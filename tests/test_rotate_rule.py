@@ -148,3 +148,43 @@ class SourceFingerprintTest(unittest.TestCase):
         src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
         self.assertIn('"source_sha256": _source_fingerprint()', src,
                       "payload 里必须带上指纹")
+
+
+class RotateAntiFlapTest(unittest.TestCase):
+    """轮换防抖（评审第 6 条）。
+
+    池子只比档位大一点时，删掉 2 颗之后能补的候选可能就只剩刚删掉的那 2 颗 ——
+    每天删了又重下。两道防线：
+      ① 刚删的种子记 rotated，7 天内不进补种候选
+      ② 池子余量（池子 − 覆盖）小于阈值时直接跳过轮换
+    """
+
+    def test_rotated_ttl_is_seven_days(self):
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        self.assertEqual(p.SG_SKIP_TTL_ROTATED, 7 * 86400)
+
+    def test_headroom_threshold_exists(self):
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        self.assertGreater(p.SG_ROTATE_MIN_HEADROOM_GIB, 0)
+
+    def test_rotate_marks_dropped_as_rotated(self):
+        import pathlib
+        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
+        self.assertIn('_sg_mark_skip(record, "rotated")', src,
+                      "删掉的种子必须记 rotated，否则下一轮又加回来")
+
+    def test_rotate_skips_when_headroom_small(self):
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
+        self.assertIn("SG_ROTATE_MIN_HEADROOM_GIB", src)
+        self.assertIn("删了补不回", src)
+
+    def test_headroom_guard_returns_before_pick(self):
+        """余量检查必须在挑可删种子之前。"""
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
+        guard = src.find("SG_ROTATE_MIN_HEADROOM_GIB")
+        pick = src.find("droppable")
+        self.assertGreater(guard, 0)
+        self.assertGreater(pick, 0)
+        self.assertLess(guard, pick, "余量检查要在挑种子之前")

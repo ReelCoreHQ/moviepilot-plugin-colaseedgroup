@@ -675,8 +675,8 @@ class RotateTest(unittest.TestCase):
         client = support.FakeClient()
         _four_days_ago = int(__import__("time").time()) - 4 * 86400
         _rows = [
-            {"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB, "added_on": _four_days_ago},
-            {"hash": "b" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB, "added_on": _four_days_ago},
+            {"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB * 100, "added_on": _four_days_ago},
+            {"hash": "b" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB * 100, "added_on": _four_days_ago},
         ]
         _live = list(_rows)
 
@@ -694,14 +694,15 @@ class RotateTest(unittest.TestCase):
             "b" * 40: {"torrent_id": 2, "name": "B"},
         })
         pool = [
-            {"torrent_id": 1, "info_hash": "a" * 40, "name": "A", "seeders": 900, "size": SG_MOD.GIB},
-            {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 400, "size": SG_MOD.GIB},
-            {"torrent_id": 3, "info_hash": "c" * 40, "name": "C", "seeders": 3, "size": SG_MOD.GIB},
-            {"torrent_id": 4, "info_hash": "d" * 40, "name": "D", "seeders": 1, "size": SG_MOD.GIB},
+            {"torrent_id": 1, "info_hash": "a" * 40, "name": "A", "seeders": 900, "size": SG_MOD.GIB * 100},
+            {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 400, "size": SG_MOD.GIB * 100},
+            {"torrent_id": 3, "info_hash": "c" * 40, "name": "C", "seeders": 3, "size": SG_MOD.GIB * 100},
+            {"torrent_id": 4, "info_hash": "d" * 40, "name": "D", "seeders": 1, "size": SG_MOD.GIB * 100},
         ]
         plugin._sg_download = lambda item: support.make_torrent(name=str(item.get("name")))
-        # 覆盖 2 GiB = 目标 2 GiB（刚好达标）→ 删掉 A/B 后为 0 → 必须补 C/D 补回来
-        out = plugin._sg_rotate([client], {"target_gib": 2.0}, pool)
+        # 覆盖 200 GiB = 目标 200 GiB（刚好达标），池子 400 GiB → 余量 200 > 50 允许轮换
+        # 删掉 A/B（各 100 GiB）后为 0 → 必须补 C/D 补回来
+        out = plugin._sg_rotate([client], {"target_gib": 200.0}, pool)
         self.assertEqual(out["dropped"], 2)          # 每天 2 颗，正好 A(900) 和 B(400)
         self.assertEqual(out["added"], 2)            # 删完不够，补 C(3)/D(1)
         self.assertTrue(any("A" in n for n in out["dropped_names"]))   # 900 先删
@@ -712,7 +713,7 @@ class RotateTest(unittest.TestCase):
         plugin = self._plugin(count=1)
         client = support.FakeClient()
         _old = int(__import__("time").time()) - 4 * 86400
-        _rows = [{"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB, "added_on": _old}]
+        _rows = [{"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB * 100, "added_on": _old}]
         _live = list(_rows)
 
         def _delete(hashes, delete_files=False):
@@ -725,11 +726,11 @@ class RotateTest(unittest.TestCase):
         client.list_completed = lambda: list(_live)
         client.list_all = lambda: list(_live)
         plugin.save_data("seedgroup_items", {"a" * 40: {"torrent_id": 1, "name": "A"}})
-        pool = [{"torrent_id": 1, "info_hash": "a" * 40, "name": "A", "seeders": 50, "size": SG_MOD.GIB},
-                {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 0, "size": SG_MOD.GIB}]
+        pool = [{"torrent_id": 1, "info_hash": "a" * 40, "name": "A", "seeders": 50, "size": SG_MOD.GIB * 100},
+                {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 0, "size": SG_MOD.GIB * 100}]
         plugin._sg_download = lambda item: support.make_torrent()
-        # 覆盖 1 GiB = 目标 1 GiB（刚好达标）→ 删掉这 1 颗后为 0 → 必须补 1 颗
-        out = plugin._sg_rotate([client], {"target_gib": 1.0}, pool)
+        # 覆盖 100 GiB = 目标 100 GiB（刚好达标），池子 200 GiB → 余量 100 > 50
+        out = plugin._sg_rotate([client], {"target_gib": 100.0}, pool)
         self.assertEqual(out["dropped"], 1)
         self.assertEqual(out["added"], 1)
 
@@ -742,7 +743,9 @@ class RotateTest(unittest.TestCase):
         client.list_all = lambda: list(_rows)
         plugin.save_data("seedgroup_items", {"z" * 40: {"torrent_id": 99, "name": "Z"}})
         # 池子里只有 torrent_id=1，与本地 torrent_id=99 对不上 → 查不到做种人数，不能删
-        out = plugin._sg_rotate([client], {"target_gib": 1.0}, [{"torrent_id": 1, "name": "A", "seeders": 1}])
+        out = plugin._sg_rotate([client], {"target_gib": 1.0},
+                                [{"torrent_id": 1, "name": "A", "seeders": 1, "size": SG_MOD.GIB * 100},
+                                 {"torrent_id": 2, "name": "B", "seeders": 1, "size": SG_MOD.GIB * 100}])
         self.assertEqual(out["dropped"], 0)
         self.assertIn("没有可删", out["reason"])
 

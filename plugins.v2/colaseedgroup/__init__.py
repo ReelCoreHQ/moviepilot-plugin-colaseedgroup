@@ -1319,7 +1319,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.5.0"
+    plugin_version = "0.5.1"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -2020,6 +2020,13 @@ class ColaSeedGroup(_PluginBase):
         if current_gib + 0.001 < target:
             out["reason"] = f"未达标（{current_gib:.1f}/{target:.1f} GiB），先补满再轮换"
             return out
+        # 池子里还能补多少：池子总量减去当前覆盖。
+        # 余量太小时删掉 2 颗、能补的候选只剩刚删的那几颗，天天来回删补（评审第 6 条）。
+        headroom = round(pool_total - current_gib, 3)
+        if headroom < self.SG_ROTATE_MIN_HEADROOM_GIB:
+            out["reason"] = (f"池子余量只有 {headroom:.1f} GiB"
+                             f"（< {self.SG_ROTATE_MIN_HEADROOM_GIB:.0f}），删了补不回，不轮换")
+            return out
 
         # ── ③ 挑一颗可删的：seeders 最多，且本地做种 ≥ 3 天 ──
         items = self._sg_items()
@@ -2063,8 +2070,11 @@ class ColaSeedGroup(_PluginBase):
             out["dropped_names"].append(
                 f"{name}（{seeders} 做种，本地做种 {ages.get(info_hash, 0)//86400} 天）")
             items.pop(info_hash, None)
-            # 删了就清掉跳过记录，否则这颗在 TTL 内再也进不了候选（缺口补不回）
+            # 先清掉旧记录（否则它在 TTL 内进不了候选），再记一条 rotated：
+            # 刚被轮换删掉的种子 7 天内不再回来 —— 否则池子贴着目标时，
+            # 删掉 2 颗、下一轮又把同样 2 颗加回去，天天来回折腾（评审第 6 条）。
             self._sg_unmark_skip(record)
+            self._sg_mark_skip(record, "rotated")
             time.sleep(1.0)          # 别把删除请求打成一串，qB 在慢链路上会 403
         self.save_data("seedgroup_items", items)
         if out["dropped"] == 0:
@@ -3167,6 +3177,10 @@ class ColaSeedGroup(_PluginBase):
     # 网络类失败（连接被重置/超时）不是种子的问题，是那条线的问题 —— 只退避几分钟，
     # 不能像坏种那样关 7 天，否则一次抖动就把 371 条全锁死（2026-11-20 就是这么丢的缺口）。
     SG_SKIP_TTL_DUP = 86400      # 「客户端已有」的记录只留 1 天：删种后要能自愈
+    SG_SKIP_TTL_ROTATED = 7 * 86400  # 刚被轮换删掉的种子：7 天内不进补种候选
+    # 池子里「可补的余量」小于这个值时不做轮换：
+    # 删掉 2 颗之后能补的候选就只剩刚删掉的那几颗，每天删了又重下（评审第 6 条）。
+    SG_ROTATE_MIN_HEADROOM_GIB = 50.0
     SG_SKIP_TTL_NET = 300
     SG_RATE_LIMIT_STOP = 3       # 连续这么多次被判限流就结束本轮
     # ── 动态轮换（老板 2026-11-22 定的规则，全部强制，不对外暴露数值）──
