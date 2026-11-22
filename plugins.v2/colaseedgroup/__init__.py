@@ -1288,7 +1288,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.0"
+    plugin_version = "0.4.1"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3498,22 +3498,28 @@ class ColaSeedGroup(_PluginBase):
         state["pool_pending"] = len(candidates)
         need = round(target - current_gib, 3)
         state["need_gib"] = max(0.0, need)
+        # 轮换与下架清理**不挂在「缺口必须为零」上**（2026-11-22 修）：
+        #   · 全站档位的 need 是拿「100% 池子」算的，永远差一点点，
+        #     而轮换门槛其实是 80% —— 挂在 need<=0 里等于永远不轮换（生产实测：
+        #     rotate_reason 一直是 None，rotate_date 从未写入）；
+        #   · 下架清理更不该要等到满分，站点撤了就该删。
+        # 两者各自在内部判门槛，这里只负责调用。
+        state.update({"activated": True, "covered_gib": current_gib})
         if need <= 0:
-            # 稳态：该保的都保了。下架清理仍要跑（UI 写的是「每轮回站点核对」）。
-            state.update({"activated": True, "covered_gib": current_gib, "shortfall_gib": 0.0})
+            state["shortfall_gib"] = 0.0
             if skips:
                 state["reason"] = f"{len(skips)} 条在跳过表里，本轮不重试"
-            self.save_data("seedgroup_state", state)
             logger.info(f"保种组已达标：档位 {tier} / 目标 {target} GiB / 现有 {current_gib} GiB")
-            try:
-                rotated = self._sg_rotate(clients, state, pool_all)
-                state["rotate_dropped"] = rotated.get("dropped", 0)
-                state["rotate_added"] = rotated.get("added", 0)
-                state["rotate_reason"] = rotated.get("reason", "")
-                self.save_data("seedgroup_state", state)
-            except Exception as err:
-                logger.warn(f"动态保种异常（不影响本轮）：{type(err).__name__}: {err}")
-            self._sg_prune_if_enabled(state)
+        try:
+            rotated = self._sg_rotate(clients, state, pool_all)
+            state["rotate_dropped"] = rotated.get("dropped", 0)
+            state["rotate_added"] = rotated.get("added", 0)
+            state["rotate_reason"] = rotated.get("reason", "")
+        except Exception as err:
+            logger.warn(f"动态保种异常（不影响本轮）：{type(err).__name__}: {err}")
+        self._sg_prune_if_enabled(state)
+        if need <= 0:
+            self.save_data("seedgroup_state", state)
             self._maybe_report(clients, state)
             return
         if not candidates:

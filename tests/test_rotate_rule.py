@@ -52,3 +52,43 @@ class RotateRuleTest(unittest.TestCase):
         import inspect
         src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
         self.assertIn("0.999", src, "池子保全时不许删")
+
+
+class RotateNotGatedOnZeroShortfallTest(unittest.TestCase):
+    """轮换与下架清理不能挂在「缺口为零」上。
+
+    2026-11-22 生产实测：全站档 need 是拿 100% 池子算的（2561.325 - 2558.53 = 2.795），
+    永远 > 0，而轮换门槛其实是 80% —— 挂在 need<=0 里等于永远不轮换
+    （rotate_reason 一直是 None、rotate_date 从未写入）。下架清理也被一起关在里面。
+    """
+
+    def test_sync_rotate_not_inside_need_branch(self):
+        import pathlib
+        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
+        idx = src.find("轮换与下架清理**不挂在")
+        self.assertGreater(idx, -1, "必须有这段注释说明修复")
+        seg = src[idx:idx + 1200]
+        self.assertIn("_sg_rotate", seg)
+        self.assertIn("_sg_prune_if_enabled", seg)
+        # 关键：if need <= 0 这一块里不能再有轮换/清理调用。
+        lines = src.splitlines()
+        need_line = next(i for i, l in enumerate(lines) if l.strip() == "if need <= 0:")
+        block = []
+        for l in lines[need_line + 1:]:
+            if not l.strip():
+                continue
+            ind = len(l) - len(l.lstrip())
+            if ind <= 8:
+                break                       # 回到同级，块结束
+            block.append(l)
+        joined = "\n".join(block)
+        self.assertNotIn("_sg_rotate", joined,
+                         "轮换还在 if need<=0 块里 —— 全站档 need 永远 >0，等于永不轮换")
+        self.assertNotIn("_sg_prune_if_enabled", joined,
+                         "下架清理还在 if need<=0 块里 —— 站点撤了也不删")
+
+    def test_rotate_gate_is_eighty_percent_for_all_tier(self):
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
+        self.assertIn("SG_ALL_ROTATE_RATIO", src, "全站档门槛走这个常量")
+        self.assertIn("全站档位", src)
