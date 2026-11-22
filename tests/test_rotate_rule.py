@@ -94,6 +94,20 @@ class RotateNotGatedOnZeroShortfallTest(unittest.TestCase):
         self.assertNotIn("_sg_prune_if_enabled", joined,
                          "下架清理还在 if need<=0 块里 —— 站点撤了也不删")
 
+    def test_all_tier_checked_before_daily_gate(self):
+        """全站档判断必须在「今天已经轮换过」之前。
+
+        否则今天跑过一次（哪怕是旧逻辑跑的），明天之前都只回「今天已经轮换过」，
+        看不出这个档位本来就不该动。
+        """
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
+        dyn_at = src.find("if dynamic:")
+        gate_at = src.find("seedgroup_rotate_date")
+        self.assertGreater(dyn_at, 0)
+        self.assertGreater(gate_at, 0)
+        self.assertLess(dyn_at, gate_at, "全站档阻挡必须在日期闸之前")
+
     def test_all_tier_never_rotates(self):
         """「全站官种」不轮换 —— 那个档位要的是全保，删了补不回。
 

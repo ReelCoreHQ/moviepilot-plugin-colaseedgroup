@@ -1288,7 +1288,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.3"
+    plugin_version = "0.4.4"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1963,34 +1963,32 @@ class ColaSeedGroup(_PluginBase):
             out["reason"] = "没有可用的下载器"
             return out
 
+        existing, current_gib, _blind, _offline = self._sg_current(clients)
+        pool_total = round(sum(_seed_group_size_gib(x.get("size")) for x in pool_all), 3)
+        dynamic = seed_group_tier_key(self._seedgroup_tier) == SEED_GROUP_ALL_TIER
+        target = float(state.get("target_gib") or 0)
+
+        # ── ⓪ 全站档先挡掉：这个档位根本不轮换 ──
+        # 必须放在「今天已经轮换过」之前 —— 否则今天跑过一次（哪怕是旧逻辑跑的），
+        # 明天之前都只会回「今天已经轮换过」，看不出这个档位本来就不该动。
+        if dynamic:
+            out["reason"] = (f"全站官种档位：目标是全保（池子 {pool_total:.1f} GiB），不做轮换。"
+                             f"当前 {current_gib:.1f} GiB")
+            return out
+
         # ── ① 一天只做一次 ──
         today = datetime.now().strftime("%Y-%m-%d")
         if str(self.get_data("seedgroup_rotate_date") or "") == today:
             out["reason"] = f"今天已经轮换过（每天最多 {self.SG_ROTATE_PER_DAY} 颗）"
             return out
 
-        existing, current_gib, _blind, _offline = self._sg_current(clients)
-        pool_total = round(sum(_seed_group_size_gib(x.get("size")) for x in pool_all), 3)
-        dynamic = seed_group_tier_key(self._seedgroup_tier) == SEED_GROUP_ALL_TIER
-        target = float(state.get("target_gib") or 0)
-
-        # ── ② 门槛 ──
-        if dynamic:
-            # **「全站官种」根本不轮换**（老板 2026-11-22 纠正）：
-            # 这个档位的意思就是「池子里有多少保多少」，要的是全保，
-            # 删了就得再下一遍、池子永远差那几颗 —— 轮换跟这个档位的目标直接矛盾。
-            # 80% 那个线是「开始计考核」的门槛（覆盖到 80% 就不再算你没达标），
-            # 不是「开始轮换」的门槛，别混。
-            out["reason"] = (f"全站官种档位：目标是全保（池子 {pool_total:.1f} GiB），不做轮换。"
-                             f"当前 {current_gib:.1f} GiB")
+        # ── ② 固定档：达标才轮换 ──
+        if target <= 0:
+            out["reason"] = "目标体积未知，不轮换"
             return out
-        else:
-            if target <= 0:
-                out["reason"] = "目标体积未知，不轮换"
-                return out
-            if current_gib + 0.001 < target:
-                out["reason"] = f"未达标（{current_gib:.1f}/{target:.1f} GiB），先补满再轮换"
-                return out
+        if current_gib + 0.001 < target:
+            out["reason"] = f"未达标（{current_gib:.1f}/{target:.1f} GiB），先补满再轮换"
+            return out
 
         # ── ③ 挑一颗可删的：seeders 最多，且本地做种 ≥ 3 天 ──
         items = self._sg_items()
