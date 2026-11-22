@@ -723,6 +723,20 @@ class _Client:
                 ok_all = False
         return ok_all
 
+    def list_all(self) -> List[Dict[str, Any]]:
+        """列出全部种子（含未下完）。
+
+        下架清理必须用它。MP 通道注入的是 `_list_all`（返回全部），直接用它；
+        没有就退化为 list_completed（该客户端列不出未完成的种子）。
+        """
+        injected = getattr(self, "_list_all", None)
+        if injected is not None:
+            try:
+                return injected() or []
+            except Exception:
+                pass
+        return self.list_completed()
+
     def add_tags(self, hashes: List[str], tags: List[str]) -> bool:
         """补标签。MP 各版本方法名不统一，只认构造方注入的；没有就降级 False。"""
         if not hashes or not tags or not self._tag:
@@ -887,7 +901,7 @@ class QBittorrentClient(_Client):
     # 45 秒在 293ms RTT 的远端链路上足够读完 500 条；真读不完就重试，再不行就沿用上次读数。
     QB_LIST_TIMEOUT = 45
 
-    def _list_page(self, page: int) -> List[Dict[str, Any]]:
+    def _list_page(self, page: int, filter_: str = "completed") -> List[Dict[str, Any]]:
         """取一页 completed 种子，网络类失败就地重试。
 
         拿不到就**抛异常**，绝不返回空列表 —— 返回空会被 `_sg_current` 当成
@@ -900,7 +914,7 @@ class QBittorrentClient(_Client):
                 rsp = self._session.get(
                     f"{self.url}/api/v2/torrents/info",
                     params={
-                        "filter": "completed",
+                        "filter": filter_,
                         "limit": self.QB_LIST_PAGE,
                         "offset": page * self.QB_LIST_PAGE,
                     },
@@ -917,11 +931,23 @@ class QBittorrentClient(_Client):
                 time.sleep(delay)
         raise RuntimeError(f"qBittorrent ({self.name}) 种子列表读取失败：{last}")
 
+    def list_all(self) -> List[Dict[str, Any]]:
+        """列出**全部**种子（含未下完的）。
+
+        下架清理必须用这个：站点撤掉的资源如果本地才下到 30%，它在 filter=completed
+        里根本不存在，于是永远清不掉（2026-11-22 老板指出）。
+        """
+        return self._list("all")
+
     def list_completed(self) -> List[Dict[str, Any]]:
+        """只列已完成的 —— 覆盖统计用这个，把没下完的算进去会把缺口算小。"""
+        return self._list("completed")
+
+    def _list(self, filter_: str) -> List[Dict[str, Any]]:
         try:
             out: List[Dict[str, Any]] = []
             for page in range(0, 40):           # 40 页 × 500 = 2 万条，够任何人的库
-                batch = self._list_page(page)
+                batch = self._list_page(page, filter_)
                 if not batch:
                     break
                 for item in batch:
@@ -1259,7 +1285,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3154,7 +3180,9 @@ class ColaSeedGroup(_PluginBase):
         items = self._sg_items()
         for client in clients:
             try:
-                torrents = client.list_completed()
+                # 必须用 list_all：站点撤掉的资源如果本地才下到 30%，它在 filter=completed
+                # 里根本不存在，于是永远清不掉（2026-11-22 老板指出）。
+                torrents = client.list_all() if hasattr(client, "list_all") else client.list_completed()
             except Exception as err:
                 logger.warn(f"保种组清理：读 {client.name} 种子失败：{err}")
                 continue
@@ -3198,8 +3226,19 @@ class ColaSeedGroup(_PluginBase):
                 if not drop:
                     out["kept"] += 1
                     continue
+                # 文件删不删：
+                #   · 配「种子和文件一起删」→ 删；
+                #   · 配「只删种子保留文件」→ 已下完(progress>=99.9%)才留文件；
+                #   · **没下完的一律连文件删**：站点都撤了，本地那点残缺文件既做不了种、
+                #     又永远补不齐，留着只占盘（老板 2026-11-22 明确要求）。
                 try:
-                    deleted = client.delete([info_hash], delete_files=self._seedgroup_prune_files)
+                    progress = float(torrent.get("progress") or 0)
+                except Exception:
+                    progress = 0.0
+                incomplete = progress < 0.999
+                drop_files = bool(self._seedgroup_prune_files) or incomplete
+                try:
+                    deleted = client.delete([info_hash], delete_files=drop_files)
                 except Exception as err:
                     logger.warn(f"保种组清理：删除 {info_hash[:12]} 异常：{err}")
                     deleted = False
@@ -3212,8 +3251,10 @@ class ColaSeedGroup(_PluginBase):
                 items.pop(info_hash, None)
                 # 同上：删了就清跳过记录，否则下架的种子被重新上架后永远加不回来
                 self._sg_unmark_skip(record)
+                why = ("未下完，连残缺文件一起删" if incomplete and not self._seedgroup_prune_files
+                       else ("已下完，按配置连文件删" if drop_files else "已下完，保留文件"))
                 logger.info(f"保种组清理：{client.name} 删除 {info_hash[:12]}"
-                            f"（torrent_id={torrent_id}，文件{'一并删除' if self._seedgroup_prune_files else '保留'}）")
+                            f"（torrent_id={torrent_id}，progress={progress*100:.0f}%，{why}）")
         self.save_data("seedgroup_items", items)
         self.save_data("seedgroup_prune", out)
         logger.info(f"保种组清理完成：检查 {out['checked']}，删除 {out['removed']}，保留 {out['kept']}，"
