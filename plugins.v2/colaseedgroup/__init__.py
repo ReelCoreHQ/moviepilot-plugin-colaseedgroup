@@ -2217,6 +2217,14 @@ class ColaSeedGroup(_PluginBase):
         # 领不到就照常发（站点答 401，记进上报快照），不报错。
         if not self._plugin_credentials()[0] and self._api_key:
             self._plugin_enroll()
+        if not self._plugin_credentials()[0]:
+            # 没有票据就不发：不带凭据的上报站点只会答 401，白打一次站点
+            out.update({"skipped": True, "reason": "还没有上报票据：先填 API Key（领票据要「读取」范围）"})
+            self.save_data("seedgroup_report_last", {
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ok": False, "status": 0,
+                "reason": out["reason"], "clients": limits, "url": url,
+            })
+            return out
         # 签名要对**实际发出去的字节**算，所以按 _curl 里同一个 json.dumps 先算出字符串。
         body_text = json.dumps(payload)
         headers = self._plugin_headers("POST", url, body_text)

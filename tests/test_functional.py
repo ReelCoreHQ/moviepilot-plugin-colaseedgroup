@@ -781,6 +781,7 @@ class SpeedReportTest(unittest.TestCase):
         plugin._seedgroup_tier = "2T"
         plugin._seedgroup_scope = "site"
         plugin._seedgroup_custom_gib = 2048
+        plugin._plugin_save_credentials("rcapi_ticket", "signing-key")
         return plugin
 
     def test_skips_when_group_disabled(self):
@@ -793,6 +794,20 @@ class SpeedReportTest(unittest.TestCase):
         plugin = self._plugin(report=False)
         out = plugin._report_seedgroup([support.FakeClient()], {})
         self.assertTrue(out["skipped"])
+
+    def test_no_ticket_and_no_key_sends_nothing(self):
+        plugin = self._plugin()
+        plugin.save_data("plugin_key", "")
+        plugin._api_key = ""
+        calls = []
+        original, SG_MOD._curl = SG_MOD._curl, (lambda *a, **k: calls.append(a))
+        try:
+            out = plugin._report_seedgroup([support.FakeClient()], {})
+        finally:
+            SG_MOD._curl = original
+        self.assertEqual(calls, [], "没有票据的上报只会被 401，不该发")
+        self.assertTrue(out["skipped"])
+        self.assertIn("票据", plugin.get_data("seedgroup_report_last")["reason"])
 
     def test_payload_contains_client_limits(self):
         plugin = self._plugin()
