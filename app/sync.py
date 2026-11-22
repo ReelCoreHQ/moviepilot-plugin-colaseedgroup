@@ -29,7 +29,7 @@ import __init__ as _plugin  # noqa: E402  （必须在打桩之后）
 #: 去掉辅种专用项（direction / sites_* / iyuu_* / max_per_hour …）。
 CONFIG_KEYS = (
     "enabled", "notify",
-    "username", "password", "otp_code", "captcha_code", "session_token",
+    "api_key",
     "seedgroup_enabled", "seedgroup_tier", "seedgroup_custom_gib",
     "seedgroup_cron", "seedgroup_max_downloading",
     "seedgroup_client_mode", "seedgroup_clients_lines", "seedgroup_target_client",
@@ -40,7 +40,7 @@ CONFIG_KEYS = (
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True, "notify": False,
-    "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
+    "api_key": "",
     "seedgroup_enabled": True, "seedgroup_tier": "2T", "seedgroup_custom_gib": 2048,
     "seedgroup_cron": "0 * * * *", "seedgroup_max_downloading": 5,
     "seedgroup_client_mode": "custom", "seedgroup_clients_lines": "", "seedgroup_target_client": "",

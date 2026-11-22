@@ -51,7 +51,7 @@ jobs:
           sys.path.insert(0, str(pathlib.Path(".").resolve()))
           from app.main import app
           from app.sync import CONFIG_KEYS, PLUGIN_VERSION, _plugin
-          assert len(CONFIG_KEYS) >= 20, CONFIG_KEYS
+          assert len(CONFIG_KEYS) >= 19, CONFIG_KEYS
           # 版本号只有一处：独立版必须读插件的 plugin_version
           assert PLUGIN_VERSION == _plugin.ColaSeedGroup.plugin_version, (PLUGIN_VERSION, _plugin.ColaSeedGroup.plugin_version)
           # 独立版必须直接引用 plugins.v2 的源码，不允许存在第二份副本

@@ -88,7 +88,7 @@ class RateLimitIsNotABadTorrentTest(unittest.TestCase):
 
 
 class PoolHashBackfillTest(unittest.TestCase):
-    """会话面池子没有 info_hash，必须用 items 映射补回去。
+    """池子条目的 info_hash：开放 API 直接给，缺的再用 items 映射补回去。
 
     没有 hash 时 `_sg_candidates` 里「hash 不在 existing」这条过滤形同虚设，
     已覆盖的种子照样进候选、被判 dup —— 2026-11-22 实测 picked=12 全部 dup，
@@ -103,8 +103,25 @@ class PoolHashBackfillTest(unittest.TestCase):
         self.assertIn('it["info_hash"]', src)
         self.assertIn("return items", src, "不能返回空列表")
 
-    def test_session_page_reports_no_hash(self):
-        """钉住这个前提：会话面通道确实不带 hash，所以补全是必需的。"""
-        import inspect
-        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_official_browse_page)
-        self.assertIn('"info_hash": ""', src)
+    def _candidates(self, versions, items=None):
+        import json as _json
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        p._api_key = "rcapi_test"
+        if items:
+            p.save_data("seedgroup_items", items)
+        body = _json.dumps({"items": [{"versions": versions}], "page": 1, "page_size": 50,
+                            "total": len(versions)}).encode()
+        p._cola = lambda m, path, **k: SG_MOD._HttpResult(200, body, body.decode())
+        return p._sg_candidates()
+
+    def test_open_api_hash_is_used(self):
+        """开放 API 的 listMedia 版本对象带 info_hash（serve #661）：直接用，不必靠映射。"""
+        got = self._candidates([{"id": 5, "official": True, "status": "approved",
+                                 "info_hash": "A" * 40, "size_bytes": "1024"}])
+        self.assertEqual(got[0]["info_hash"], "a" * 40)
+
+    def test_missing_hash_is_backfilled_from_items(self):
+        """版本对象缺 hash 时（结构漂移、老站点），仍按 torrent_id 从映射补回去。"""
+        got = self._candidates([{"id": 7, "official": True, "status": "approved", "size_bytes": "1"}],
+                               items={"b" * 40: {"torrent_id": 7}})
+        self.assertEqual(got[0]["info_hash"], "b" * 40)

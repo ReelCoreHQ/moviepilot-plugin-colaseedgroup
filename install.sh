@@ -46,7 +46,7 @@ case "${1:-install}" in
     echo "安装完成，容器 $C 已重启。"
     echo
     echo "接下来：MoviePilot → 插件 → 找到「可乐保种组」→ 启用。"
-    echo "首次使用：填可乐账号 + 密码 + 验证码登录；登录成功后再勾「启用保种组」并保存（保存时才会校验工作组头衔）。"
+    echo "首次使用：在可乐PT「账号 → Key → API Key」新建一把勾「读取」「下载」的 Key，填进设置「API Key」，勾「启用保种组」并保存。"
     ;;
   *)
     echo "用法: $0 [install|uninstall]" >&2
