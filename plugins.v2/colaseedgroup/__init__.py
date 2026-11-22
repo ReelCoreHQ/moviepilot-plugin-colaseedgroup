@@ -85,6 +85,37 @@ GIB = 1024 ** 3
 SEED_GROUP_REPORT_URL = "https://www.colapt.com/api/v1/plugin/seed-group/report"
 # 档位 -> 体积下限（GiB）。固定档之外还有一个 custom（自定义），下限同样不许低于 20T。
 SEED_GROUP_TIERS: Dict[str, int] = {"2T": 2048, "5T": 5120, "10T": 10240, "15T": 15360, "20T": 20480}
+def _source_fingerprint() -> str:
+    """本插件源码的 sha256 —— 站点用来确认「这是官方发布的代码，不是自己改过的」。
+
+    # 为什么要有它
+
+    2026-11-22 规则评审指出的根子问题：站点侧的所有核验都建立在插件上报的数据上，
+    改一行代码就能绕过。现在服务端已经改成自己从 tracker 算覆盖（不再信插件的数），
+    但**客户端本身是不是官方代码**仍然需要一条证据 —— 就是这个指纹。
+
+    # 算什么
+
+    整个模块的源码文本（不是编译产物）。加一行空格、改一个常量、插一段 monkey patch，
+    哈希都会变。站点维护一份官方哈希白名单，不匹配就拒收上报。
+
+    # 为什么不读 __file__
+
+    MP 各版本加载插件的方式不同（有的复制到临时目录、有的用 importlib 从字符串加载），
+    `__file__` 不保证指向真实源码。`inspect.getsource` 走的是模块自己的代码对象，
+    对两种加载方式都成立。
+
+    取不到时返回空串：宁可不报指纹，也不能因为算不出来就崩掉一轮同步。
+    """
+    try:
+        import inspect
+        import sys as _sys
+        src = inspect.getsource(_sys.modules[__name__])
+    except Exception:
+        return ""
+    return hashlib.sha256(src.encode("utf-8")).hexdigest()
+
+
 SEED_GROUP_CUSTOM_TIER = "custom"
 SEED_GROUP_ALL_TIER = "all"        # 全站官种：有多少保多少（target 由池子总量决定）
 SEED_GROUP_CUSTOM_MIN_GIB = 1              # 自定义档只要求「不是 0」：100M / 100G / 1T / 1P 都行
@@ -1288,7 +1319,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.4"
+    plugin_version = "0.5.0"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -2331,6 +2362,8 @@ class ColaSeedGroup(_PluginBase):
         # 多一个（plugin/version/at/uid/username…）都会 400。身份与是否工作组都由票据所属账号决定。
         payload = {
             "plugin_version": self.plugin_version,
+            # 源码指纹：站点用它确认这是官方发布的代码（白名单外的哈希一律拒收）
+            "source_sha256": _source_fingerprint(),
             "tier": state.get("tier") or self._seedgroup_tier,
             "scope": self._seedgroup_scope,
             "target_gib": state.get("target_gib"),

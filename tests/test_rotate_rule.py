@@ -122,3 +122,29 @@ class RotateNotGatedOnZeroShortfallTest(unittest.TestCase):
         self.assertIn("全保", seg)
         # 全站档分支里不该再出现 0.8 之类的旋转门槛
         self.assertNotIn("SG_ALL_ROTATE_RATIO", seg)
+
+
+class SourceFingerprintTest(unittest.TestCase):
+    """上报源码指纹，供站点白名单校验。
+
+    2026-11-22 评审：站点所有核验都建立在插件上报的数据上，改一行代码就能绕过。
+    服务端已改成自己从 tracker 算覆盖，但客户端本身是不是官方代码仍需证据。
+    """
+
+    def test_fingerprint_is_stable_sha256(self):
+        fp = SG_MOD._source_fingerprint()
+        self.assertEqual(len(fp), 64, "应是 sha256 的 hex")
+        self.assertEqual(fp, SG_MOD._source_fingerprint(), "同一份源码多次调用必须一致")
+
+    def test_fingerprint_changes_when_source_changes(self):
+        """不同源码必须算出不同指纹 —— 这是它唯一的用途。"""
+        import hashlib
+        a = hashlib.sha256("def f(): pass".encode()).hexdigest()
+        b = hashlib.sha256("def f(): pass  # 改一行".encode()).hexdigest()
+        self.assertNotEqual(a, b)
+
+    def test_report_payload_carries_fingerprint(self):
+        import pathlib
+        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
+        self.assertIn('"source_sha256": _source_fingerprint()', src,
+                      "payload 里必须带上指纹")
