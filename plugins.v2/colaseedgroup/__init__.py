@@ -1253,7 +1253,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.18"
+    plugin_version = "0.2.19"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3987,9 +3987,9 @@ class ColaSeedGroup(_PluginBase):
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_custom_gib",
-                             "label": "自定义体积（100M / 100G / 1T / 1P）",
+                             "label": "自定义体积",
                              "persistent-hint": True,
-                             "hint": "仅选「自定义档」时生效；不带单位按 GiB"}}]},
+                             "hint": "100M / 100G / 1T / 1P；不带单位按 GiB。仅「自定义档」生效"}}]},
                         {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VSelect", "props": {"model": "seedgroup_client_mode", "label": "保种下载器", "items": [
                                 {"title": "用 MP 已配置下载器", "value": "mp"},
@@ -4014,7 +4014,8 @@ class ColaSeedGroup(_PluginBase):
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "sm": 12, "md": 6}, "content": [
-                            {"component": "VSelect", "props": {"model": "seedgroup_prune_mode", "label": "下架清理（每轮回站点核对 status/official）", "items": [
+                            {"component": "VSelect", "props": {"model": "seedgroup_prune_mode", "label": "下架清理", "persistent-hint": True,
+                             "hint": "每轮回站点核对 status/official", "items": [
                                 {"title": "只删种子，保留文件（默认）", "value": "seed"},
                                 {"title": "种子和文件一起删", "value": "files"},
                                 {"title": "不清理", "value": "off"}]}}]},
@@ -4038,8 +4039,8 @@ class ColaSeedGroup(_PluginBase):
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextarea", "props": {"model": "limit_lines", "rows": 3,
                              "persistent-hint": True,
-                             "label": "每客户端单独限速（每行：客户端名或地址,下载KiB/s,上传KiB/s）",
-                             "hint": "包含匹配：写 198.72 或 MP-qb 都能命中；没列出的客户端用上面的保种全局值",
+                             "label": "每客户端单独限速",
+                             "hint": "每行 客户端名或地址,下载KiB/s,上传KiB/s；包含匹配（写 10.0 或 MP-qb 都能命中）；没列出的用上面的全局值",
                              "placeholder": "10.0.0.5:8081,1024,2048\nMP-qb,0,3000"}}]},
                     ]},
                     {"component": "VRow", "content": [
@@ -4056,8 +4057,8 @@ class ColaSeedGroup(_PluginBase):
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextarea", "props": {"model": "seedgroup_clients_lines", "rows": 3,
                              "persistent-hint": True,
-                             "label": "保种组自定义下载器（仅「用下面填的自定义下载器」时生效）",
-                             "hint": "每行 地址,用户名,密码；TR 写 tr,地址,用户名,密码",
+                             "label": "保种组自定义下载器",
+                             "hint": "每行 地址,用户名,密码；TR 写 tr,地址,用户名,密码。仅「用下面填的自定义下载器」时生效",
                              "placeholder": "192.168.1.100:8080,admin,密码\ntr,192.168.1.101:9091,admin,密码"}}]},
                     ]},
                 ],
