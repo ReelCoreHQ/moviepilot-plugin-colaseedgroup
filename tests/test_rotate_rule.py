@@ -48,10 +48,17 @@ class RotateRuleTest(unittest.TestCase):
         self.assertIn("SG_ROTATE_MIN_AGE", src)
         self.assertIn("_sg_local_ages", src)
 
-    def test_rotate_blocks_when_pool_fully_covered(self):
+    def test_all_tier_returns_before_any_drop(self):
         import inspect
         src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
-        self.assertIn("0.999", src, "池子保全时不许删")
+        # 全站档分支必须在挑 droppable 之前 return
+        dyn = src.find("if dynamic:")
+        drop = src.find("droppable")
+        self.assertGreater(dyn, 0)
+        self.assertGreater(drop, 0)
+        seg = src[dyn:drop]
+        self.assertIn("return out", seg,
+                      "全站档必须在挑可删种子之前就返回（不轮换）")
 
 
 class RotateNotGatedOnZeroShortfallTest(unittest.TestCase):
@@ -87,8 +94,17 @@ class RotateNotGatedOnZeroShortfallTest(unittest.TestCase):
         self.assertNotIn("_sg_prune_if_enabled", joined,
                          "下架清理还在 if need<=0 块里 —— 站点撤了也不删")
 
-    def test_rotate_gate_is_eighty_percent_for_all_tier(self):
+    def test_all_tier_never_rotates(self):
+        """「全站官种」不轮换 —— 那个档位要的是全保，删了补不回。
+
+        老板 2026-11-22 纠正：80% 是「开始计考核」的线，不是「开始轮换」的线。
+        """
         import inspect
         src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
-        self.assertIn("SG_ALL_ROTATE_RATIO", src, "全站档门槛走这个常量")
-        self.assertIn("全站档位", src)
+        idx = src.find("dynamic")
+        self.assertGreater(idx, -1)
+        seg = src[idx:idx + 900]
+        self.assertIn("不做轮换", seg, "全站档必须直接返回、不进删种逻辑")
+        self.assertIn("全保", seg)
+        # 全站档分支里不该再出现 0.8 之类的旋转门槛
+        self.assertNotIn("SG_ALL_ROTATE_RATIO", seg)
