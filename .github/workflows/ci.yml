@@ -42,3 +42,22 @@ jobs:
 
       - name: 功能测试
         run: python -m unittest discover -s tests -v
+
+      - name: 独立版自检
+        run: |
+          python -m pip install -q -r requirements.txt
+          python - <<'PY'
+          import sys, pathlib
+          sys.path.insert(0, str(pathlib.Path(".").resolve()))
+          from app.main import app
+          from app.sync import CONFIG_KEYS, PLUGIN_VERSION, _plugin
+          assert len(CONFIG_KEYS) >= 20, CONFIG_KEYS
+          # 版本号只有一处：独立版必须读插件的 plugin_version
+          assert PLUGIN_VERSION == _plugin.ColaSeedGroup.plugin_version, (PLUGIN_VERSION, _plugin.ColaSeedGroup.plugin_version)
+          # 独立版必须直接引用 plugins.v2 的源码，不允许存在第二份副本
+          assert not pathlib.Path("app/vendor").exists(), "app/vendor 不该存在"
+          import json
+          manifest = json.loads(pathlib.Path("package.v2.json").read_text("utf-8"))["ColaSeedGroup"]
+          assert manifest["version"] == PLUGIN_VERSION, (manifest["version"], PLUGIN_VERSION)
+          print("standalone ok:", PLUGIN_VERSION, len(CONFIG_KEYS), "keys")
+          PY

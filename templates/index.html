@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ColaSeedBox · 保种组</title>
+<style>
+  :root{
+    --bg:#faf9f7; --fg:#1f1d1a; --muted:#6b655c; --line:#e5e1da;
+    --accent:#9b2c2c; --ok:#2f7d4f; --warn:#a8641a; --err:#b3261e;
+    --card:#fff; --radius:10px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#17161a; --fg:#ece9e4; --muted:#9c968c; --line:#2c2a30; --card:#1f1e23; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif}
+  header{padding:20px 16px 8px;max-width:960px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px;letter-spacing:.5px}
+  .sub{color:var(--muted);font-size:13px}
+  main{max-width:960px;margin:0 auto;padding:8px 16px 64px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+        padding:16px;margin:14px 0}
+  .card h2{font-size:14px;margin:0 0 12px;color:var(--muted);font-weight:600;
+           text-transform:none;letter-spacing:.3px}
+  /* 栅格：手机单列，平板两列，桌面三列 —— 与插件设置页同一套断点 */
+  .grid{display:grid;gap:12px;grid-template-columns:1fr}
+  @media (min-width:600px){ .grid{grid-template-columns:repeat(2,1fr)} }
+  @media (min-width:960px){ .grid{grid-template-columns:repeat(3,1fr)} }
+  .field{display:flex;flex-direction:column;gap:4px;min-width:0}
+  .field.wide{grid-column:1/-1}
+  @media (min-width:600px){ .field.span2{grid-column:span 2} }
+  @media (min-width:960px){ .field.span2{grid-column:span 2} }
+  label{font-size:13px;color:var(--muted)}
+  input,select,textarea{width:100%;padding:8px 10px;border:1px solid var(--line);
+    border-radius:8px;background:var(--bg);color:var(--fg);font:inherit;font-size:14px}
+  textarea{min-height:72px;resize:vertical;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+  .hint{font-size:12px;color:var(--muted)}
+  .switch{display:flex;align-items:center;gap:10px;padding:8px 0}
+  .switch input{width:auto}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  button{padding:9px 16px;border-radius:8px;border:1px solid var(--line);
+    background:var(--card);color:var(--fg);font:inherit;cursor:pointer}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  button:disabled{opacity:.5;cursor:default}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:14px}
+  .kv dt{color:var(--muted)}
+  .kv dd{margin:0}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
+  #msg{font-size:13px;min-height:20px}
+  code{background:var(--line);padding:1px 5px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>ColaSeedBox · 保种组</h1>
+  <div class="sub">独立运行，不需要 MoviePilot。端口 <code>{{ port }}</code></div>
+</header>
+<main>
+
+  <div class="card">
+    <h2>状态</h2>
+    <dl class="kv" id="status">
+      <dt>运行中</dt><dd id="st-running">—</dd>
+      <dt>档位</dt><dd id="st-tier">—</dd>
+      <dt>周期</dt><dd id="st-cron">—</dd>
+      <dt>最近一轮</dt><dd id="st-last">—</dd>
+      <dt>覆盖 / 目标</dt><dd id="st-cover">—</dd>
+      <dt>缺口</dt><dd id="st-short">—</dd>
+    </dl>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="btn-run">立即跑一轮</button>
+      <span id="msg"></span>
+    </div>
+  </div>
+
+  <form id="cfg">
+    <div class="card">
+      <h2>① 可乐PT 账号</h2>
+      <div class="grid">
+        <div class="field"><label>用户名</label><input name="username" autocomplete="username"></div>
+        <div class="field"><label>密码</label><input name="password" type="password" autocomplete="current-password" placeholder="留空 = 不修改"></div>
+        <div class="field"><label>两步验证码（可选）</label><input name="otp_code" inputmode="numeric"></div>
+        <div class="field"><label>验证码</label><input name="captcha_code" inputmode="numeric">
+          <span class="hint">先到站点插件页取图，填 4 位数字后保存</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>② 下载器</h2>
+      <div class="grid">
+        <div class="field"><label>保种加种到</label>
+          <select name="seedgroup_client_mode">
+            <option value="custom">用下面填的自定义下载器</option>
+            <option value="mp">用本站已配置下载器（独立版等同自定义）</option>
+          </select></div>
+        <div class="field"><label>只作用于某一台（留空=第一台）</label>
+          <input name="seedgroup_target_client" placeholder="qb1 / 10.0.0.5:8081"></div>
+        <div class="field"><label>保存路径（留空=下载器默认）</label>
+          <input name="seedgroup_save_path" placeholder="/home/qb1/qbittorrent/Downloads">
+          <span class="hint">恢复做种时填原目录 + 开「跳过校验」即可续种</span></div>
+        <div class="field wide"><label>自定义下载器</label>
+          <textarea name="seedgroup_clients_lines" placeholder="10.0.0.5:8081,admin,密码&#10;tr,10.0.0.6:9091,admin,密码"></textarea>
+          <span class="hint">每行 <code>地址,用户名,密码</code>；Transmission 写 <code>tr,地址,用户名,密码</code></span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>⑤ 保种组</h2>
+      <div class="grid">
+        <div class="field"><label>保种档位</label>
+          <select name="seedgroup_tier">
+            <option value="2T">2T（2048 GiB）</option>
+            <option value="5T">5T</option>
+            <option value="10T">10T</option>
+            <option value="15T">15T</option>
+            <option value="20T">20T</option>
+            <option value="custom">自定义</option>
+            <option value="all">全站官种（有多少保多少）</option>
+          </select></div>
+        <div class="field"><label>自定义体积（100M / 100G / 1T）</label>
+          <input name="seedgroup_custom_gib" placeholder="2048"></div>
+        <div class="field"><label>运行间隔（cron 5 段）</label>
+          <input name="seedgroup_cron" placeholder="0 */6 * * *">
+          <span class="hint">支持 <code>0 */N * * *</code>（每 N 小时）与 <code>*/N * * * *</code>（每 N 分钟）</span></div>
+        <div class="field"><label>进种限流（同时下载上限）</label>
+          <input name="seedgroup_max_downloading" type="number" min="0" placeholder="5">
+          <span class="hint">0 = 不限制</span></div>
+        <div class="field"><label>下架清理</label>
+          <select name="seedgroup_prune_mode">
+            <option value="seed">只删种子，保留文件</option>
+            <option value="files">种子和文件一起删</option>
+            <option value="off">不清理</option>
+          </select></div>
+        <div class="field"><label>动态轮换：每轮删/补数量</label>
+          <input name="seedgroup_rotate_count" type="number" min="1" max="50" placeholder="5"></div>
+        <div class="field"><div class="switch"><input type="checkbox" name="seedgroup_skip_check" id="skip"><label for="skip">跳过校验</label></div>
+          <span class="hint">仅恢复做种时开；新下载开着会全部「丢失文件」</span></div>
+        <div class="field"><div class="switch"><input type="checkbox" name="seedgroup_rotate_files" id="rot"><label for="rot">轮换时连文件一起删</label></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>⑤-2 保种限速</h2>
+      <div class="grid">
+        <div class="field"><label>下载限速（KiB/s）</label><input name="limit_dl_kib" type="number" min="0" placeholder="0">
+          <span class="hint">0 = 不接管</span></div>
+        <div class="field"><label>上传限速（KiB/s）</label><input name="limit_up_kib" type="number" min="0" placeholder="0">
+          <span class="hint">0 = 不接管</span></div>
+        <div class="field wide"><label>每客户端单独限速</label>
+          <textarea name="limit_lines" placeholder="10.0.0.5:8081,1024,2048"></textarea>
+          <span class="hint">每行 <code>客户端名或地址,下载KiB/s,上传KiB/s</code></span></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <button class="primary" type="submit">保存配置</button>
+      <span id="save-msg" class="hint"></span>
+    </div>
+  </form>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const form = $('#cfg');
+let KEYS = [];
+
+async function loadConfig(){
+  const r = await fetch('/api/config'); const c = await r.json();
+  KEYS = c.keys || [];
+  for (const [k,v] of Object.entries(c)){
+    const el = form.elements[k];
+    if (!el) continue;
+    if (el.type === 'checkbox') el.checked = !!v;
+    else el.value = v ?? '';
+  }
+  if (c.password_set) form.elements.password.placeholder = '已设置（留空 = 不修改）';
+}
+async function loadStatus(){
+  const r = await fetch('/api/status'); const s = await r.json();
+  $('#st-running').textContent = s.running ? '正在跑' : (s.enabled ? '待命' : '未启用');
+  $('#st-running').className = s.running ? 'warn' : (s.enabled ? 'ok' : 'err');
+  $('#st-tier').textContent = s.tier || '—';
+  $('#st-cron').textContent = s.cron || '—';
+  const l = s.last;
+  if (!l){ $('#st-last').textContent = '还没跑过'; $('#st-cover').textContent='—'; $('#st-short').textContent='—'; return; }
+  const t = new Date(l.at*1000).toLocaleString();
+  $('#st-last').textContent = `${t} · ${l.ok ? '成功' : '失败'} · ${l.message}`;
+  $('#st-cover').textContent = (l.covered_gib ?? '—') + ' / ' + (l.target_gib ?? '—') + ' GiB';
+  $('#st-short').textContent = (l.shortfall_gib ?? '—') + ' GiB';
+  $('#st-short').className = (l.shortfall_gib > 0) ? 'warn' : 'ok';
+}
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const body = {};
+  for (const k of KEYS){
+    const el = form.elements[k];
+    if (!el) continue;
+    if (el.type === 'checkbox') body[k] = el.checked;
+    else if (el.type === 'number') body[k] = Number(el.value || 0);
+    else {
+      if ((k === 'password' || k === 'session_token') && !el.value) continue;
+      body[k] = el.value;
+    }
+  }
+  const r = await fetch('/api/config', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  $('#save-msg').textContent = r.ok ? '已保存' : '保存失败';
+  setTimeout(()=>{ $('#save-msg').textContent='' }, 2500);
+  loadStatus();
+});
+$('#btn-run').addEventListener('click', async () => {
+  $('#btn-run').disabled = true; $('#msg').textContent = '跑一轮中…';
+  try{
+    const r = await fetch('/api/run', {method:'POST'}); const d = await r.json();
+    $('#msg').textContent = d.ok ? ('完成：' + d.message) : ('失败：' + d.message);
+  } finally { $('#btn-run').disabled = false; loadStatus(); }
+});
+loadConfig(); loadStatus();
+setInterval(loadStatus, 15000);
+</script>
+</body>
+</html>

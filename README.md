@@ -1,18 +1,17 @@
-# 可乐保种组 · MoviePilot 插件
+# 可乐保种组 · MoviePilot 插件 + 独立服务
 
-把可乐PT 的**官方种子**按档位搬进下载器长期保种：体积只超不少、进种限流、达标后动态轮换、下架自动清理、多客户端单独限速，并每轮把保种情况上报站点供工作组审核。
+**一份源码，两种用法**：
 
-> **独立插件**：本仓库只提供 `ColaSeedGroup`（保种组）。
-> 辅种是另一个插件，在 [moviepilot-plugin-colapt](https://github.com/ReelCoreHQ/moviepilot-plugin-colapt)。
-> 两者功能互补、**互不依赖**，可以只装一个，也可以都装。
+| 用法 | 适合谁 | 怎么装 |
+|---|---|---|
+| **MoviePilot 插件** | 已经有 MP，想用 MP 的下载器与整理 | 插件市场添加本仓库 |
+| **独立服务** | 不想装 MP，只要保种 | Docker，端口 **3006** |
 
-MIT 开源 ｜ 当前版本 **v0.2.17**
+两种形态跑的是**同一个文件** `plugins.v2/colaseedgroup/__init__.py`，版本号也只有一处：插件里的 `plugin_version`（当前 **0.2.18**）。不存在两份代码，也不会出现版本互相落后。
 
 ---
 
-## 安装
-
-### 方式一：插件市场（推荐，能跟随升级）
+## 一、MoviePilot 插件
 
 MoviePilot → 设置 → 插件市场 → **添加仓库**：
 
@@ -20,21 +19,46 @@ MoviePilot → 设置 → 插件市场 → **添加仓库**：
 https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup
 ```
 
-刷新市场 → 找到「可乐保种组」→ 安装 → 启用。
+刷新 → 找到「可乐保种组」→ 安装 → 启用。
 
-> 想同时用辅种，再把 `https://github.com/ReelCoreHQ/moviepilot-plugin-colapt` 也加进市场，两个插件会并列显示，各自安装。
-
-### 方式二：一键脚本
+或用脚本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/main/install.sh | bash
-# 卸载
-curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/main/install.sh | bash -s uninstall
 ```
 
-容器升级重建后要重跑一次；想跟随升级请用方式一。
+---
+
+## 二、独立服务（Docker，不需要 MP）
+
+```bash
+mkdir -p colaseedbox/data && cd colaseedbox
+curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/main/docker-compose.yml -o docker-compose.yml
+docker compose up -d
+```
+
+打开 **http://你的IP:3006**。
+
+或者不用 compose：
+
+```bash
+docker run -d --name colaseedbox --restart unless-stopped \
+  -p 3006:3006 -v $(pwd)/data:/data -e TZ=Asia/Shanghai \
+  ghcr.io/reelcorehq/colaseedbox:latest
+```
+
+**连宿主机上的 qB**：容器里的 `127.0.0.1` 是容器自己，用 `host.docker.internal:8081`，compose 里加：
+
+```yaml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+**独立版不含什么**：MP 的加种后自动整理、刮削、订阅、下载器管理 —— 那些是 MP 的职责，独立版刻意剥离，只做保种。
 
 ---
+
+## 三、两者共有的行为
 
 ## 谁能用
 
