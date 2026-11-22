@@ -1288,7 +1288,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.4.1"
+    plugin_version = "0.4.2"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1966,7 +1966,7 @@ class ColaSeedGroup(_PluginBase):
         # ── ① 一天只做一次 ──
         today = datetime.now().strftime("%Y-%m-%d")
         if str(self.get_data("seedgroup_rotate_date") or "") == today:
-            out["reason"] = "今天已经轮换过（每天最多 1 颗）"
+            out["reason"] = f"今天已经轮换过（每天最多 {self.SG_ROTATE_PER_DAY} 颗）"
             return out
 
         existing, current_gib, _blind, _offline = self._sg_current(clients)
