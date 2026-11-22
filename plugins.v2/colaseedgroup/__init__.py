@@ -1288,7 +1288,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.3.3"
+    plugin_version = "0.3.4"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1422,7 +1422,11 @@ class ColaSeedGroup(_PluginBase):
             # 动态保种强制开启：配置里写 false 也按 true 处理（老板 2026-11-15）
             self._seedgroup_rotate = True
             try:
-                self._seedgroup_rotate_count = max(1, min(50, int(config.get("seedgroup_rotate_count", 5) or 5)))
+                # 轮换是强制的（_seedgroup_rotate 恒 True），所以这个数字只能是「每轮动几颗」。
+                # 0 或留空视为默认 5 —— 以前 max(1, 0) 会变成 1，也就是每轮只删补一颗，
+                # 既没真正轮换、又让下载器白忙（2026-11-22 老板问「可以设置0？」时查出的坑）。
+                raw_rotate = int(config.get("seedgroup_rotate_count", 5) or 0)
+                self._seedgroup_rotate_count = max(1, min(50, raw_rotate if raw_rotate > 0 else 5))
             except Exception:
                 self._seedgroup_rotate_count = 5
             self._seedgroup_rotate_files = bool(config.get("seedgroup_rotate_files", True))
@@ -1952,7 +1956,8 @@ class ColaSeedGroup(_PluginBase):
         if not clients:
             out["reason"] = "没有可用的下载器"
             return out
-        limit = max(1, min(50, int(self._seedgroup_rotate_count or 5)))
+        raw_limit = int(self._seedgroup_rotate_count or 0)
+        limit = max(1, min(50, raw_limit if raw_limit > 0 else 5))
         existing, _, _, _ = self._sg_current(clients)
         items = self._sg_items()
         by_tid = {str(x.get("torrent_id")): x for x in pool_all if x.get("torrent_id") is not None}
@@ -3805,9 +3810,10 @@ class ColaSeedGroup(_PluginBase):
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_rotate_count",
-                             "label": "动态保种：每轮删/补数量（强制开启）", "type": "number", "min": 1,
+                             "label": "动态保种：每轮删/补数量", "type": "number", "min": 1, "max": 50,
                              "persistent-hint": True,
-                             "hint": "达到档位后自动轮换：删做种人数最多的那几颗，补做种人数最少的同数量"}}]},
+                             "hint": "轮换强制开启（不给关）。留空或 0 = 默认 5；范围 1–50。"
+                                     "每轮删做种人数最多的 N 颗、补最少的 N 颗"}}]},
                         {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 8}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_rotate_files",
                              "label": "轮换时连文件一起删（不勾只删种子、保留文件）"}}]},
