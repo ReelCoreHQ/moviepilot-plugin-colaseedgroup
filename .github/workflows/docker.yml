@@ -1,47 +1,42 @@
-# 构建并推送独立版 Docker 镜像到 GHCR。
+# 验证独立版镜像能构建。
 #
-# 为什么要有这条流水线：docker-compose.yml 里是 `build: .`，
-# 只有 clone 整个仓库的人才能构建 —— 只想跑容器的人得先装 git 和构建工具链。
-# 有了预构建镜像，一行 docker run 就能起来。
+# **不推 GHCR**：ReelCoreHQ 组织的 packages 权限对 GITHUB_TOKEN 返回
+# denied: permission_denied: read_package（试过换镜像名，同样的错），
+# 说明是组织级限制，不是名字冲突。要推得先配一个有 packages:write 的 PAT。
+#
+# 所以对外只提供「clone 整个仓库后 docker compose up -d」这一条路径 ——
+# 那是能保证работ的。这条流水线的价值是：有人在 PR 里动了 Dockerfile / app/ 时，
+# 立刻发现镜像构建坏了。
 name: docker
 
 on:
   push:
     branches: [main]
-    tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write        # 推 GHCR 必需
     steps:
       - uses: actions/checkout@v4
-
       - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/colaseedgroup
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=tag
-            type=sha,prefix=sha-,format=short
-
-      - uses: docker/build-push-action@v6
+      - name: 构建（不推送）
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          push: false
+          load: true
+          tags: colaseedbox:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: 冒烟：容器能起来并响应 /api/health
+        run: |
+          docker run -d --name smoke -p 3006:3006 colaseedbox:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3006/api/health >/dev/null 2>&1; then
+              echo "health ok"; curl -s http://127.0.0.1:3006/api/health; exit 0
+            fi
+            sleep 2
+          done
+          echo "容器没起来，日志："; docker logs smoke; exit 1

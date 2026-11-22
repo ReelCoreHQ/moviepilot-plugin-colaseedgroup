@@ -53,16 +53,6 @@ cd moviepilot-plugin-colaseedgroup-main
 docker compose up -d
 ```
 
-### 用预构建镜像（不构建）
-
-```bash
-docker run -d --name colaseedbox --restart unless-stopped \
-  -p 3006:3006 \
-  -v $(pwd)/data:/data \
-  -e TZ=Asia/Shanghai \
-  ghcr.io/reelcorehq/colaseedgroup:latest
-```
-
 ### 连宿主机上的 qB
 
 容器里的 `127.0.0.1` 是容器自己，用 `host.docker.internal:8081`，compose 里加：
