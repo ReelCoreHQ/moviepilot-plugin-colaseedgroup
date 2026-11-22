@@ -15,6 +15,15 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai
 
 WORKDIR /app
+
+# 插件对可乐PT 的请求走系统 curl（见 __init__.py 的 _curl：部分 NAS/容器镜像里
+# python+OpenSSL 的握手会被 Cloudflare 拦，curl 同一台机器却能通）。
+# python:3.12-slim 里没有 curl，漏了这一层就是「所有站内请求 Errno 2 no such file」。
+# ca-certificates 一起装上，否则 curl 校验不了站点证书。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
