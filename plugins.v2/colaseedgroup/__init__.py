@@ -899,7 +899,10 @@ class QBittorrentClient(_Client):
     QB_LIST_RETRY = 2          # 单页失败重试次数
     # 列表请求用短超时：它是每分钟一轮的常规动作，不能占着 90 秒让两轮叠在一起。
     # 45 秒在 293ms RTT 的远端链路上足够读完 500 条；真读不完就重试，再不行就沿用上次读数。
-    QB_LIST_TIMEOUT = 45
+    # 45 秒在 Cloudflare 隧道下不够：filter=all 要读全部种子（实测 1042 条 = 3 页），
+    # 比 filter=completed（约 375 条）多 3 倍数据，单页经常 45 秒读不完 →
+    # Read timed out / 502，下架清理和覆盖统计一起失败（2026-11-22 实测）。
+    QB_LIST_TIMEOUT = 120
 
     def _list_page(self, page: int, filter_: str = "completed") -> List[Dict[str, Any]]:
         """取一页 completed 种子，网络类失败就地重试。
@@ -1285,7 +1288,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.3.1"
+    plugin_version = "0.3.2"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
