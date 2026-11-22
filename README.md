@@ -31,7 +31,42 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colase
 
 ## 二、独立服务（Docker，不需要 MP）
 
-### 一行拉起来（推荐）
+### 一键装（推荐）
+
+在**要跑保种的机器**上执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/main/install-box.sh | bash
+```
+
+装完打开 **http://<本机IP>:3006**，填 API Key 即可。
+
+**脚本做了什么**（看一眼心里有数）：检查 Docker → 下载代码到 `~/colaseedbox` → 写初始配置 → 构建镜像 → 起容器 → 等健康检查通过。
+
+**重复跑是安全的**：会更新代码并重建容器，`~/colaseedbox/data` 里的配置保留。
+
+### 带参数装
+
+qB 不在本机、或想换端口/档位：
+
+```bash
+BOX_PORT=3007 \
+BOX_QB=10.0.0.5:8080 BOX_QB_USER=qb1 BOX_QB_PASS=mypass \
+BOX_TIER=5T \
+BOX_KEY=rcapi_xxx \
+bash <(curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/main/install-box.sh)
+```
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `BOX_DIR` | `~/colaseedbox` | 装到哪 |
+| `BOX_PORT` | `3006` | 面板端口 |
+| `BOX_QB` | `127.0.0.1:8081` | qB 地址 |
+| `BOX_QB_USER` / `BOX_QB_PASS` | `admin` / `adminadmin` | qB 凭据 |
+| `BOX_TIER` | `2T` | 档位（2T/5T/10T/15T/20T/all/custom） |
+| `BOX_KEY` | 空 | API Key，不填就装完在面板里填 |
+
+### 手动装（想自己控制每一步）
 
 ```bash
 git clone --depth 1 https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup.git
@@ -39,13 +74,9 @@ cd moviepilot-plugin-colaseedgroup
 docker compose up -d
 ```
 
-打开 **http://你的IP:3006**。
+> **必须 clone 整个仓库**。`docker-compose.yml` 里是 `build: .`，需要同目录的 `Dockerfile`、`requirements.txt`、`app/`、`templates/`。只 curl 一个 compose 文件会报 `failed to read dockerfile: open Dockerfile: no such file or directory`。
 
-> **注意**：必须 clone **整个仓库**。`docker-compose.yml` 里是 `build: .`，
-> 需要同目录的 `Dockerfile`、`requirements.txt`、`app/`、`templates/` 才能构建。
-> 只 curl 一个 compose 文件会报 `failed to read dockerfile: open Dockerfile: no such file or directory`。
-
-### 没有 git 的机器
+没有 git 的机器：
 
 ```bash
 curl -fsSL https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/archive/refs/heads/main.tar.gz | tar xz
@@ -55,14 +86,29 @@ docker compose up -d
 
 ### 连宿主机上的 qB
 
-容器里的 `127.0.0.1` 是容器自己，用 `host.docker.internal:8081`，compose 里加：
+**最容易踩的坑**：容器里的 `127.0.0.1` 是**容器自己**，不是宿主机。
 
-```yaml
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-```
+| 写法 | 结果 |
+|---|---|
+| `127.0.0.1:8081` | ❌ 连不上（容器里没 qB） |
+| `host.docker.internal:8081` | ✅ 需在 compose 打开 `extra_hosts`（一键脚本已打开） |
+| **宿主机真实 IP**`192.168.1.10:8081` | ✅ 最直接 |
 
-**独立版不含** MP 的加种后自动整理、刮削、订阅、下载器管理 —— 那些是 MP 的职责，独立版刻意剥离，只做保种。两边跑的是同一份代码、同一个版本号。
+qB 必须监听 `0.0.0.0`（默认就是），只绑 `127.0.0.1` 的话容器进不来。
+
+### 常见问题
+
+**面板打开是空白 / 502？**
+`docker logs colaseedbox` 看原因。多数是端口被占（换 `BOX_PORT`）或容器没起（`docker compose up -d` 重试）。
+
+**连通性检测报「没有可用下载器」？**
+这条是误报（检测的是辅种的下载器列表，不是保种组的）。看下方「保种组状态」里的 `report_ok` 才是真的。
+
+**qB 用户名密码不对？**
+面板 →「下载器」那一行改，格式 `地址,用户名,密码`。改了保存就会重连。
+
+**想升级？**
+重跑一键脚本即可。
 
 ---
 

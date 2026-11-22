@@ -188,3 +188,36 @@ class RotateAntiFlapTest(unittest.TestCase):
         self.assertGreater(guard, 0)
         self.assertGreater(pick, 0)
         self.assertLess(guard, pick, "余量检查要在挑种子之前")
+
+
+class ConnectivityCheckTest(unittest.TestCase):
+    """连通性检测必须测保种组真正会用的那批下载器。
+
+    2026-11-23 用户反馈：在「保种组自定义下载器」里填了
+    `198-远端,192.168.31.100,user,pass`，面板却显示
+    「❌ 没有可用下载器：检查「下载器」每行格式与地址」。
+    根因是 _test_clients() 读的是 self._clients()（辅种那套），
+    而 MoviePilot 自己的 Qbittorrent 在新版本里没有 _host，读出来是空。
+    """
+
+    def test_checks_seedgroup_clients_when_enabled(self):
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._test_clients)
+        self.assertIn("_sg_clients()", src, "保种组启用时必须测保种组的下载器")
+        self.assertIn("self._seedgroup_enabled", src)
+
+    def test_four_part_line_parses(self):
+        """`名称,地址,用户名,密码` 四段写法必须能解析出地址。"""
+        parts = SG_MOD.ColaSeedGroup._split_line("198-远端,192.168.31.100,qb1,secret")
+        self.assertEqual(len(parts), 4)
+        idx = next((i for i, p in enumerate(parts)
+                    if SG_MOD.ColaSeedGroup._looks_like_address(p)), None)
+        self.assertEqual(idx, 1, "地址应在第 2 段")
+        self.assertEqual(parts[idx], "192.168.31.100")
+
+    def test_mp_downloader_warning_is_not_noise(self):
+        """读 MP 下载器失败不该是 WARN —— 用自定义下载器时那是无关信息。"""
+        import pathlib
+        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
+        self.assertNotIn('logger.warn(f"读取 MoviePilot qBittorrent 失败', src)
+        self.assertIn("仅在用 MP 下载器时需要", src)

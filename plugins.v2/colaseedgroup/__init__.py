@@ -1319,7 +1319,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.5.2"
+    plugin_version = "0.5.3"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1903,7 +1903,10 @@ class ColaSeedGroup(_PluginBase):
                                              getattr(qb, "delete_torrent", None),
                                              getattr(qb, "get_torrents", None)))
                 except Exception as err:
-                    logger.warn(f"读取 MoviePilot qBittorrent 失败：{err}")
+                    # 新版 MP 的 Qbittorrent() 写法变过（实例化后没有 _host 等私有属性），
+                    # 这条只在「用 MP 下载器」那条路上才有意义。保种组填了自定义下载器时
+                    # 根本用不到它 —— 打成 WARN 会让用户以为自己的配置坏了（2026-11-23 反馈）。
+                    logger.info(f"读取 MoviePilot qBittorrent 失败（仅在用 MP 下载器时需要）：{err}")
                 try:
                     from app.modules.transmission import Transmission
                     tr = Transmission()
@@ -1913,7 +1916,7 @@ class ColaSeedGroup(_PluginBase):
                         out.append(_MPClient("MP-TR", tr.get_completed_torrents, tr.add_torrent,
                                              getattr(tr, "delete_torrent", None)))
                 except Exception as err:
-                    logger.warn(f"读取 MoviePilot Transmission 失败：{err}")
+                    logger.info(f"读取 MoviePilot Transmission 失败（仅在用 MP 下载器时需要）：{err}")
         line_clients = self._parse_client_lines(line_text)
         if line_clients:
             out.extend(line_clients)
@@ -2762,16 +2765,41 @@ class ColaSeedGroup(_PluginBase):
                 return url
         return ""
     def _test_clients(self) -> List[str]:
+        """连通性检测：测**保种组真正会用的那批下载器**。
+
+        # 2026-11-23 用户反馈的 BUG
+
+        原来这里调的是 `self._clients()` —— 辅种的下载器。于是：
+        · 用户在「保种组自定义下载器」里填了 `198-远端,192.168.31.100,user,pass`；
+        · 检测却去读 MoviePilot 自己那套下载器，而 MoviePilot 的
+          `Qbittorrent` / `Transmission` 在部分版本里没有 `_host` 属性，读出来是空；
+        · 结果面板显示「❌ 没有可用下载器：检查「下载器」每行格式与地址」，
+          **明明配了、明明能用，却告诉用户格式不对**。
+
+        保种组启用时必须以 `_sg_clients()` 为准 —— 那才是它真正加种的目标机器。
+        """
         lines: List[str] = []
-        for client in self._clients():
-            torrents = client.list_completed()
+        if self._seedgroup_enabled:
+            clients = self._sg_clients()
+            source = "保种组"
+        else:
+            clients = self._clients()
+            source = "辅种"
+        if not clients:
+            lines.append(f"❌ 没有可用下载器（{source}）：检查「下载器」每行格式与地址")
+            return lines
+        for client in clients:
+            try:
+                torrents = client.list_completed()
+            except Exception as err:
+                # 连不上要说清是哪台、什么错 —— 只说「没有可用下载器」等于什么都没说。
+                lines.append(f"❌ {client.name}：连接失败（{type(err).__name__}: {err}）")
+                continue
             if torrents:
                 lines.append(f"✅ {client.name}：连接成功，已完成 {len(torrents)} 个种子")
             else:
                 # 能连上但列表为空，和连不上要分开说。
                 lines.append(f"⚠️ {client.name}：连接成功，但没有已完成种子（或读取失败）")
-        if not lines:
-            lines.append("❌ 没有可用下载器：检查「下载器」每行格式与地址")
         return lines
 
     def _probe_pieces(self, site: Dict[str, str]) -> Tuple[bool, str]:
@@ -3443,6 +3471,30 @@ class ColaSeedGroup(_PluginBase):
             "pool_source": str(self.get_data("seedgroup_pool_source") or ""),
             "api_key": "present" if self._api_key else "missing",
         }
+
+    def seed_group_run_once(self, **kwargs) -> Dict[str, Any]:
+        """立即跑一轮保种组同步 —— 设置页那个「立即运行一次」按钮。
+
+        # 为什么要后台线程
+
+        MoviePilot 调用 action 时是**同步等返回**的，而一轮保种组同步可能跑几十秒
+        （拉官方池、按 qB 现状比对、加种、上报）。等它跑完再返回，设置页会一直转圈，
+        前端超时后还会显示「执行失败」—— 明明任务在跑。
+
+        所以这里只是**起一个线程**再立刻返回，把真实结果留给面板上的状态区去读
+        （`seed_group_status`）。用户点一下就等到「已开始」，不用盯着转圈。
+
+        # 与定时任务的关系
+
+        它直接调 `seed_group_sync()`，也就是和 cron 走同一条路 —— 不会出现
+        「手动跑的结果和定时跑的不一样」。并发跑两轮的风险由 `_sg_lock` 之类挡住，
+        这里不额外加锁。
+        """
+        if not self._seedgroup_enabled:
+            return {"ok": False, "message": "保种组没启用，先在设置里打开「启用保种组」"}
+        thread = threading.Thread(target=self.seed_group_sync, name="colaseedgroup-manual", daemon=True)
+        thread.start()
+        return {"ok": True, "message": "已开始，结果见下方「保种组状态」（约 30 秒后刷新）"}
 
     def seed_group_sync(self):
         """保种组任务入口：任何异常只记日志 + 通知，不让 MoviePilot 报「执行失败」。"""
