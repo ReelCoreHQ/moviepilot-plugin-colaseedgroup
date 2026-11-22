@@ -1253,7 +1253,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.17"
+    plugin_version = "0.2.18"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3905,12 +3905,12 @@ class ColaSeedGroup(_PluginBase):
                 "content": [
                     # ── 总开关（放最上面，开关一关下面都不跑）──
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件（总开关）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_enabled",
                              "label": "启用保种组"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "notify", "label": "任务结果通知"}}]},
                     ]},
                     {"component": "VRow", "content": [
@@ -3927,16 +3927,16 @@ class ColaSeedGroup(_PluginBase):
                                        "第一次使用先打开插件页取验证码，填到「验证码」保存即完成登录；"
                                        "会话过期插件会发站内通知，重新取一次即可。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "username", "label": "用户名"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "password", "label": "密码", "type": "password"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "captcha_code",
                              "label": "验证码（先在插件页看图片）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
                             {"component": "VTextField", "props": {"model": "otp_code", "label": "两步验证码（可选）"}}]},
                     ]},
 
@@ -3945,7 +3945,7 @@ class ColaSeedGroup(_PluginBase):
                                        "勾「使用 MoviePilot 已配置下载器」就用 MP 里的那几台；"
                                        "否则在下面按行填地址与账号。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_use_mp_clients",
                              "label": "保种用 MP 已配置下载器"}}]},
                     ]},
@@ -3964,52 +3964,56 @@ class ColaSeedGroup(_PluginBase):
                                         "建议在 MP「设置 → 目录/整理」里把整理方式设为硬链接（硬链接不占双份空间），"
                                         "或改用下面的「自定义下载器」专门保种。"}}]},
                     ]},
+                    # 栅格一律三档：手机 12（单列）/ 平板 6（两列）/ 桌面 4（三列）。
+                    # 每个字段独占一个 VCol —— 以前把 cron 和进种限流塞进同一个 VCol，
+                    # 两个 persistent-hint 会互相挤压，视觉上像叠在一起。
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 5}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VSelect", "props": {"model": "seedgroup_tier", "label": "保种档位", "items": [
                                 {"title": SEED_GROUP_TIER_LABELS[k], "value": k}
                                 for k in (list(SEED_GROUP_TIERS)
                                           + [SEED_GROUP_CUSTOM_TIER, SEED_GROUP_ALL_TIER])]}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_cron",
                              "label": "保种运行间隔（cron，5 段）", "persistent-hint": True,
                              "hint": "例如 0 */6 * * * = 每 6 小时；写错会静默按每 6 小时跑",
-                             "placeholder": "0 */6 * * *"}},
+                             "placeholder": "0 */6 * * *"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_max_downloading",
-                             "label": "进种限流：同时下载不超过 N 个", "type": "number",
+                             "label": "进种限流（同时下载上限）", "type": "number",
                              "persistent-hint": True,
-                             "hint": "客户端里「正在下载」的种子达到这个数就不再进种，等下完再补；0 = 不限制。"
-                                     "默认 5：让覆盖稳步追平，而不是一次塞几百颗互相抢带宽"}}]},
+                             "hint": "0 = 不限制；默认 5，让覆盖稳步追平"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_custom_gib",
                              "label": "自定义体积（100M / 100G / 1T / 1P）",
                              "persistent-hint": True,
                              "hint": "仅选「自定义档」时生效；不带单位按 GiB"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VSelect", "props": {"model": "seedgroup_client_mode", "label": "保种下载器", "items": [
                                 {"title": "用 MP 已配置下载器", "value": "mp"},
                                 {"title": "用下面填的自定义下载器", "value": "custom"}]}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_target_client",
                              "label": "保种加到哪台（留空=第一台）",
                              "placeholder": "MP-qb / QB-1 / TR-1"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "seedgroup_save_path",
-                             "label": "保存路径（留空=下载器默认）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VSwitch", "props": {"model": "seedgroup_skip_check",
-                             "label": "保种组：跳过校验（新下载不要开）",
-                             "persistent-hint": True,
-                             "hint": "只在「文件已经在磁盘上、只是种子丢了」的恢复场景打开。"
-                                     "保种是从站点新下载的，开着它 qB 会以为文件已完整，"
-                                     "全部变成「丢失文件」、进度 0%、永远下不动"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        # 路径给 8 格：md:4 时 /home/qb1/qbittorrent/Downloads 会被截断。
+                        {"component": "VCol", "props": {"cols": 12, "sm": 12, "md": 8}, "content": [
+                            {"component": "VTextField", "props": {"model": "seedgroup_save_path",
+                             "label": "保存路径（留空=下载器默认）",
+                             "persistent-hint": True,
+                             "hint": "恢复做种时填原下载目录 + 开「跳过校验」即可直接续种，不会重新下载"}}]},
+                        {"component": "VCol", "props": {"cols": 12, "sm": 12, "md": 4}, "content": [
+                            {"component": "VSwitch", "props": {"model": "seedgroup_skip_check",
+                             "label": "跳过校验",
+                             "persistent-hint": True,
+                             "hint": "仅恢复做种时开；新下载开着会全部「丢失文件」"}}]},
+                    ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 12, "md": 6}, "content": [
                             {"component": "VSelect", "props": {"model": "seedgroup_prune_mode", "label": "下架清理（每轮回站点核对 status/official）", "items": [
                                 {"title": "只删种子，保留文件（默认）", "value": "seed"},
                                 {"title": "种子和文件一起删", "value": "files"},
@@ -4019,12 +4023,12 @@ class ColaSeedGroup(_PluginBase):
                                        "留空 = 完全不碰下载器原有设置；填了才强行接管，每轮保种同步都会重新下发。"
                                        "辅种不走这里，也不受这里影响。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "limit_dl_kib",
                              "label": "保种下载限速（KiB/s）", "type": "number", "min": 0,
                              "persistent-hint": True,
                              "hint": "留空/0 = 不接管下载"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "limit_up_kib",
                              "label": "保种上传限速（KiB/s）", "type": "number", "min": 0,
                              "persistent-hint": True,
@@ -4039,12 +4043,12 @@ class ColaSeedGroup(_PluginBase):
                              "placeholder": "10.0.0.5:8081,1024,2048\nMP-qb,0,3000"}}]},
                     ]},
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VTextField", "props": {"model": "seedgroup_rotate_count",
                              "label": "动态保种：每轮删/补数量（强制开启）", "type": "number", "min": 1,
                              "persistent-hint": True,
                              "hint": "达到档位后自动轮换：删做种人数最多的那几颗，补做种人数最少的同数量"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 8}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_rotate_files",
                              "label": "轮换时连文件一起删（不勾只删种子、保留文件）"}}]},
                     ]},

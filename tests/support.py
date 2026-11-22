@@ -144,6 +144,52 @@ def load_seedgroup_plugin():
 
 
 
+class FakeClient:
+    """下载器替身：记录调用，按需返回 ok / dup / fail。"""
+
+    name = "fake-qb"
+
+    def __init__(self, has_hash=(), add_result="ok"):
+        self._has = set(has_hash)
+        self._add_result = add_result
+        self.added = []
+        self.trackers = []
+        self.deleted = []
+        self.speed_limits = None
+        # 进种限流用：客户端里「正在下载」的条数（默认 0 = 队列空，永远有额度）
+        self.inflight_count = 0
+
+    def list_completed(self):
+        return []
+
+    def inflight(self):
+        return self.inflight_count
+
+    def has(self, info_hash):
+        return info_hash in self._has
+
+    def add(self, torrent, save_path, skip_check, label="", hash_hint="", category="", auto_tmm=False):
+        self.added.append({"save_path": save_path, "skip_check": skip_check,
+                           "label": label, "hash_hint": hash_hint,
+                           "category": category, "auto_tmm": auto_tmm})
+        return self._add_result
+
+    def add_trackers(self, info_hash, urls):
+        self.trackers.append((info_hash, list(urls)))
+        return True
+
+    def set_speed_limits(self, dl_kib, up_kib):
+        self.speed_limits = (dl_kib, up_kib)
+        return True
+
+    def tagged_missing(self, tag):
+        return []
+
+    def delete(self, hashes, delete_files=False):
+        self.deleted.extend(hashes)
+        return True
+
+
 def make_plugin(module, store=None, cls_name=None, **attrs):
     """绕过 _PluginBase.__init__ 造一个实例，插件数据换成内存字典。
 
