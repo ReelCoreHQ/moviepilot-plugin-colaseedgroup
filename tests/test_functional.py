@@ -673,10 +673,22 @@ class RotateTest(unittest.TestCase):
         plugin = self._plugin()
         # 客户端里已有 A(seeders=900) B(seeders=400)；C(seeders=3)/D(seeders=1) 未保
         client = support.FakeClient()
-        client.list_completed = lambda: [
-            {"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB},
-            {"hash": "b" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB},
+        _four_days_ago = int(__import__("time").time()) - 4 * 86400
+        _rows = [
+            {"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB, "added_on": _four_days_ago},
+            {"hash": "b" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB, "added_on": _four_days_ago},
         ]
+        _live = list(_rows)
+
+        def _delete(hashes, delete_files=False):
+            for h in hashes:
+                _live[:] = [r for r in _live if r["hash"] != h]
+            client.deleted.extend(hashes)
+            return True
+
+        client.delete = _delete
+        client.list_completed = lambda: list(_live)
+        client.list_all = lambda: list(_live)
         plugin.save_data("seedgroup_items", {
             "a" * 40: {"torrent_id": 1, "name": "A"},
             "b" * 40: {"torrent_id": 2, "name": "B"},
@@ -688,9 +700,10 @@ class RotateTest(unittest.TestCase):
             {"torrent_id": 4, "info_hash": "d" * 40, "name": "D", "seeders": 1, "size": SG_MOD.GIB},
         ]
         plugin._sg_download = lambda item: support.make_torrent(name=str(item.get("name")))
-        out = plugin._sg_rotate([client], {}, pool)
-        self.assertEqual(out["dropped"], 2)          # count=5 但只有 2 颗可删
-        self.assertEqual(out["added"], 2)
+        # 覆盖 2 GiB = 目标 2 GiB（刚好达标）→ 删掉 A/B 后为 0 → 必须补 C/D 补回来
+        out = plugin._sg_rotate([client], {"target_gib": 2.0}, pool)
+        self.assertEqual(out["dropped"], 2)          # 每天 2 颗，正好 A(900) 和 B(400)
+        self.assertEqual(out["added"], 2)            # 删完不够，补 C(3)/D(1)
         self.assertTrue(any("A" in n for n in out["dropped_names"]))   # 900 先删
         self.assertTrue(any("D" in n for n in out["added_names"]))     # 1 先补
         self.assertIn("a" * 40, client.deleted)
@@ -698,23 +711,40 @@ class RotateTest(unittest.TestCase):
     def test_rotate_respects_count(self):
         plugin = self._plugin(count=1)
         client = support.FakeClient()
-        client.list_completed = lambda: [{"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB}]
+        _old = int(__import__("time").time()) - 4 * 86400
+        _rows = [{"hash": "a" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB, "added_on": _old}]
+        _live = list(_rows)
+
+        def _delete(hashes, delete_files=False):
+            for h in hashes:
+                _live[:] = [r for r in _live if r["hash"] != h]
+            client.deleted.extend(hashes)
+            return True
+
+        client.delete = _delete
+        client.list_completed = lambda: list(_live)
+        client.list_all = lambda: list(_live)
         plugin.save_data("seedgroup_items", {"a" * 40: {"torrent_id": 1, "name": "A"}})
         pool = [{"torrent_id": 1, "info_hash": "a" * 40, "name": "A", "seeders": 50, "size": SG_MOD.GIB},
                 {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 0, "size": SG_MOD.GIB}]
         plugin._sg_download = lambda item: support.make_torrent()
-        out = plugin._sg_rotate([client], {}, pool)
+        # 覆盖 1 GiB = 目标 1 GiB（刚好达标）→ 删掉这 1 颗后为 0 → 必须补 1 颗
+        out = plugin._sg_rotate([client], {"target_gib": 1.0}, pool)
         self.assertEqual(out["dropped"], 1)
         self.assertEqual(out["added"], 1)
 
     def test_rotate_skips_unknown_torrent(self):
         plugin = self._plugin()
         client = support.FakeClient()
-        client.list_completed = lambda: [{"hash": "z" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB}]
+        _old = int(__import__("time").time()) - 4 * 86400
+        _rows = [{"hash": "z" * 40, "tags": SG_MOD.SEED_GROUP_TAG, "size": SG_MOD.GIB, "added_on": _old}]
+        client.list_completed = lambda: list(_rows)
+        client.list_all = lambda: list(_rows)
         plugin.save_data("seedgroup_items", {"z" * 40: {"torrent_id": 99, "name": "Z"}})
-        out = plugin._sg_rotate([client], {}, [{"torrent_id": 1, "name": "A", "seeders": 1}])
+        # 池子里只有 torrent_id=1，与本地 torrent_id=99 对不上 → 查不到做种人数，不能删
+        out = plugin._sg_rotate([client], {"target_gib": 1.0}, [{"torrent_id": 1, "name": "A", "seeders": 1}])
         self.assertEqual(out["dropped"], 0)
-        self.assertIn("查不到", out["reason"])
+        self.assertIn("没有可删", out["reason"])
 
 
 class AllTierTest(unittest.TestCase):
@@ -976,13 +1006,15 @@ class FormLayoutTest(unittest.TestCase):
         for gone in ("username", "password", "captcha_code", "otp_code", "seedgroup_api_key"):
             self.assertNotIn(gone, models)
             self.assertNotIn(gone, defaults)
+        # seedgroup_rotate_count 已移除：轮换频率固定为「每天 2 颗」，不再对外暴露数值
         for key in ("api_key", "seedgroup_enabled", "seedgroup_tier", "seedgroup_cron",
                     "seedgroup_max_downloading", "seedgroup_save_path",
                     "seedgroup_skip_check", "seedgroup_client_mode",
-                    "seedgroup_prune_mode", "seedgroup_rotate_count",
-                    "seedgroup_rotate_files", "seedgroup_clients_lines",
-                    "limit_dl_kib", "limit_up_kib", "limit_lines"):
+                    "seedgroup_prune_mode", "seedgroup_rotate_files",
+                    "seedgroup_clients_lines", "limit_dl_kib", "limit_up_kib", "limit_lines"):
             self.assertIn(key, models, f"表单缺少字段 {key}")
+        self.assertNotIn("seedgroup_rotate_count", models,
+                         "轮换频率固定，不该再有这个数值输入框")
 
     def test_every_model_has_a_default(self):
         form, defaults = self._form()

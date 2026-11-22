@@ -1288,7 +1288,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.3.4"
+    plugin_version = "0.4.0"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1422,13 +1422,10 @@ class ColaSeedGroup(_PluginBase):
             # 动态保种强制开启：配置里写 false 也按 true 处理（老板 2026-11-15）
             self._seedgroup_rotate = True
             try:
-                # 轮换是强制的（_seedgroup_rotate 恒 True），所以这个数字只能是「每轮动几颗」。
-                # 0 或留空视为默认 5 —— 以前 max(1, 0) 会变成 1，也就是每轮只删补一颗，
-                # 既没真正轮换、又让下载器白忙（2026-11-22 老板问「可以设置0？」时查出的坑）。
-                raw_rotate = int(config.get("seedgroup_rotate_count", 5) or 0)
-                self._seedgroup_rotate_count = max(1, min(50, raw_rotate if raw_rotate > 0 else 5))
+                # 轮换频率固定为「每天 1 颗」（老板 2026-11-22 定），不再对外暴露数值。
+                self._seedgroup_rotate_count = self.SG_ROTATE_PER_DAY
             except Exception:
-                self._seedgroup_rotate_count = 5
+                self._seedgroup_rotate_count = self.SG_ROTATE_PER_DAY
             self._seedgroup_rotate_files = bool(config.get("seedgroup_rotate_files", True))
             prune_mode = str(config.get("seedgroup_prune_mode") or "").strip().lower()
             if prune_mode not in ("off", "seed", "files"):
@@ -1478,7 +1475,6 @@ class ColaSeedGroup(_PluginBase):
             "seedgroup_skip_check": self._seedgroup_skip_check,
             "seedgroup_client_mode": self._seedgroup_client_mode,
             "seedgroup_rotate": self._seedgroup_rotate,
-            "seedgroup_rotate_count": self._seedgroup_rotate_count,
             "seedgroup_rotate_files": self._seedgroup_rotate_files,
             "seedgroup_prune_mode": self._seedgroup_prune_mode,
             "seedgroup_prune": self._seedgroup_prune,
@@ -1942,10 +1938,20 @@ class ColaSeedGroup(_PluginBase):
 
     def _sg_rotate(self, clients: List[_Client], state: Dict[str, Any],
                    pool_all: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """体积已达标时的动态保种：删「做种人数最多」的，补「做种人数最少」的。
+        """达标后的动态保种：**每天**删 1 颗做种人数最多的，按体积需要补几颗。
 
-        只在达标后执行（没达标就只补满，不轮换）；每次各 N 颗（默认 5）。
-        「做种人数」取站点侧的 seeders（跟池子一起拉回来的）。
+        # 规则（老板 2026-11-22 定，全部强制）
+
+        · **频率**：一天最多 1 颗，不是「每轮」。同一自然日跑过就不再动。
+        · **能不能删**：只能删**本地做种满 3 天**的种子。刚加进来的还没坐热，不动。
+        · **删谁**：站点侧 seeders 最多的那颗（人最多 = 最不缺）。
+        · **补几颗**：删完重新算覆盖 ——
+            还 ≥ 目标 → **今天不补**（删的是小种子，体积仍够）；
+            掉到目标以下 → 补最缺的，**补到够了就停**（可能补好几颗小的）。
+        · **什么时候才允许轮换**：
+            固定档位 → 覆盖 ≥ 设定体积；
+            全站官种 → 覆盖 ≥ 池子总量的 **80%**；
+            **池子已经保全（≈100%）→ 不允许删**，删了再也补不回来。
         """
         out: Dict[str, Any] = {"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                "dropped": 0, "added": 0, "failed": 0,
@@ -1956,38 +1962,68 @@ class ColaSeedGroup(_PluginBase):
         if not clients:
             out["reason"] = "没有可用的下载器"
             return out
-        raw_limit = int(self._seedgroup_rotate_count or 0)
-        limit = max(1, min(50, raw_limit if raw_limit > 0 else 5))
-        existing, _, _, _ = self._sg_current(clients)
+
+        # ── ① 一天只做一次 ──
+        today = datetime.now().strftime("%Y-%m-%d")
+        if str(self.get_data("seedgroup_rotate_date") or "") == today:
+            out["reason"] = "今天已经轮换过（每天最多 1 颗）"
+            return out
+
+        existing, current_gib, _blind, _offline = self._sg_current(clients)
+        pool_total = round(sum(_seed_group_size_gib(x.get("size")) for x in pool_all), 3)
+        dynamic = seed_group_tier_key(self._seedgroup_tier) == SEED_GROUP_ALL_TIER
+        target = float(state.get("target_gib") or 0)
+
+        # ── ② 门槛：达标才轮换；保全了不许删 ──
+        if dynamic:
+            if pool_total <= 0:
+                out["reason"] = "池子总量未知，不轮换"
+                return out
+            # 容差 0.1%：体积是浮点算的，正好等于门槛时可能差 0.0001，
+            # 不该因此判成"未到 80%"。
+            if current_gib + 0.001 < pool_total * self.SG_ALL_ROTATE_RATIO:
+                out["reason"] = (f"全站档位：覆盖 {current_gib:.1f} GiB 未到池子 "
+                                 f"{pool_total:.1f} GiB 的 {int(self.SG_ALL_ROTATE_RATIO*100)}%，先补不轮换")
+                return out
+            if current_gib >= pool_total * 0.999:
+                # 保全了：删一颗就再也补不回来，今天不动。
+                out["reason"] = "已保全区部官方种，删了补不回，不轮换"
+                return out
+        else:
+            if target <= 0:
+                out["reason"] = "目标体积未知，不轮换"
+                return out
+            if current_gib + 0.001 < target:
+                out["reason"] = f"未达标（{current_gib:.1f}/{target:.1f} GiB），先补满再轮换"
+                return out
+
+        # ── ③ 挑一颗可删的：seeders 最多，且本地做种 ≥ 3 天 ──
         items = self._sg_items()
         by_tid = {str(x.get("torrent_id")): x for x in pool_all if x.get("torrent_id") is not None}
-
+        ages = self._sg_local_ages(clients)
         droppable: List[Tuple[int, str, Dict[str, Any]]] = []
+        too_young = 0
         for info_hash, record in items.items():
             if info_hash not in existing:
                 continue
             row = by_tid.get(str((record or {}).get("torrent_id") or ""))
             if not row:
-                continue                      # 池子里查不到的（已下架/换池）交给 prune，不在轮换里动
+                continue                      # 池子里查不到的（已下架/换池）交给 prune
+            age = ages.get(info_hash, 0)
+            if age < self.SG_ROTATE_MIN_AGE:
+                too_young += 1
+                continue
             droppable.append((int(row.get("seeders") or 0), info_hash, record))
-        # 做种人数最多的先删
-        droppable.sort(key=lambda item: (-item[0], item[1]))
-        drops = droppable[:limit]
-        if not drops:
-            out["reason"] = "没有可轮换的已保种子（池子里查不到它们的做种人数）"
+        if not droppable:
+            out["reason"] = (f"没有可删的：{too_young} 颗都是刚加的（本地做种不足 "
+                             f"{self.SG_ROTATE_MIN_AGE // 86400} 天）")
             return out
+        droppable.sort(key=lambda item: (-item[0], item[1]))
+        drops = droppable[:self.SG_ROTATE_PER_DAY]
 
-        kept_tids = {str((rec or {}).get("torrent_id")) for _, _, rec in drops}
-        skips = self._sg_skips()
-        pending = [x for x in pool_all
-                   if str(x.get("info_hash") or "").lower() not in existing
-                   and str(x.get("torrent_id")) not in kept_tids
-                   and _seed_group_key(x) not in skips]
-        # 做种人数最少的最该补
-        pending.sort(key=lambda x: (int(x.get("seeders") or 0), str(x.get("torrent_id") or "")))
-        adds = pending[:len(drops)]
-
+        # ── ④ 删（一天最多 SG_ROTATE_PER_DAY 颗）──
         client = clients[0]
+        dropped_gib = 0.0
         for seeders, info_hash, record in drops:
             name = str((record or {}).get("name") or info_hash[:12])
             try:
@@ -1995,30 +2031,77 @@ class ColaSeedGroup(_PluginBase):
             except Exception as err:
                 logger.warn(f"动态保种：删除 {name} 异常：{err}")
                 deleted = False
-            if deleted:
-                out["dropped"] += 1
-                out["dropped_names"].append(f"{name}（{seeders} 做种）")
-                items.pop(info_hash, None)
-                # 删了就清掉跳过记录，否则这颗在 TTL 内再也进不了候选（缺口补不回）
-                self._sg_unmark_skip(record)
-            else:
+            if not deleted:
                 out["failed"] += 1
+                continue
+            out["dropped"] += 1
+            dropped_gib += float(record.get("size_gib") or 0)
+            out["dropped_names"].append(
+                f"{name}（{seeders} 做种，本地做种 {ages.get(info_hash, 0)//86400} 天）")
+            items.pop(info_hash, None)
+            # 删了就清掉跳过记录，否则这颗在 TTL 内再也进不了候选（缺口补不回）
+            self._sg_unmark_skip(record)
+            time.sleep(1.0)          # 别把删除请求打成一串，qB 在慢链路上会 403
+        self.save_data("seedgroup_items", items)
+        if out["dropped"] == 0:
+            out["reason"] = "全部删除都失败，今天不再试"
+            self.save_data("seedgroup_rotate", out)
+            return out
 
-        for item in adds:
+        # ── ⑤ 按需补：删完还够就不再动 ──
+        try:
+            _ex2, after_gib, _b, _o = self._sg_current(clients)
+        except Exception:
+            # 读不到就按「删掉的总和」估算：dropped_gib 是刚才实际删掉的那些的体积
+            after_gib = max(0.0, current_gib - dropped_gib)
+        goal = (pool_total * self.SG_ALL_ROTATE_RATIO) if dynamic else target
+        if after_gib >= goal:
+            out["reason"] = (f"删的是小种子，覆盖仍有 {after_gib:.1f} GiB "
+                             f"（≥ {goal:.1f}），今天不补")
+            self.save_data("seedgroup_rotate", out)
+            self.save_data("seedgroup_rotate_date", today)
+            logger.info(f"动态保种：删 {out['dropped']} 颗（{dropped_gib:.1f} GiB）后覆盖仍够"
+                        f"（{after_gib:.1f}/{goal:.1f} GiB），不补")
+            return out
+
+        need = round(goal - after_gib, 3)
+        skips = self._sg_skips()
+        pending = [x for x in pool_all
+                   if str(x.get("info_hash") or "").lower() not in existing
+                   and _seed_group_key(x) not in skips]
+        # 做种人数最少的最该补
+        pending.sort(key=lambda x: (int(x.get("seeders") or 0), str(x.get("torrent_id") or "")))
+        planned, got_gib = [], 0.0
+        for item in pending:
+            if got_gib >= need:
+                break
+            planned.append(item)
+            got_gib += _seed_group_size_gib(item.get("size"))
+        if not planned:
+            out["reason"] = f"删后差 {need:.1f} GiB，但池子里没有可补的（都已保或都在跳过表）"
+            self.save_data("seedgroup_rotate", out)
+            self.save_data("seedgroup_rotate_date", today)
+            return out
+
+        for item in planned:
             if self._event.is_set():
                 break
             data = self._sg_download(item)
             if not data:
                 out["failed"] += 1
                 continue
-            info_hash = _torrent_info_hash(data) or str(item.get("info_hash") or "")
+            ih = _torrent_info_hash(data) or str(item.get("info_hash") or "")
             result = client.add(data, self._seedgroup_save_path, self._seedgroup_skip_check,
-                                label=SEED_GROUP_TAG, hash_hint=info_hash)
+                                label=SEED_GROUP_TAG, hash_hint=ih)
             if result in ("ok", "dup"):
                 out["added"] += 1
                 out["added_names"].append(f"{str(item.get('name') or '')[:48]}"
                                           f"（{int(item.get('seeders') or 0)} 做种）")
-                self._sg_remember_item(info_hash, item)
+                self._sg_remember_item(ih, item)
+            elif result == "ratelimit":
+                out["reason"] = "补种时被限流，剩下的下次再说"
+                out["failed"] += 1
+                break
             else:
                 out["failed"] += 1
                 self._sg_mark_skip(item, "rotate-fail")
@@ -2026,8 +2109,35 @@ class ColaSeedGroup(_PluginBase):
 
         self.save_data("seedgroup_items", items)
         self.save_data("seedgroup_rotate", out)
-        logger.info(f"动态保种：删 {out['dropped']} 补 {out['added']}（失败 {out['failed']}）")
+        self.save_data("seedgroup_rotate_date", today)
+        logger.info(f"动态保种：删 {out['dropped']} 颗（{dropped_gib:.1f} GiB），"
+                    f"补 {out['added']} 颗，覆盖 {after_gib:.1f} → 目标 {goal:.1f} GiB")
         return out
+
+    def _sg_local_ages(self, clients: List[_Client]) -> Dict[str, int]:
+        """每颗保种种子在本地做了多久（秒）：{info_hash: age}。
+
+        用客户端返回的 added_on（加进客户端的时间）。读不到的按 0 算 ——
+        宁可判成「太新、不能删」，也不能误删刚加进来的种子。
+        """
+        ages: Dict[str, int] = {}
+        now = int(time.time())
+        for client in clients:
+            try:
+                rows = client.list_all() if hasattr(client, "list_all") else client.list_completed()
+            except Exception:
+                continue
+            for row in rows or []:
+                h = str(row.get("hash") or "").lower()
+                if not h:
+                    continue
+                try:
+                    added = int(row.get("added_on") or 0)
+                except Exception:
+                    added = 0
+                if added > 0:
+                    ages[h] = max(0, now - added)
+        return ages
 
     def _sg_prune_if_enabled(self, state: Dict[str, Any]) -> None:
         """下架清理：达标那轮也要跑。
@@ -3033,6 +3143,12 @@ class ColaSeedGroup(_PluginBase):
     SG_SKIP_TTL_DUP = 86400      # 「客户端已有」的记录只留 1 天：删种后要能自愈
     SG_SKIP_TTL_NET = 300
     SG_RATE_LIMIT_STOP = 3       # 连续这么多次被判限流就结束本轮
+    # ── 动态轮换（老板 2026-11-22 定的规则，全部强制，不对外暴露数值）──
+    # 每天最多删几颗（老板 2026-11-22 定：2 颗）。不是「每轮」，是一天一次：
+    # 保种组人多，慢慢轮换，不追求快点轮完。
+    SG_ROTATE_PER_DAY = 2
+    SG_ROTATE_MIN_AGE = 3 * 86400  # 本地做种不足 3 天的种子一律不删（刚加进来还没坐热）
+    SG_ALL_ROTATE_RATIO = 0.8    # 「全站官种」档位：覆盖到池子的 80% 才开始轮换
     SG_ADD_RETRY = 2             # 单条加种的额外重试次数（网络类才重试）
     SG_ADD_RETRY_BACKOFF = 2     # 重试间隔：2s、4s
     SG_CLIENT_OFFLINE_AFTER = 3  # 连续这么多轮读不到客户端 → 判掉线（前两轮沿用上次读数）
@@ -3808,15 +3924,21 @@ class ColaSeedGroup(_PluginBase):
                              "placeholder": "10.0.0.5:8081,1024,2048\nMP-qb,0,3000"}}]},
                     ]},
                     {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VAlert", "props": {
+                                "type": "info", "variant": "tonal", "density": "compact",
+                                "title": "动态轮换（自动，无参数）",
+                                "text": "达标后每天删 2 颗「站点做种人数最多」的种子，"
+                                        "按体积需要补几颗「做种人数最少」的。"
+                                        "只删本地做种满 3 天的；删完体积仍够就不补。"
+                                        "全站档位要到池子 80% 才轮换；池子已保全时不删。"}}]},
                         {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {"model": "seedgroup_rotate_count",
-                             "label": "动态保种：每轮删/补数量", "type": "number", "min": 1, "max": 50,
-                             "persistent-hint": True,
-                             "hint": "轮换强制开启（不给关）。留空或 0 = 默认 5；范围 1–50。"
-                                     "每轮删做种人数最多的 N 颗、补最少的 N 颗"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 8}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_rotate_files",
-                             "label": "轮换时连文件一起删（不勾只删种子、保留文件）"}}]},
+                             "label": "轮换时连文件一起删",
+                             "persistent-hint": True,
+                             "hint": "勾上：删的种子连本地文件一起删，省盘。"
+                                     "不勾：只删种子、保留文件，以后想再做种不用重下。"
+                                     "用于腾出空间给别人补种，不影响你已完成的下载量"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
@@ -3843,7 +3965,7 @@ class ColaSeedGroup(_PluginBase):
             "seedgroup_save_path": "", "seedgroup_skip_check": False,
             "iyuu_json_file": "",
             "seedgroup_client_mode": "mp", "seedgroup_prune_mode": "seed",
-            "seedgroup_rotate": True, "seedgroup_rotate_count": 5, "seedgroup_rotate_files": True,
+            "seedgroup_rotate": True, "seedgroup_rotate_files": True,
             "seedgroup_report": True, "seedgroup_report_url": SEED_GROUP_REPORT_URL,
             "seedgroup_report_token": "",
             "seedgroup_prune": True, "seedgroup_prune_files": False,
