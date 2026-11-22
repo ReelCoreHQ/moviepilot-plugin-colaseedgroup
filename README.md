@@ -60,7 +60,7 @@ docker run -d --name colaseedbox --restart unless-stopped \
   -p 3006:3006 \
   -v $(pwd)/data:/data \
   -e TZ=Asia/Shanghai \
-  ghcr.io/reelcorehq/colaseedbox:latest
+  ghcr.io/reelcorehq/colaseedgroup:latest
 ```
 
 ### 连宿主机上的 qB
