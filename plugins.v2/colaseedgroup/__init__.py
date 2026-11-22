@@ -1319,7 +1319,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.5.1"
+    plugin_version = "0.5.2"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -2372,8 +2372,11 @@ class ColaSeedGroup(_PluginBase):
         # 多一个（plugin/version/at/uid/username…）都会 400。身份与是否工作组都由票据所属账号决定。
         payload = {
             "plugin_version": self.plugin_version,
-            # 源码指纹：站点用它确认这是官方发布的代码（白名单外的哈希一律拒收）
-            "source_sha256": _source_fingerprint(),
+            # 源码指纹**暂不上报**：站点契约 SeedGroupReportInput 是
+            # additionalProperties:false，多一个字段整份上报 400 ——
+            # 2026-11-22 实测过：升级到带这个字段的版本后，上报从 10 次全成功变成全部 400。
+            # 等站点侧把 source_sha256 写进契约并部署之后，再把下面这行打开。
+            # "source_sha256": _source_fingerprint(),
             "tier": state.get("tier") or self._seedgroup_tier,
             "scope": self._seedgroup_scope,
             "target_gib": state.get("target_gib"),
