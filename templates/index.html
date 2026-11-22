@@ -77,13 +77,10 @@
 
   <form id="cfg">
     <div class="card">
-      <h2>① 可乐PT 账号</h2>
+      <h2>① 可乐PT API Key</h2>
       <div class="grid">
-        <div class="field"><label>用户名</label><input name="username" autocomplete="username"></div>
-        <div class="field"><label>密码</label><input name="password" type="password" autocomplete="current-password" placeholder="留空 = 不修改"></div>
-        <div class="field"><label>两步验证码（可选）</label><input name="otp_code" inputmode="numeric"></div>
-        <div class="field"><label>验证码</label><input name="captcha_code" inputmode="numeric">
-          <span class="hint">先到站点插件页取图，填 4 位数字后保存</span></div>
+        <div class="field"><label>API Key</label><input name="api_key" type="password" autocomplete="off" spellcheck="false" placeholder="留空 = 不修改">
+          <span class="hint">在站点「账号 → Key → API Key」新建一把，范围勾「读取」和「下载」；接口说明见 <a href="https://www.colapt.com/api-docs" target="_blank" rel="noopener">www.colapt.com/api-docs</a></span></div>
       </div>
     </div>
 
@@ -174,7 +171,7 @@ async function loadConfig(){
     if (el.type === 'checkbox') el.checked = !!v;
     else el.value = v ?? '';
   }
-  if (c.password_set) form.elements.password.placeholder = '已设置（留空 = 不修改）';
+  if (c.api_key_set) form.elements.api_key.placeholder = '已设置（留空 = 不修改）';
 }
 async function loadStatus(){
   const r = await fetch('/api/status'); const s = await r.json();
@@ -199,7 +196,7 @@ form.addEventListener('submit', async e => {
     if (el.type === 'checkbox') body[k] = el.checked;
     else if (el.type === 'number') body[k] = Number(el.value || 0);
     else {
-      if ((k === 'password' || k === 'session_token') && !el.value) continue;
+      if (k === 'api_key' && !el.value) continue;
       body[k] = el.value;
     }
   }

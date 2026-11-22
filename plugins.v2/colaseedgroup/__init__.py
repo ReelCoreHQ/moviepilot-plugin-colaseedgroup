@@ -11,7 +11,9 @@
   5. 每轮回站点核对，下架的种子自动清理（可连文件一起删）；
   6. 每轮向站点上报（档位/覆盖/缺口/限速/做种时长），站点据此算月度考核与退休进度。
 
-解锁资格只认站点工作组（登录后读本人资料里的工作组头衔），没有工作组的账号保存配置时会被强制关掉。
+凭据：可乐PT 开放 API 的 API Key（站点「账号 → Key → API Key」创建，勾「读取」+「下载」），只放在
+请求头 X-API-Key 里；不再用账号密码 + 验证码登录，也不带 Cookie / CSRF / Origin。接口说明见站点 /api-docs。
+谁的上报进考核由站点按上报时的账号身份判定，插件不再自己查工作组头衔。
 辅种请装另一个插件「可乐PT辅种」（ColaCrossSeed），两者可以并存、各配各的下载器。
 """
 import base64
@@ -61,6 +63,13 @@ SITE_SKIP = {
 }
 MANDATORY_TAG = "可乐辅种"   # 加进客户端的种子一律带这个标签，方便筛选/清理
 COLA_MATCH_BATCH = 500
+# 可乐PT 开放 API（契约里带 x-open-api 的操作，文档在站点 /api-docs）
+COLA_STATS_API = "/api/v1/me/stats"                   # personalStats（read）
+COLA_MEDIA_API = "/api/v1/media"                      # listMedia（read）
+COLA_TORRENT_API = "/api/v1/torrents/{id}"            # getTorrent（read）
+COLA_DOWNLOAD_LINK_API = "/api/v1/torrents/{id}/download-links"   # createDownloadLink（download）
+COLA_PLUGIN_KEYS_API = "/api/v1/plugin/keys"          # enrollPluginKey（read）：用 API Key 领上报票据
+COLA_KEY_PAGE = "https://www.colapt.com/account/tracker?tab=api"
 # colapt.com 在部分国内网络会被解析到连不通的 Cloudflare 段；这些是实测可用的备用段。
 COLA_FALLBACK_IPS = ("104.21.66.130", "172.67.132.88", "104.26.10.0")
 REQUEST_TIMEOUT = 90
@@ -69,21 +78,11 @@ UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chr
 # ---------------- 可乐保种组 ----------------
 # 「可乐保种组」= 站点侧的定向保种计划：给授权成员开放一组资源池，成员按档位
 # （2T / 5T / 10T / 15T / 20T / 自定义≥2T）把池子纳入做种，**体积只能超、不能少**。
-# 站点的权限/资源接口尚未上线，这里先按预留的 v1 契约探测（见 docs/seed-group-api.md）：
-# 拿不到 200 就整块锁定，面板上直说缺什么，不静默失败。
+# 资源池 = 全站官方种（开放 API listMedia official=true），取种走 createDownloadLink。
 SEED_GROUP_TAG = "可乐保种组"
 GIB = 1024 ** 3
-# 站点「工作组」= rc_site_groups.title 以「工作组」开头的组（生产：工作组-审核 / 工作组-保种 /
-# 工作组-组长 / 工作组-转载）。插件不看 is_system、不看 vip，只认这个标题前缀，因为「转载组」
-# 是自建组（is_system=0）却同样是工作组。前缀可用配置项覆盖。
-SEED_GROUP_STAFF_PREFIX = "工作组"
-# 官方发布清单（机器面）：X-API-Key，一页最多 100 条，不回 Cookie。
-OFFICIAL_API = "/api/v1/automation/official/torrents"
-OFFICIAL_PAGE_LIMIT = 100
 # 限速上报收集端：走站点域名（HTTPS），不暴露源站 IP
 SEED_GROUP_REPORT_URL = "https://www.colapt.com/api/v1/plugin/seed-group/report"
-# 站点将来若提供专用的保种组资源池接口，插件优先走它；没有就走官方清单。
-SEED_GROUP_API = "/api/v1/plugin/seed-group"
 # 档位 -> 体积下限（GiB）。固定档之外还有一个 custom（自定义），下限同样不许低于 20T。
 SEED_GROUP_TIERS: Dict[str, int] = {"2T": 2048, "5T": 5120, "10T": 10240, "15T": 15360, "20T": 20480}
 SEED_GROUP_CUSTOM_TIER = "custom"
@@ -587,7 +586,7 @@ def _torrent_info_hash_variants(data: bytes) -> List[str]:
 
     可乐PT 发布时会把 info.source 盖成 `[https://www.colapt.com] ColaPT`；同一颗种子在
     M-Team 是 `[kp.m-team.cc] M-Team - TP` —— 于是两边的 info_hash 必然不同，而
-    /api/v1/plugin/match 只按 info_hash / source_info_hash 反查，结果就是「内容一模一样
+    站点的哈希反查只按 info_hash / source_info_hash 反查，结果就是「内容一模一样
     却匹配不到」。这里把 source 换成可乐的章 / 直接去掉，各算一遍 info_hash，再让站点反查。
     """
     try:
@@ -1258,9 +1257,9 @@ class TransmissionClient(_Client):
 
 class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
-    plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
+    plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.23"
+    plugin_version = "0.3.0"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1270,11 +1269,8 @@ class ColaSeedGroup(_PluginBase):
     _enabled = False            # MP 插件总开关：关掉后两个功能都不跑
     _notify = True
     _cron = "0 */1 * * *"
-    _username = ""
-    _password = ""
-    _otp_code = ""
-    _captcha_code = ""
-    _session_token = ""
+    _api_key = ""            # 可乐PT 开放 API 的 Key（read + download），只放在 X-API-Key 请求头里
+    _key_alerted = False     # 本次加载已经提醒过「Key 不能用」，不每个请求都发一条
     _skip_check = False
     _max_per_hour = 0        # 0 = 不限（老板 2026-11-01：不要全局上限）
     _max_per_site = 20       # 单个站点每轮最多补多少
@@ -1304,15 +1300,12 @@ class ColaSeedGroup(_PluginBase):
     _limit_up_kib = 0
     # 每客户端覆盖：每行 `客户端名或地址,下载KiB/s,上传KiB/s`（命中就覆盖全局，未命中用全局）
     _limit_lines = ""
-    # ---- 可乐保种组（只有工作组账号能解锁；见 docs/seed-group-api.md）----
+    # ---- 可乐保种组（考核资格由站点按上报时的身份判定）----
     _seedgroup_enabled = False
     _seedgroup_tier = "2T"
     # 保种范围：site = 全站官方种（默认）；pool = 站点保种组专用池（未开放时回落到全站官方种）
     _seedgroup_scope = "site"
     _seedgroup_custom_gib = 2048
-    _seedgroup_api_key = ""      # 可选：站点机器面 API Key（X-API-Key，拉官方清单更快）
-    _seedgroup_staff_prefix = SEED_GROUP_STAFF_PREFIX
-    _seedgroup_allow_admin = True
     # 保种组自己的下载器：默认用 MP 已配置的那台（MP 会按自己的规则刮削/整理），
     # 也可以单独填 qB/TR（只给保种组用，不影响辅种的客户端）
     _seedgroup_client_mode = "mp"      # mp = 用 MP 已配置下载器；custom = 用下面那行
@@ -1345,7 +1338,6 @@ class ColaSeedGroup(_PluginBase):
     _seedgroup_report_url = "https://www.colapt.com/api/v1/plugin/seed-group/report"
     _seedgroup_report_token = ""
     _event = Event()
-    _csrf = ""
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
     _pieces_paths: Dict[str, str] = {}
     _iyuu_rate_limited = False
@@ -1355,11 +1347,8 @@ class ColaSeedGroup(_PluginBase):
         if config is not None:
             self._enabled = bool(config.get("enabled", False))
             self._notify = bool(config.get("notify", True))
-            self._username = str(config.get("username") or "")
-            self._password = str(config.get("password") or "")
-            self._otp_code = str(config.get("otp_code") or "")
-            self._captcha_code = str(config.get("captcha_code") or "")
-            self._session_token = str(config.get("session_token") or "")
+            self._api_key = str(config.get("api_key") or "").strip()
+            self._key_alerted = False
             self._use_mp_clients = bool(config.get("use_mp_clients", True))
             self._clients_json = str(config.get("clients_json") or "")
             self._add_label = str(config.get("add_label") or "").strip()
@@ -1383,18 +1372,12 @@ class ColaSeedGroup(_PluginBase):
                 self._seedgroup_max_downloading = max(0, min(int(raw_limit if raw_limit is not None else 5), 200))
             except Exception:
                 self._seedgroup_max_downloading = 5
-            # 范围已从 UI 撤掉：统一「全站官种」；老配置里的 pool 也归一成 site（机器面通道只看有没有 Key）
+            # 范围已从 UI 撤掉：统一「全站官种」；老配置里的 pool 也归一成 site
             self._seedgroup_scope = "site"
             # 支持 100M / 100G / 1T / 1P（parse_size_gib 也接受纯数字）
             custom = int(round(parse_size_gib(config.get("seedgroup_custom_gib"))))
             # 自定义档：100M / 100G / 1T / 1P 都行，只有 0 会被抬到 1 GiB
             self._seedgroup_custom_gib = max(SEED_GROUP_CUSTOM_MIN_GIB, custom)
-            # 旧配置键 seedgroup_api_token 的语义就是这把站点 API Key，读进来兼容
-            self._seedgroup_api_key = str(config.get("seedgroup_api_key")
-                                          or config.get("seedgroup_api_token") or "").strip()
-            self._seedgroup_staff_prefix = (str(config.get("seedgroup_staff_prefix") or "").strip()
-                                            or SEED_GROUP_STAFF_PREFIX)
-            self._seedgroup_allow_admin = bool(config.get("seedgroup_allow_admin", True))
             mode = str(config.get("seedgroup_client_mode") or "").strip().lower()
             if mode in ("mp", "custom"):
                 self._seedgroup_client_mode = mode
@@ -1430,25 +1413,6 @@ class ColaSeedGroup(_PluginBase):
             self._seedgroup_report_url = str(config.get("seedgroup_report_url")
                                              or SEED_GROUP_REPORT_URL).strip()
             self._seedgroup_report_token = str(config.get("seedgroup_report_token") or "").strip()
-            # 启用保种组时立刻校验工作组资格。
-            # 注意顺序：这段必须在 max_per_hour / max_per_site 赋值之后 —— 它可能 _persist()，
-            # 写在前面会把这两个字段写成类属性默认值（0/20），等于把用户的限速悄悄改成「不限」。
-            if self._seedgroup_enabled:
-                # 未登录时 identity 会返回 ok=False（不是「没资格」），开关原样保留
-                ident = self.seed_group_identity()
-                if not ident.get("ok"):
-                    # 网络/会话问题不是「没资格」：保留开关，下一轮 _sg_unlocked 还会拦
-                    logger.warn(f"保种组资格校验暂时失败（保留开关）：{ident.get('reason')}")
-                else:
-                    # 2026-11-18：任何站点用户都能保种，只有工作组成员才向站点汇报
-                    self.seed_group_unlock(ident)
-                    if not ident.get("staff"):
-                        logger.info("保种组：当前账号没有工作组头衔 —— 照常拉官种，但不向站点汇报")
-        # 保存配置时如果填了验证码，立刻换一次 token（一次性，成功/失败都会清掉验证码字段）。
-        if self._captcha_code and self._username and self._password and not self._session_token:
-            self._login(self._captcha_code)
-            self._captcha_code = ""
-            self._persist()
         self._event.clear()
         if self._enabled and self._seedgroup_enabled:
             # 保存后自动检测一次连通性（后台线程，不卡保存）；结果显示在插件页。
@@ -1459,11 +1423,7 @@ class ColaSeedGroup(_PluginBase):
         self.update_config({
             "enabled": self._enabled,
             "notify": self._notify,
-            "username": self._username,
-            "password": self._password,
-            "otp_code": self._otp_code,
-            "captcha_code": "",
-            "session_token": self._session_token,
+            "api_key": self._api_key,
             "use_mp_clients": self._use_mp_clients,
             "clients_json": self._clients_json,
             "add_label": self._add_label,
@@ -1477,9 +1437,6 @@ class ColaSeedGroup(_PluginBase):
             "seedgroup_max_downloading": self._seedgroup_max_downloading,
             "seedgroup_scope": self._seedgroup_scope,
             "seedgroup_custom_gib": self._seedgroup_custom_gib,
-            "seedgroup_api_key": self._seedgroup_api_key,
-            "seedgroup_staff_prefix": self._seedgroup_staff_prefix,
-            "seedgroup_allow_admin": self._seedgroup_allow_admin,
             "seedgroup_use_mp_clients": self._seedgroup_use_mp_clients,
             "seedgroup_clients_lines": self._seedgroup_clients_lines,
             "seedgroup_target_client": self._seedgroup_target_client,
@@ -1498,61 +1455,51 @@ class ColaSeedGroup(_PluginBase):
             "seedgroup_report_token": self._seedgroup_report_token,
         })
 
-    # ---------------- 站点登录 / 匹配 / 下载 ----------------
+    # ---------------- 可乐PT 开放 API / 下载 ----------------
 
-    def _login(self, captcha_code: str) -> bool:
-        captcha_id = self.get_data("captcha_id") or ""
-        if not captcha_id:
-            logger.warn("可乐PT 登录失败：没有验证码 id，请先打开插件页面获取验证码")
-            return False
-        payload = {
-            "username": self._username,
-            "password": self._password,
-            "captcha_id": captcha_id,
-            "captcha_code": captcha_code,
-        }
-        if self._otp_code:
-            payload["code"] = self._otp_code
+    def _key_alert(self, text: str) -> None:
+        """Key 不能用时提醒一次（每次加载插件最多一条），别让每个请求都刷一条通知。"""
+        if self._key_alerted:
+            return
+        self._key_alerted = True
         try:
-            # 走 _curl 而不是 requests：有些机器（含群晖/部分 NAS）Python 的 TLS 握手过不去，
-            # 但系统 curl 正常，登录就不会莫名其妙失败。
-            rsp = _curl("POST", f"{COLA_BASE}/api/v1/plugin/sessions", json_body=payload,
-                        timeout=REQUEST_TIMEOUT)
-        except Exception as err:
-            logger.error(f"可乐PT 登录异常：{err}")
-            return False
-        if rsp.status_code == 201:
-            self._session_token = (rsp.json() or {}).get("session_token") or ""
-            self.save_data("captcha_id", "")
-            self.save_data("captcha_cache", {})
-            logger.info("可乐PT 登录成功")
-            return bool(self._session_token)
-        body = rsp.text or ""
-        if rsp.status_code == 403 and "captcha" in body:
-            # 验证码错/过期：把缓存清掉，下次打开插件页会换一张新的
-            self.save_data("captcha_cache", {})
-            self.save_data("captcha_error", "验证码不对或已过期，重新打开插件页会换一张")
-            logger.warn("可乐PT 登录失败：验证码不对或已过期，已清掉旧验证码")
-        else:
-            logger.warn(f"可乐PT 登录失败：{rsp.status_code} {body[:160]}")
-        return False
+            self.post_message(mtype=NotificationType.SiteMessage, title="【可乐保种组】API Key 不能用", text=text)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _error_code(rsp: Optional[_HttpResult]) -> str:
+        """站点错误信封 {"error": {"code": ...}} 里的 code；不是这个形状就返回空串。"""
+        if rsp is None:
+            return ""
+        body = rsp.json({}) or {}
+        error = body.get("error") if isinstance(body, dict) else None
+        return str(error.get("code") or "") if isinstance(error, dict) else ""
 
     def _cola(self, method: str, path: str, **kwargs) -> Optional[_HttpResult]:
+        """调可乐PT 开放 API：只带 X-API-Key，不带 Cookie / CSRF / Origin（带了反而会被拒）。
+
+        没填 Key 或网络失败返回 None；其余一律把响应交回调用方按状态码处理。
+        """
+        if not self._api_key:
+            return None
         headers = kwargs.pop("headers", {})
-        headers["Cookie"] = f"reelcore_session={self._session_token}"
+        headers["X-API-Key"] = self._api_key
+        headers.setdefault("Accept", "application/json")
         try:
             rsp = _curl(method, f"{COLA_BASE}{path}", headers=headers, timeout=REQUEST_TIMEOUT, **kwargs)
         except Exception as err:
             logger.error(f"可乐PT 请求失败 {path}：{err}")
             return None
         if rsp.status_code == 401:
-            logger.warn("可乐PT 会话已失效，请重新登录")
-            self._session_token = ""
-            self._persist()
-            self.post_message(mtype=NotificationType.SiteMessage, title="【可乐保种组】需要重新登录",
-                              text="会话已失效：请打开插件页面获取新的验证码，在插件设置里填写后保存。")
-            return None
-        if rsp.status_code != 200:
+            logger.warn(f"可乐PT {path}：API Key 无效、已撤销或已过期")
+            self._key_alert(f"API Key 无效、已撤销或已过期。请到 {COLA_KEY_PAGE} 新建一把勾「读取」「下载」的 Key，"
+                            f"填进插件设置「API Key」后保存。")
+        elif rsp.status_code == 403 and self._error_code(rsp) == "api_key_scope_denied":
+            logger.warn(f"可乐PT {path}：这把 API Key 缺少需要的范围")
+            self._key_alert(f"这把 API Key 缺少需要的范围：保种组要「读取」（拉官种、核对下架）和「下载」（取种子）两项。"
+                            f"请到 {COLA_KEY_PAGE} 新建一把两项都勾上的 Key。")
+        elif rsp.status_code not in (200, 201):
             logger.warn(f"可乐PT {path} 返回 {rsp.status_code}：{rsp.text[:160]}")
         return rsp
     def _export_content_key(data: bytes) -> str:
@@ -1600,56 +1547,25 @@ class ColaSeedGroup(_PluginBase):
                 path = path[len(name) + 1:]
             files.append((path, int(item.get("size") or 0)))
         return _content_key(files)
-    def _csrf_token(self) -> str:
-        """会话登录后拿 CSRF（POST /authorizations 要带）。"""
-        if self._csrf:
-            return self._csrf
-        rsp = self._cola("GET", "/api/v1/me")
-        if rsp is None or rsp.status_code != 200:
-            return ""
-        try:
-            self._csrf = ((rsp.json() or {}).get("session") or {}).get("csrf_token") or ""
-        except Exception:
-            self._csrf = ""
-        return self._csrf
-
     def _download_cola(self, torrent_id: int) -> bytes:
-        """站点的下载要两步：先签发 authorization，再带 authorization_id 取字节。"""
-        csrf = self._csrf_token()
-        if not csrf:
-            logger.warn("可乐PT 下载失败：拿不到 CSRF（会话可能已过期）")
+        """取可乐的种子：createDownloadLink 签一条 30 分钟的直链，再不带任何凭据 GET 它。"""
+        rsp = self._cola("POST", COLA_DOWNLOAD_LINK_API.format(id=int(torrent_id)), json_body={})
+        if rsp is None or rsp.status_code not in (200, 201):
+            return b""
+        url = str((rsp.json({}) or {}).get("download_url") or "")
+        if not url.startswith("http"):
+            logger.warn(f"可乐PT 下载地址响应缺少 download_url（种子 {torrent_id}）")
             return b""
         try:
-            rsp = _curl(
-                "POST",
-                f"{COLA_BASE}/api/v1/torrents/{torrent_id}/authorizations",
-                headers={
-                    "Cookie": f"reelcore_session={self._session_token}",
-                    "X-CSRF-Token": csrf,
-                    "Origin": COLA_BASE,
-                    "Idempotency-Key": str(uuid.uuid4()),
-                },
-                json_body={},
-                timeout=REQUEST_TIMEOUT,
-            )
+            # 签名直链本身就是凭据：不带 X-API-Key，免得 Key 跟着 30 分钟的链接出现在别处的日志里
+            got = _curl("GET", url, timeout=REQUEST_TIMEOUT)
         except Exception as err:
-            logger.error(f"可乐PT 签发下载授权失败：{err}")
+            logger.error(f"可乐PT 取种子失败（{torrent_id}）：{err}")
             return b""
-        if rsp.status_code != 200:
-            logger.warn(f"可乐PT 签发下载授权返回 {rsp.status_code}：{rsp.text[:160]}")
+        if got.status_code != 200:
+            logger.warn(f"可乐PT 取种子返回 {got.status_code}（{torrent_id}）")
             return b""
-        try:
-            authorization = int((rsp.json() or {}).get("id") or 0)
-        except Exception:
-            authorization = 0
-        if not authorization:
-            logger.warn("可乐PT 下载授权响应缺少 id")
-            return b""
-        rsp = self._cola("GET", f"/api/v1/torrents/{torrent_id}/download",
-                         params={"authorization_id": authorization})
-        if rsp is None or rsp.status_code != 200:
-            return b""
-        return rsp.content if _valid_torrent(rsp.content) else b""
+        return got.content if _valid_torrent(got.content) else b""
     @staticmethod
     def _split_line(line: str) -> List[str]:
         return [p.strip() for p in re.split(r"[,，]", line.strip()) if p.strip()]
@@ -2113,8 +2029,8 @@ class ColaSeedGroup(_PluginBase):
     #   签名密钥（长期）—— 只留在本机插件数据里，唯一的用途是票据过期后换一张新的。
     #     它驱动不了任何业务端点：站点只认它的 HMAC，不把它当 token。
     #
-    # 为什么必须能换票：票据两小时就过期，而站点登录要解图形验证码，那只能在浏览器前解。
-    # 没有换票，用户每两小时要回家点一次验证码 —— 那不是安全，那是让人把插件关掉。
+    # 为什么能换票：票据两小时就过期，换票只要签名，站点短暂不可用后插件一次调用就恢复。
+    # 第一把票据（以及被撤销后的重领）用会员的开放 API Key 领（enrollPluginKey）。
     PLUGIN_ID = "colaseedgroup"
     _SIG_MODEL = "COLA-PLUGIN-1"
 
@@ -2162,7 +2078,7 @@ class ColaSeedGroup(_PluginBase):
     def _plugin_headers(self, method: str, url: str, body: str) -> Dict[str, str]:
         """带凭据的请求头。
 
-        刻意不带 Cookie / X-CSRF-Token：那是浏览器会话的东西。混进来只会让站点分不清
+        刻意不带 Cookie / CSRF 令牌：那是浏览器会话的东西。混进来只会让站点分不清
         这次调用按哪个身份算，票据等于白拿。
         """
         token, _ = self._plugin_credentials()
@@ -2180,26 +2096,19 @@ class ColaSeedGroup(_PluginBase):
         return headers
 
     def _plugin_enroll(self) -> bool:
-        """用站点会话换一把票据（登录成功后调用）。"""
-        if not self._session_token:
+        """用会员的开放 API Key 换一把上报票据（enrollPluginKey，read 范围）。
+
+        只带 X-API-Key，不带 Cookie / CSRF / Origin；请求与响应和以前用会话换时一样。
+        之后的上报与换票仍只认这把票据 + 实例签名，API Key 不参与。
+        """
+        if not self._api_key:
             return False
         payload = {"plugin_id": self.PLUGIN_ID,
                    "instance_id": self._plugin_instance_id(),
                    "label": ""}
-        url = urljoin(COLA_BASE, "/api/v1/plugin/keys")
-        headers = {"Content-Type": "application/json", "Origin": COLA_BASE,
-                   "Cookie": f"reelcore_session={self._session_token}"}
-        csrf = self._csrf_token()
-        if csrf:
-            headers["X-CSRF-Token"] = csrf
-        try:
-            rsp = _curl("POST", url, headers=headers, json_body=payload, timeout=REQUEST_TIMEOUT)
-        except Exception as err:
-            logger.warn(f"插件凭据签发失败：{type(err).__name__}: {err}")
-            return False
+        rsp = self._cola("POST", COLA_PLUGIN_KEYS_API, json_body=payload)
         if rsp is None or rsp.status_code not in (200, 201):
-            logger.warn(f"插件凭据签发失败：站点返回 {0 if rsp is None else rsp.status_code}"
-                        "（站点未升级时这里会是 404，插件按会话继续跑）")
+            logger.warn(f"插件凭据签发失败：站点返回 {0 if rsp is None else rsp.status_code}")
             return False
         try:
             data = json.loads(rsp.text or "{}")
@@ -2281,12 +2190,10 @@ class ColaSeedGroup(_PluginBase):
         if not url:
             out.update({"skipped": True, "reason": "没有配置上报地址"})
             return out
-        record = self._sg_unlock_record()
         # 站点的契约是 additionalProperties:false：只发它声明的字段，
-        # 多一个（plugin/version/at/uid/username…）都会 400。身份由会话决定，不用自己报。
+        # 多一个（plugin/version/at/uid/username…）都会 400。身份与是否工作组都由票据所属账号决定。
         payload = {
             "plugin_version": self.plugin_version,
-            "groups": record.get("groups") or [],
             "tier": state.get("tier") or self._seedgroup_tier,
             "scope": self._seedgroup_scope,
             "target_gib": state.get("target_gib"),
@@ -2306,9 +2213,9 @@ class ColaSeedGroup(_PluginBase):
             "enforced": {"dl_kib": self._limit_dl_kib, "up_kib": self._limit_up_kib},
             "clients": limits,
         }
-        # 上报只认插件凭据（两小时票据 + 实例签名），站点会话不再能写这一行。
-        # 没有票据时先领一把 —— 领不到（站点还没升级）就按会话继续跑，不报错。
-        if not self._plugin_credentials()[0] and self._session_token:
+        # 上报只认插件凭据（两小时票据 + 实例签名）。没有票据时先用 API Key 领一把；
+        # 领不到就照常发（站点答 401，记进上报快照），不报错。
+        if not self._plugin_credentials()[0] and self._api_key:
             self._plugin_enroll()
         # 签名要对**实际发出去的字节**算，所以按 _curl 里同一个 json.dumps 先算出字符串。
         body_text = json.dumps(payload)
@@ -2317,15 +2224,18 @@ class ColaSeedGroup(_PluginBase):
         try:
             rsp = _curl("POST", url, headers=headers, json_body=payload, timeout=REQUEST_TIMEOUT)
             status = 0 if rsp is None else rsp.status_code
-            # 票据过期才值得换一张：站点把「过期」与「无效/撤销」分开答，撤销了换也没用，
-            # 那种情况只能重新登录站点。
+            # 票据过期就换一张；换不了（被撤销、签名密钥丢了）就用 API Key 重新领一把。
+            # 同一个 (账号, 插件, 实例) 重领是站点就地轮换，不会多出一行凭据。
             if status == 401 and self._plugin_credentials()[0]:
                 if self._plugin_renew():
+                    out["renewed"] = True
+                elif self._plugin_enroll():
+                    out["reenrolled"] = True
+                if out.get("renewed") or out.get("reenrolled"):
                     headers = self._plugin_headers("POST", url, body_text)
                     rsp = _curl("POST", url, headers=headers, json_body=payload,
                                 timeout=REQUEST_TIMEOUT)
                     status = 0 if rsp is None else rsp.status_code
-                    out["renewed"] = True
         except Exception as err:
             out["reason"] = f"{type(err).__name__}: {err}"
         out["status"] = status
@@ -2720,18 +2630,23 @@ class ColaSeedGroup(_PluginBase):
             return str(note)
         return str(((self.get_data("rss_cache") or {}).get(host) or {}).get("note") or "")
     def _test_cola(self) -> str:
-        if not self._session_token:
-            return "❌ 可乐PT：未登录（打开插件页取验证码填一次）"
-        rsp = self._cola("GET", "/api/v1/me")
+        """personalStats：200 就说明 Key 能读；顺带显示等级名。下载范围要到真取种时才知道。"""
+        if not self._api_key:
+            return f"❌ 可乐PT：未填 API Key（在 {COLA_KEY_PAGE} 创建，勾「读取」「下载」）"
+        rsp = self._cola("GET", COLA_STATS_API)
         if rsp is None:
             return "❌ 可乐PT：连不上（网络/防火墙），稍后重试"
         if rsp.status_code == 200:
-            try:
-                return f"✅ 可乐PT：已登录（{((rsp.json() or {}).get('username') or '')}）"
-            except Exception:
-                return "✅ 可乐PT：已登录"
+            class_name = str((rsp.json({}) or {}).get("class_name") or "").strip()
+            return f"✅ 可乐PT：API Key 可用（{class_name or '未定级'}）"
         if rsp.status_code == 401:
-            return "❌ 可乐PT：会话过期，需要重新登录"
+            return "❌ 可乐PT：API Key 无效、已撤销或已过期，请重新创建"
+        if rsp.status_code == 403:
+            if self._error_code(rsp) == "api_key_scope_denied":
+                return "❌ 可乐PT：API Key 缺少「读取」范围，请新建一把勾「读取」「下载」的 Key"
+            return "❌ 可乐PT：账号没有权限（被停用或等级不够）"
+        if rsp.status_code == 429:
+            return "⚠️ 可乐PT：请求太频繁（每把 Key 每分钟有额度），稍后自动恢复"
         return f"❌ 可乐PT：HTTP {rsp.status_code}"
     def run_tests(self, persist: bool = True) -> Dict[str, Any]:
         """连通性检测：只测可乐账号与下载器（辅种站点不在这个插件里）。"""
@@ -2786,157 +2701,17 @@ class ColaSeedGroup(_PluginBase):
             return out[:1]
         return out
 
-    def _sg_headers(self) -> Dict[str, str]:
-        headers = {"Accept": "application/json"}
-        if self._session_token:
-            headers["Cookie"] = f"reelcore_session={self._session_token}"
-        return headers
-
-    def _sg_api(self, method: str, path: str, **kwargs) -> Optional[_HttpResult]:
-        """站点将来若提供专用的保种组池接口（/api/v1/plugin/seed-group），优先走它。"""
-        try:
-            return _curl(method, f"{COLA_BASE}{SEED_GROUP_API}{path}",
-                         headers=self._sg_headers(), timeout=REQUEST_TIMEOUT, **kwargs)
-        except Exception as err:
-            logger.warn(f"保种组专用接口请求失败 {path}：{err}")
-            return None
-
-    # ---- 资格：只认工作组 ----
-
-    def seed_group_identity(self) -> Dict[str, Any]:
-        """用当前会话读本人资料里的工作组头衔。
-
-        站点把组名放在 rc_site_groups.title，生产上是「工作组-审核 / 工作组-保种 /
-        工作组-组长 / 工作组-转载」；`GET /api/v1/me` 的 groups 在服务端是**空数组**
-        （identity.Current 直接写 []string{}），所以必须再读 `/api/v1/users/{id}/profile`：
-        本人查自己时 privileged=true，groups 一定可见，不受「对外展示」开关影响。
-        """
-        out: Dict[str, Any] = {
-            "ok": False, "staff": False, "uid": 0, "username": "",
-            "roles": [], "groups": [], "display_group": "", "reason": "",
-        }
-        if not self._session_token:
-            out["reason"] = "还没登录可乐PT：先在插件页取验证码登录"
-            return out
-        me = self._cola("GET", "/api/v1/me")
-        if me is None or me.status_code != 200:
-            out["reason"] = "读取账号资料失败（会话可能已过期）"
-            return out
-        body = me.json() or {}
-        try:
-            out["uid"] = int(body.get("id") or 0)
-        except Exception:
-            out["uid"] = 0
-        out["username"] = str(body.get("username") or "")
-        out["roles"] = [str(x) for x in (body.get("roles") or [])]
-        if not out["uid"]:
-            out["reason"] = "账号资料缺少 id"
-            return out
-        profile = self._cola("GET", f"/api/v1/users/{out['uid']}/profile")
-        if profile is not None and profile.status_code == 200:
-            data = profile.json() or {}
-            out["groups"] = [str(x) for x in (data.get("groups") or []) if str(x).strip()]
-            out["display_group"] = str(data.get("display_group") or "")
-        prefix = (self._seedgroup_staff_prefix or SEED_GROUP_STAFF_PREFIX).strip()
-        titles = list(out["groups"])
-        if out["display_group"]:
-            titles.append(out["display_group"])
-        out["staff"] = any(t.startswith(prefix) for t in titles)
-        if not out["staff"] and self._seedgroup_allow_admin and "admin" in out["roles"]:
-            # 管理员持有全量权限，等同工作组放行（设置里可关掉）
-            out["staff"] = True
-        out["ok"] = True
-        if not out["staff"]:
-            out["reason"] = (f"账号不在工作组：组名需以「{prefix}」开头"
-                             f"（当前 {', '.join(titles) or '没有任何组'}），照常拉官种，但不向站点汇报")
-        return out
-
-    def seed_group_unlock(self, ident: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """手动解锁：校验工作组资格，通过才把解锁记录写进插件数据。
-
-        `ident` 可以传入已经算好的 `seed_group_identity()` 结果，省掉一轮 /me + profile 请求。
-        """
-        if not isinstance(ident, dict):
-            ident = self.seed_group_identity()
-        now = int(time.time())
-        if not ident.get("ok"):
-            record = {"ok": False, "at": now, "until": 0, "reason": ident.get("reason", ""),
-                      "uid": 0, "username": "", "groups": []}
-            self.save_data("seedgroup_unlock", record)
-            return record
-        if not ident.get("staff"):
-            record = {"ok": False, "at": now, "until": 0, "reason": ident.get("reason", ""),
-                      "uid": ident["uid"], "username": ident["username"], "groups": ident["groups"]}
-            self.save_data("seedgroup_unlock", record)
-            logger.warn(f"保种组解锁被拒：{ident.get('reason')}")
-            return record
-        record = {"ok": True, "at": now, "until": now + self.UNLOCK_TTL, "reason": "",
-                  "uid": ident["uid"], "username": ident["username"],
-                  "groups": ident["groups"], "roles": ident["roles"]}
-        self.save_data("seedgroup_unlock", record)
-        self.save_data("seedgroup_blocked_reason", "")
-        logger.info(f"保种组已解锁：{ident['username']}（工作组 {'/'.join(ident['groups']) or '管理员'}）")
-        return record
-
-    def _sg_unlock_record(self) -> Dict[str, Any]:
-        """解锁记录，**顺带算出 staff**。
-
-        `seed_group_unlock()` 写进去的记录里只有 groups（没有 staff 字段），而 0.2.0 的
-        「只有工作组成员才上报」直接读 `record["staff"]` → 永远取到 None → **一次都没上报过**
-        （站点面板因此一直停在旧版本的数字上）。这里统一补算，所有调用点都能拿到。
-        """
-        record = self.get_data("seedgroup_unlock") or {}
-        if not isinstance(record, dict):
-            return {}
-        groups = [str(g) for g in (record.get("groups") or [])]
-        prefix = self._seedgroup_staff_prefix or ""
-        record["staff"] = bool(groups) and any(g.startswith(prefix) for g in groups)
-        if not record["staff"] and self._seedgroup_allow_admin and "admin" in (record.get("roles") or []):
-            record["staff"] = True
-        return record
-
-    def _sg_unlocked(self, refresh: bool = True) -> Tuple[bool, Dict[str, Any]]:
-        """解锁是否有效：缓存 24 小时，且必须还是同一个账号（换号后旧记录不再沿用）。
-
-        缓存不代表「不再校验资格」：命中也只省掉一次 /me + profile，每轮任务仍会走这里。
-        """
-        record = self._sg_unlock_record()
-        try:
-            until = int(record.get("until") or 0)
-        except Exception:
-            until = 0
-        if record.get("ok") and until > int(time.time()):
-            if not refresh:
-                return True, record
-            ident = self.seed_group_identity()
-            same_user = bool(ident.get("ok")) and int(ident.get("uid") or 0) == int(record.get("uid") or 0)
-            if same_user and ident.get("staff"):
-                return True, record
-            # 换了账号、或已经离开工作组：作废缓存，按现场结果重写记录
-            record = self.seed_group_unlock(ident)
-            return bool(record.get("ok")), record
-        if not refresh:
-            return False, record
-        record = self.seed_group_unlock()
-        return bool(record.get("ok")), record
 
     def seed_group_status(self) -> Dict[str, Any]:
         state = self.get_data("seedgroup_state") or {}
         return state if isinstance(state, dict) else {}
 
     def _seedgroup_panel(self) -> Dict[str, Any]:
-        """插件页顶部的「可乐保种组」面板：档位 / 覆盖体积 / 缺口 / 工作组资格。"""
+        """插件页顶部的「可乐保种组」面板：档位 / 覆盖体积 / 缺口 / 上报。"""
         tier = seed_group_tier_key(self._seedgroup_tier)
         dynamic = tier == SEED_GROUP_ALL_TIER
         target = float(seed_group_target_gib(tier, self._seedgroup_custom_gib))
         state = self.seed_group_status()
-        unlock = self._sg_unlock_record()
-        # 解锁记录 24 小时过期：过期的不能还显示「已解锁」
-        try:
-            still_valid = int(unlock.get("until") or 0) > int(time.time())
-        except Exception:
-            still_valid = False
-        staff = bool(unlock.get("ok")) and still_valid
         try:
             if state.get("target_gib"):
                 target = float(state["target_gib"])
@@ -2977,29 +2752,13 @@ class ColaSeedGroup(_PluginBase):
                              f"本轮额度 {'不限' if quota == 'unlimited' else quota}"
                              + (f"（因额度只挑了 {state.get('quota_trimmed')} 条没加）"
                                 if state.get("quota_trimmed") else ""))
-        if staff:
-            groups = "/".join(unlock.get("groups") or []) or "管理员"
-            when = ""
-            try:
-                when = datetime.fromtimestamp(int(unlock.get("at") or 0)).strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                when = ""
-            lines.append(f"资格：工作组（{groups}）；解锁于 {when}")
-        else:
-            lines.append("资格：" + str(unlock.get("reason")
-                                        or "非工作组成员：保种照常，数据不汇报（申请进组后自动开始）"))
+        lines.append("考核：站点按每次上报时的账号身份判定 —— 工作组保种成员的数据进考核，其余只留档")
         if not self._seedgroup_enabled:
-            lines.append("状态：未启用 —— 勾选顶部「启用保种组（功能二）」并保存，会自动校验工作组资格")
-        elif not staff:
-            lines.append("状态：保种中（数据不汇报）—— 非工作组成员也能拉官种，"
-                         "只是覆盖/时长不进站点考核表；申请进组后自动开始汇报")
+            lines.append("状态：未启用 —— 勾选顶部「启用保种组」并保存")
         elif float(state.get("shortfall_gib") or 0) > 0:
-            lines.append("状态：已解锁，但体积还没到档位 —— "
-                         + str(state.get("reason") or "等下一轮同步补齐"))
+            lines.append("状态：体积还没到档位 —— " + str(state.get("reason") or "等下一轮同步补齐"))
         else:
-            lines.append("状态：已解锁且达到档位下限（只超不少）")
-        # 资源池走的是哪条通道：填了 API Key 走机器面清单，没填就用会话面浏览接口。
-        # 审查指出「静默降级到网页面」会让用户无法自证，这里把它显式打出来。
+            lines.append("状态：已达到档位下限（只超不少）")
         rotate = self.get_data("seedgroup_rotate") or {}
         if rotate:
             lines.append(f"动态保种：{rotate.get('at', '')} 删 {rotate.get('dropped', 0)} 补 "
@@ -3009,9 +2768,8 @@ class ColaSeedGroup(_PluginBase):
         if report:
             ok = "成功" if report.get("ok") else f"失败({report.get('reason') or report.get('status')})"
             lines.append(f"限速上报（强制）：{report.get('at', '')} → {ok}；客户端 {len(report.get('clients') or [])} 台")
-        key_state = "已配置" if (self._seedgroup_api_key or "").strip() else "未配置"
         pool_source = str(self.get_data("seedgroup_pool_source") or "未拉取")
-        lines.append(f"资源池通道：{pool_source}（站点 API Key：{key_state}）")
+        lines.append(f"资源池通道：{pool_source}")
         return {
             "component": "VCard",
             "props": {"class": "mb-4", "variant": "outlined"},
@@ -3027,39 +2785,9 @@ class ColaSeedGroup(_PluginBase):
 
     # ---- 资源池：官方种子 ----
 
-    def _sg_official_machine_page(self, page: int) -> Tuple[List[Dict[str, Any]], int, str]:
-        """机器面官方清单（X-API-Key，一页最多 100 条；不回 Cookie）。"""
-        key = (self._seedgroup_api_key or "").strip()
-        if not key:
-            return [], 0, ""
-        try:
-            rsp = _curl("GET", f"{COLA_BASE}{OFFICIAL_API}",
-                        headers={"Accept": "application/json", "X-API-Key": key},
-                        params={"page": page, "page_size": OFFICIAL_PAGE_LIMIT},
-                        timeout=REQUEST_TIMEOUT)
-        except Exception as err:
-            logger.warn(f"官方清单（API Key）请求失败：{err}")
-            return [], 0, ""
-        if rsp.status_code != 200:
-            logger.warn(f"官方清单（API Key）返回 {rsp.status_code}：{rsp.text[:120]}")
-            return [], 0, ""
-        body = rsp.json() or {}
-        items: List[Dict[str, Any]] = []
-        for row in body.get("items") or []:
-            if not isinstance(row, dict):
-                continue
-            items.append({
-                "torrent_id": row.get("torrent_id"),
-                "info_hash": str(row.get("info_hash") or ""),
-                "name": str(row.get("release_name") or row.get("name") or ""),
-                "size": row.get("size_bytes") or row.get("size") or 0,
-                "official": True,
-            })
-        return items, int(body.get("total") or 0), "api-key"
-
     def _sg_official_browse_page(self, page: int, official_only: bool = True) \
             -> Tuple[List[Dict[str, Any]], int, str]:
-        """会话面通道：/api/v1/media?official=true&view=torrents —— 全站官方种。
+        """开放 API listMedia：/api/v1/media?official=true&view=torrents —— 全站官方种。
 
         `official_only` 只为兼容旧调用；保种范围在 _sg_candidates 里定，**永远只取官方种**。
         """
@@ -3067,7 +2795,7 @@ class ColaSeedGroup(_PluginBase):
                                   "page_size": self.SG_BROWSE_PAGE_SIZE, "version_limit": 20}
         if official_only:
             params["official"] = "true"
-        rsp = self._cola("GET", "/api/v1/media", params=params)
+        rsp = self._cola("GET", COLA_MEDIA_API, params=params)
         if rsp is None or rsp.status_code != 200:
             return [], 0, ""
         body = rsp.json() or {}
@@ -3085,44 +2813,30 @@ class ColaSeedGroup(_PluginBase):
                     continue
                 items.append({
                     "torrent_id": version.get("id"),
-                    "info_hash": "",
+                    "info_hash": str(version.get("info_hash") or "").lower(),
                     "name": str(version.get("release_name") or ""),
                     "size": version.get("size_bytes") or version.get("size") or 0,
                     "seeders": int(version.get("seeders") or 0),
                     "official": True,
                 })
-        return items, int(body.get("total") or 0), "session"
+        return items, int(body.get("total") or 0), "open-api"
 
     def _sg_candidates(self) -> List[Dict[str, Any]]:
-        """把官方资源池拉全：优先机器面清单，没有 API Key 就走会话面浏览接口。
+        """把官方资源池拉全：开放 API listMedia（official=true, view=torrents）。
 
-        两条通道的分页单位不一样，必须分开判终止条件：
-          · 机器面 `/official/torrents`：total 是**种子数**，一页 100 条；
-          · 会话面 `/media?official=true`：total 是**作品数**，一页 50 个作品，
-            每个作品的官方版本数不定 —— 拿种子数跟作品数比会提前收工（实测只拿到 247 条）。
+        listMedia 的 `view=torrents` 一页一条版本，按 total 翻页（见 `_sg_collect`）。
 
-        **info_hash 的补全**：会话面返回的 version 对象里根本没有 hash 字段
-        （2026-11-22 实测，字段列表里没有任何 hash 相关键），于是下面那条
-        「hash 不在 existing」的候选过滤对会话面池子完全失效 —— 已覆盖的种子照样进候选、
-        被判 dup、picked 全是已有的，缺口一动不动（生产实测 picked=12 全部 dup）。
-        补救：用 `seedgroup_items` 里 torrent_id → info_hash 的映射把 hash 补回去。
-        加过的种子因此能被 existing 正确过滤，没加过的仍是空串（它们本来就是缺的）。
+        **info_hash 的补全**：候选过滤靠「hash 不在 existing」。开放 API 的版本对象带
+        `info_hash`，直接用；万一缺（老站点或结构漂移），再用 `seedgroup_items` 里
+        torrent_id → info_hash 的映射补回去（0.2.23：生产实测会话面版本对象不带 hash，
+        已覆盖的种子照样进候选、被判 dup，缺口一动不动）。加过的种子因此能被正确过滤，
+        没加过的仍是空串（它们本来就是缺的）。
         """
-        # 范围只决定「用哪条通道」，不决定「要不要官方」：保种只保官方种（老板 2026-11-15 明确）
-        official_only = True
-        items: List[Dict[str, Any]] = []
-        if (self._seedgroup_api_key or "").strip():
-            got, _total, source = self._sg_collect(self._sg_official_machine_page, True)
-            if got:
-                items = got
-                self.save_data("seedgroup_pool_source", source)
-        if not items:
-            probe = lambda page: self._sg_official_browse_page(page, official_only)  # noqa: E731
-            got, _total, source = self._sg_collect(probe, False)
-            if got:
-                items = got
-                self.save_data("seedgroup_pool_source", "session-official")
-
+        # 保种只保官方种（老板 2026-11-15 明确）
+        probe = lambda page: self._sg_official_browse_page(page, True)  # noqa: E731
+        items, _total, _source = self._sg_collect(probe)
+        if items:
+            self.save_data("seedgroup_pool_source", "open-api-official")
         by_tid = {str(v.get("torrent_id")): str(k).lower()
                   for k, v in (self._sg_items() or {}).items() if isinstance(v, dict)}
         for it in items:
@@ -3130,12 +2844,11 @@ class ColaSeedGroup(_PluginBase):
                 it["info_hash"] = by_tid.get(str(it.get("torrent_id")), "")
         return items
 
-    def _sg_collect(self, probe, machine: bool) -> Tuple[List[Dict[str, Any]], int, str]:
-        """逐页收一种通道的结果，按该通道自己的分页语义停。
+    def _sg_collect(self, probe) -> Tuple[List[Dict[str, Any]], int, str]:
+        """逐页收 listMedia 的结果。
 
         终止只看 total（服务器说了算），不看「这一页收了几条」：
-          · 机器面 total 是种子数，收到 total 条就停；
-          · 会话面 total 是作品数，翻完 ceil(total / 每页作品数) 页就停；
+          · 翻完 ceil(total / 每页条数) 页就停；
           · 只有 total 缺失（服务端没给）时才用「空页」兜底。
         以前用 `len(batch) < 100` 判断，服务端把每页调成 40 条就只收到第一页。
         """
@@ -3152,10 +2865,7 @@ class ColaSeedGroup(_PluginBase):
                 seen.add(key)
                 merged.append(item)
             if total:
-                if machine:
-                    if len(merged) >= total:
-                        break
-                elif page >= -(-total // self.SG_BROWSE_PAGE_SIZE):
+                if page >= -(-total // self.SG_BROWSE_PAGE_SIZE):
                     break
             elif not batch:
                 # 服务端没给 total：只能靠空页判断到底
@@ -3163,16 +2873,7 @@ class ColaSeedGroup(_PluginBase):
         return merged, total, source
 
     def _sg_download(self, item: Dict[str, Any]) -> bytes:
-        """拿种子字节：优先直链，否则按 torrent_id 走站点两步授权。"""
-        url = str(item.get("download_url") or "").strip()
-        if url:
-            try:
-                rsp = _curl("GET", url, headers=self._sg_headers(), timeout=REQUEST_TIMEOUT)
-                if rsp.status_code == 200 and _valid_torrent(rsp.content):
-                    return rsp.content
-                logger.warn(f"保种组直链下载失败：HTTP {rsp.status_code} {url[:80]}")
-            except Exception as err:
-                logger.warn(f"保种组直链下载异常：{err}")
+        """拿种子字节：按 torrent_id 走 createDownloadLink。"""
         torrent_id = item.get("torrent_id") or item.get("id")
         if torrent_id:
             try:
@@ -3280,10 +2981,8 @@ class ColaSeedGroup(_PluginBase):
             self.save_data("seedgroup_client_cache", cache)
         return hashes, round(total, 3), blind, offline
 
-    UNLOCK_TTL = 86400          # 工作组资格校验结果的缓存时长（秒）
     SG_MAX_PAGES = 50
     SG_BROWSE_PAGE_SIZE = 50
-    SG_MACHINE_PAGE_SIZE = 100
     SG_DOWNLOAD_GAP = 2.0        # 每颗之间停一下：站点下载限流 120 次/分，一颗 2 个请求；
                                  # 走 Cloudflare 隧道时 POST 也会被 CF 限流，2 秒更稳（实测 0.7 秒会撞 403）
     SG_SKIP_TTL = 7 * 86400      # 「加不进去」的种子记 7 天，别再每轮白下载一遍
@@ -3470,7 +3169,7 @@ class ColaSeedGroup(_PluginBase):
                     out["unmapped"] += 1
                     logger.warn(f"保种组清理：torrent_id 不是数字（{torrent_id!r}），跳过 {info_hash[:12]}")
                     continue
-                detail = self._cola("GET", f"/api/v1/torrents/{tid}")
+                detail = self._cola("GET", COLA_TORRENT_API.format(id=tid))
                 if detail is None:
                     continue
                 drop = False
@@ -3514,24 +3213,19 @@ class ColaSeedGroup(_PluginBase):
         return out
 
     def seed_group_probe(self) -> Dict[str, Any]:
-        """探针：工作组资格 + 解锁状态 + 资源池可达性（面板与 /seedgroup/probe 共用）。"""
-        ident = self.seed_group_identity()
-        unlocked, record = self._sg_unlocked(refresh=False)
+        """探针：Key 是否可用 + 资源池可达性（面板与 /seedgroup/probe 共用）。"""
+        cola = self._test_cola()
         pool = self._sg_candidates()
         tier = seed_group_tier_key(self._seedgroup_tier)
         return {
-            "ok": bool(ident.get("ok")),
-            "activated": bool(ident.get("staff")) and unlocked,
-            "staff": bool(ident.get("staff")),
-            "groups": ident.get("groups") or [],
-            "unlocked": unlocked,
-            "reason": ident.get("reason") or ("" if unlocked else "尚未解锁"),
+            "ok": cola.startswith("✅"),
+            "cola": cola,
             "tier": tier,
             "quota_gib": float(seed_group_target_gib(tier, self._seedgroup_custom_gib)),
             "pool_count": len(pool),
             "pool_gib": round(sum(_seed_group_size_gib(x.get("size")) for x in pool), 1),
             "pool_source": str(self.get_data("seedgroup_pool_source") or ""),
-            "api_key": "present" if (self._seedgroup_api_key or "").strip() else "missing",
+            "api_key": "present" if self._api_key else "missing",
         }
 
     def seed_group_sync(self):
@@ -3546,7 +3240,7 @@ class ColaSeedGroup(_PluginBase):
                     "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "tier": seed_group_tier_key(self._seedgroup_tier),
                     "target_gib": 0.0, "current_gib": 0.0, "covered_gib": 0.0,
-                    "shortfall_gib": 0.0, "activated": False, "unlocked": False,
+                    "shortfall_gib": 0.0, "activated": False,
                     "reason": f"{type(err).__name__}: {err}"[:200],
                 })
             except Exception as report_err:
@@ -3568,14 +3262,14 @@ class ColaSeedGroup(_PluginBase):
         state: Dict[str, Any] = {
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "tier": tier, "target_gib": target, "current_gib": 0.0,
-            "activated": False, "unlocked": False, "staff_groups": [], "reason": "",
+            "activated": False, "reason": "",
             "picked": 0, "added": 0, "duplicate": 0, "failed": 0,
             "added_gib": 0.0, "covered_gib": 0.0, "shortfall_gib": 0.0,
         }
-        if not self._session_token:
-            state["reason"] = "插件还没登录可乐PT：先在插件页取验证码登录"
+        if not self._api_key:
+            state["reason"] = "还没填可乐PT 的 API Key：在站点新建一把勾「读取」「下载」的 Key 填进设置"
             self.save_data("seedgroup_state", state)
-            logger.warn("保种组：未登录可乐PT，跳过本轮")
+            logger.warn("保种组：未填可乐PT API Key，跳过本轮")
             self._maybe_report(clients, state)
             return
         if not clients:
@@ -3584,11 +3278,6 @@ class ColaSeedGroup(_PluginBase):
             logger.warn("保种组：没有可用的下载器")
             return
         self._apply_speed_limits(clients)
-        # 解锁只决定「汇不汇报」，不再挡进种：任何登录站点的用户都能拉官种
-        unlocked, record = self._sg_unlocked()
-        staff = bool(record.get("staff"))
-        state.update({"unlocked": unlocked, "staff": staff,
-                      "staff_groups": record.get("groups") or []})
         existing, current_gib, blind, offline = self._sg_current(clients)
         # 丢失文件自检：带标签却 missingFiles 的种子既不计入覆盖、也永远不会下动。
         missing_total = 0
@@ -3858,7 +3547,7 @@ class ColaSeedGroup(_PluginBase):
 
     def get_state(self) -> bool:
         # 两个功能任一开启都算「插件在工作」：只开保种组时也要显示为运行中
-        return bool(self._enabled and self._seedgroup_enabled and self._session_token)
+        return bool(self._enabled and self._seedgroup_enabled and self._api_key)
 
     def get_service(self) -> List[Dict[str, Any]]:
         services: List[Dict[str, Any]] = []
@@ -3880,22 +3569,15 @@ class ColaSeedGroup(_PluginBase):
 
     def get_page(self) -> Optional[List[dict]]:
         """插件页：只有保种组面板（辅种已经在另一个插件里）。"""
-        if not self._session_token:
-            captcha_id, image = self._fetch_captcha()
-            if not image:
-                reason = str(self.get_data("captcha_error") or "未知原因")
-                return [
-                    {"component": "div", "text": f"获取可乐PT 验证码失败：{reason}"},
-                    {"component": "div", "text": "确认这台机器能打开 https://www.colapt.com（浏览器里试一下），"
-                                                 "再重新打开插件页重试；若一直失败，把上面这行原因贴到 GitHub issue。"},
-                ]
+        if not self._api_key:
             return [
-                {"component": "div", "text": f"可乐PT 登录：验证码 id {captcha_id}（4 位数字），填到插件设置「验证码」后保存。"},
-                {"component": "VImg", "props": {"src": image, "max-width": 220, "class": "mt-3"}},
+                {"component": "div", "text": "还没填可乐PT 的 API Key。"},
+                {"component": "div", "text": f"到 {COLA_KEY_PAGE} 新建一把 Key，范围勾「读取」和「下载」，"
+                                             f"把它粘到插件设置「API Key」里保存即可。接口说明见 https://www.colapt.com/api-docs 。"},
             ]
         last = self.get_data("last_run") or {}
         blocks: List[dict] = [
-            {"component": "div", "text": f"插件版本 v{self.plugin_version}；已登录可乐PT。上次运行：{last.get('at', '未运行')}；"
+            {"component": "div", "text": f"插件版本 v{self.plugin_version}；已填可乐PT API Key。上次运行：{last.get('at', '未运行')}；"
                                          f"本轮新增 {last.get('added', 0)} 条，重复 {last.get('duplicate', 0)}，"
                                          f"失败 {last.get('failed', 0)}，覆盖 {last.get('covered_gib', 0)} GiB。"}
         ]
@@ -3903,35 +3585,6 @@ class ColaSeedGroup(_PluginBase):
         return blocks
 
 
-    # 站点验证码 10 分钟内有效；插件缓存 5 分钟 —— 否则每次打开/刷新插件页都会换一张，
-    # 用户看到的那张立刻作废（「第一次看不清，再刷就不出来了」就是这个）。
-    CAPTCHA_TTL = 300
-
-    def _fetch_captcha(self, force: bool = False) -> Tuple[str, str]:
-        cached = self.get_data("captcha_cache") or {}
-        if (not force and cached.get("id") and cached.get("image")
-                and 0 <= time.time() - int(cached.get("at") or 0) < self.CAPTCHA_TTL):
-            return str(cached["id"]), str(cached["image"])
-        captcha_id, image, reason = "", "", ""
-        try:
-            rsp = _curl("GET", f"{COLA_BASE}/api/v1/plugin/captcha", timeout=REQUEST_TIMEOUT)
-            if rsp.status_code == 200:
-                body = rsp.json() or {}
-                captcha_id = str(body.get("captcha_id") or "")
-                image = str(body.get("image") or "")
-            else:
-                reason = f"站点返回 HTTP {rsp.status_code}"
-        except Exception as err:
-            reason = f"{type(err).__name__}: {err}"
-        if not image:
-            reason = reason or "站点没有返回验证码图片"
-            self.save_data("captcha_error", reason)
-            logger.warn(f"获取可乐PT 验证码失败：{reason}")
-            return "", ""
-        self.save_data("captcha_error", "")
-        self.save_data("captcha_id", captcha_id)
-        self.save_data("captcha_cache", {"id": captcha_id, "image": image, "at": int(time.time())})
-        return captcha_id, image
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -3940,7 +3593,7 @@ class ColaSeedGroup(_PluginBase):
                 "endpoint": self.run_tests,
                 "methods": ["GET", "POST"],
                 "summary": "检测可乐/下载器/其他站连通性",
-                "description": "返回可乐登录、每个下载器、每个其他站的连接结果；结果也会显示在插件页",
+                "description": "返回可乐 API Key、每个下载器、每个其他站的连接结果；结果也会显示在插件页",
             },
             {
                 "path": "/seedgroup/status",
@@ -3976,20 +3629,6 @@ class ColaSeedGroup(_PluginBase):
                 "methods": ["POST"],
                 "summary": "清理站点已下架的保种",
                 "description": "逐个回站点核对 status/official，把已下架或撤掉官方标记的种子从下载器里删掉（可选同时删文件）",
-            },
-            {
-                "path": "/seedgroup/identity",
-                "endpoint": self.seed_group_identity,
-                "methods": ["GET", "POST"],
-                "summary": "查看当前账号的工作组资格",
-                "description": "登录后读本人资料里的工作组头衔（组名以配置的前缀开头才算），返回是否可解锁",
-            },
-            {
-                "path": "/seedgroup/unlock",
-                "endpoint": self.seed_group_unlock,
-                "methods": ["POST"],
-                "summary": "手动解锁可乐保种组",
-                "description": "校验工作组资格；通过则解锁 24 小时，非工作组账号强制拒绝（返回 ok=false 与原因）",
             },
         ]
 
@@ -4027,25 +3666,19 @@ class ColaSeedGroup(_PluginBase):
                                 "type": "info", "variant": "tonal", "density": "compact",
                                 "text": "两个功能互不影响，各有各的开关与运行间隔；"
                                         "「启用插件」是总开关，关掉后两个都不跑。"
-                                        "异常与重新登录提醒始终发送，不受「任务结果通知」影响。"}}]},
+                                        "异常与 API Key 失效提醒始终发送，不受「任务结果通知」影响。"}}]},
                     ]},
 
                     # ── ① 账号 ──
-                    self._form_section("① 可乐PT 账号",
-                                       "第一次使用先打开插件页取验证码，填到「验证码」保存即完成登录；"
-                                       "会话过期插件会发站内通知，重新取一次即可。"),
+                    self._form_section("① 可乐PT API Key",
+                                       "在站点「账号 → Key → API Key」新建一把 Key，范围勾「读取」和「下载」，"
+                                       "粘到这里保存。插件只把它放在 X-API-Key 请求头里，不再需要账号密码和验证码。"),
                     {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "username", "label": "用户名"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "password", "label": "密码", "type": "password"}}]},
-                    ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "captcha_code",
-                             "label": "验证码（先在插件页看图片）"}}]},
-                        {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {"model": "otp_code", "label": "两步验证码（可选）"}}]},
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
+                            {"component": "VTextField", "props": {
+                                "model": "api_key", "label": "API Key", "type": "password",
+                                "persistent-hint": True,
+                                "hint": "读取：拉官种、核对下架、领上报票据；下载：取种子。接口说明见 www.colapt.com/api-docs"}}]},
                     ]},
 
                     # ── ② 下载器 ──
@@ -4059,10 +3692,9 @@ class ColaSeedGroup(_PluginBase):
                     ]},
 
                     # ── ⑤ 可乐保种组 ──
-                    self._form_section("⑤ 保种组（功能二，仅工作组可解锁）",
-                                       "开关在页面顶部「启用保种组（功能二）」。按档位把站点官方资源池搬进下载器，"
-                                       "体积只能超不能少；解锁资格只认站点工作组（登录后读本人资料里的工作组头衔），"
-                                       "没有工作组的账号保存时会被强制关掉这一块，并写明原因。"),
+                    self._form_section("⑤ 保种组",
+                                       "开关在页面顶部「启用保种组」。按档位把站点官方资源池搬进下载器，"
+                                       "体积只能超不能少；每轮上报站点，是否进考核由站点按账号身份判定。"),
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VAlert", "props": {
@@ -4173,7 +3805,7 @@ class ColaSeedGroup(_PluginBase):
             }
         ], {
             "enabled": False, "notify": True,
-            "username": "", "password": "", "otp_code": "", "captcha_code": "", "session_token": "",
+            "api_key": "",
             "skip_check": False, "max_per_hour": 0, "max_per_site": 20, "direction": "both",
             "use_mp_clients": True, "clients_json": "", "clients_lines": "",
             "sites_json": "", "sites_lines": "", "iyuu_json": "", "iyuu_token": "", "sites_mode": "merge",
@@ -4190,8 +3822,7 @@ class ColaSeedGroup(_PluginBase):
             "seedgroup_report": True, "seedgroup_report_url": SEED_GROUP_REPORT_URL,
             "seedgroup_report_token": "",
             "seedgroup_prune": True, "seedgroup_prune_files": False,
-            "seedgroup_api_key": "", "seedgroup_staff_prefix": SEED_GROUP_STAFF_PREFIX,
-            "seedgroup_allow_admin": True, "seedgroup_use_mp_clients": True,
+            "seedgroup_use_mp_clients": True,
             "seedgroup_clients_lines": "", "seedgroup_target_client": "",
         }
 
