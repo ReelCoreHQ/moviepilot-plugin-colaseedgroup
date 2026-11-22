@@ -1260,7 +1260,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.22"
+    plugin_version = "0.2.23"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3100,20 +3100,35 @@ class ColaSeedGroup(_PluginBase):
           · 机器面 `/official/torrents`：total 是**种子数**，一页 100 条；
           · 会话面 `/media?official=true`：total 是**作品数**，一页 50 个作品，
             每个作品的官方版本数不定 —— 拿种子数跟作品数比会提前收工（实测只拿到 247 条）。
+
+        **info_hash 的补全**：会话面返回的 version 对象里根本没有 hash 字段
+        （2026-11-22 实测，字段列表里没有任何 hash 相关键），于是下面那条
+        「hash 不在 existing」的候选过滤对会话面池子完全失效 —— 已覆盖的种子照样进候选、
+        被判 dup、picked 全是已有的，缺口一动不动（生产实测 picked=12 全部 dup）。
+        补救：用 `seedgroup_items` 里 torrent_id → info_hash 的映射把 hash 补回去。
+        加过的种子因此能被 existing 正确过滤，没加过的仍是空串（它们本来就是缺的）。
         """
         # 范围只决定「用哪条通道」，不决定「要不要官方」：保种只保官方种（老板 2026-11-15 明确）
         official_only = True
+        items: List[Dict[str, Any]] = []
         if (self._seedgroup_api_key or "").strip():
-            items, total, source = self._sg_collect(self._sg_official_machine_page, True)
-            if items:
+            got, _total, source = self._sg_collect(self._sg_official_machine_page, True)
+            if got:
+                items = got
                 self.save_data("seedgroup_pool_source", source)
-                return items
-        probe = lambda page: self._sg_official_browse_page(page, official_only)  # noqa: E731
-        items, total, source = self._sg_collect(probe, False)
-        if items:
-            self.save_data("seedgroup_pool_source", "session-official")
-            return items
-        return []
+        if not items:
+            probe = lambda page: self._sg_official_browse_page(page, official_only)  # noqa: E731
+            got, _total, source = self._sg_collect(probe, False)
+            if got:
+                items = got
+                self.save_data("seedgroup_pool_source", "session-official")
+
+        by_tid = {str(v.get("torrent_id")): str(k).lower()
+                  for k, v in (self._sg_items() or {}).items() if isinstance(v, dict)}
+        for it in items:
+            if not it.get("info_hash"):
+                it["info_hash"] = by_tid.get(str(it.get("torrent_id")), "")
+        return items
 
     def _sg_collect(self, probe, machine: bool) -> Tuple[List[Dict[str, Any]], int, str]:
         """逐页收一种通道的结果，按该通道自己的分页语义停。

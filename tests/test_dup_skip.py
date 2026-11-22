@@ -85,3 +85,26 @@ class RateLimitIsNotABadTorrentTest(unittest.TestCase):
         self.assertIn('result == "ratelimit"', src, "上层必须识别 ratelimit")
         self.assertIn('_sg_mark_skip(item, "net")', src, "限流要记 net（5 分钟重试），不是 fail（7 天）")
         self.assertIn("SG_RATE_LIMIT_STOP", src, "连续限流要收手")
+
+
+class PoolHashBackfillTest(unittest.TestCase):
+    """会话面池子没有 info_hash，必须用 items 映射补回去。
+
+    没有 hash 时 `_sg_candidates` 里「hash 不在 existing」这条过滤形同虚设，
+    已覆盖的种子照样进候选、被判 dup —— 2026-11-22 实测 picked=12 全部 dup，
+    缺口 322 GiB 一动不动。补全之后缺口降到 136.5 GiB（剩下的是在下载中的）。
+    """
+
+    def test_candidates_backfills_hash_from_items(self):
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_candidates)
+        self.assertIn("by_tid", src, "必须用 torrent_id → info_hash 的映射补全")
+        self.assertIn("_sg_items", src)
+        self.assertIn('it["info_hash"]', src)
+        self.assertIn("return items", src, "不能返回空列表")
+
+    def test_session_page_reports_no_hash(self):
+        """钉住这个前提：会话面通道确实不带 hash，所以补全是必需的。"""
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_official_browse_page)
+        self.assertIn('"info_hash": ""', src)
