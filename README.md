@@ -31,30 +31,48 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colase
 
 ## 二、独立服务（Docker，不需要 MP）
 
+### 一行拉起来（推荐）
+
 ```bash
-mkdir -p colaseedbox/data && cd colaseedbox
-curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/main/docker-compose.yml -o docker-compose.yml
+git clone --depth 1 https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup.git
+cd moviepilot-plugin-colaseedgroup
 docker compose up -d
 ```
 
 打开 **http://你的IP:3006**。
 
-或者不用 compose：
+> **注意**：必须 clone **整个仓库**。`docker-compose.yml` 里是 `build: .`，
+> 需要同目录的 `Dockerfile`、`requirements.txt`、`app/`、`templates/` 才能构建。
+> 只 curl 一个 compose 文件会报 `failed to read dockerfile: open Dockerfile: no such file or directory`。
+
+### 没有 git 的机器
+
+```bash
+curl -fsSL https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/archive/refs/heads/main.tar.gz | tar xz
+cd moviepilot-plugin-colaseedgroup-main
+docker compose up -d
+```
+
+### 用预构建镜像（不构建）
 
 ```bash
 docker run -d --name colaseedbox --restart unless-stopped \
-  -p 3006:3006 -v $(pwd)/data:/data -e TZ=Asia/Shanghai \
+  -p 3006:3006 \
+  -v $(pwd)/data:/data \
+  -e TZ=Asia/Shanghai \
   ghcr.io/reelcorehq/colaseedbox:latest
 ```
 
-**连宿主机上的 qB**：容器里的 `127.0.0.1` 是容器自己，用 `host.docker.internal:8081`，compose 里加：
+### 连宿主机上的 qB
+
+容器里的 `127.0.0.1` 是容器自己，用 `host.docker.internal:8081`，compose 里加：
 
 ```yaml
     extra_hosts:
       - "host.docker.internal:host-gateway"
 ```
 
-**独立版不含什么**：MP 的加种后自动整理、刮削、订阅、下载器管理 —— 那些是 MP 的职责，独立版刻意剥离，只做保种。
+**独立版不含** MP 的加种后自动整理、刮削、订阅、下载器管理 —— 那些是 MP 的职责，独立版刻意剥离，只做保种。两边跑的是同一份代码、同一个版本号。
 
 ---
 
