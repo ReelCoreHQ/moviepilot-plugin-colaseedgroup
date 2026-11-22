@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import sys
 import threading
 import time
@@ -92,9 +94,14 @@ class Syncer:
             if k in cfg:
                 clean[k] = cfg[k]
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.config_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=2), "utf-8")
-        tmp.replace(self.config_path)
+        fd, name = tempfile.mkstemp(dir=self.config_path.parent, prefix=".config-")
+        tmp = Path(name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(clean, stream, ensure_ascii=False, indent=2)
+            tmp.replace(self.config_path)
+        finally:
+            tmp.unlink(missing_ok=True)
         return clean
 
     # ---------- 运行 ----------

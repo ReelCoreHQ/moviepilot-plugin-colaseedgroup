@@ -101,7 +101,9 @@ def _mini_bencode(value) -> bytes:
 
 def _install_stubs() -> None:
     if not _loadable("app.log"):
-        _module("app").__path__ = []          # 当包用，from app.plugins import … 才走得通
+        app = _module("app")
+        if not hasattr(app, "__path__"):
+            app.__path__ = [str(ROOT / "app")]
         _module("app.log", logger=_SilentLogger())
     if not _loadable("app.plugins"):
         if "app" in sys.modules and not getattr(sys.modules["app"], "__path__", None):

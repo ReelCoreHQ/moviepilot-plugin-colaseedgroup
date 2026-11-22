@@ -1,0 +1,157 @@
+{
+  "repository": "ReelCoreHQ/moviepilot-plugin-colaseedgroup",
+  "source": "plugins.v2/colaseedgroup/__init__.py",
+  "main_at_archive": "d4b01f6e173a70fa8982ba1593aa73593bbd00f0",
+  "releases": [
+    {
+      "version": "0.2.17",
+      "source_sha256": "78e8d80a48542fae4b87e30c951261089654b0aa0883dbbba709388b9bb2b29d",
+      "commit": "f345d9a4a0dc487f4cf23a2d437ef574c98883da",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.2.18",
+      "source_sha256": "6b94821114746be1f4f5da3d046a6cefa6272c29cd898d78b9dfd3d9f0553e62",
+      "commit": "bb3a868b069c2a9c0e1a2f0dacaa92d805d68e99",
+      "reports_fingerprint": false,
+      "tags": [
+        "v0.2.18"
+      ]
+    },
+    {
+      "version": "0.2.19",
+      "source_sha256": "4afbe9ecc7199e321fb221255ce521192913b36e6cd0de2567e9e152b0ec51b2",
+      "commit": "c4e006e0e5fbafecfad5d843eaad7e9bb4a7a592",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.2.21",
+      "source_sha256": "1f6fb48c2678831c63d85ba46dcd519003ff05248ea30fabcab308a054efcf4f",
+      "commit": "9a7c2fe4d2c0feea57a9984b07e4a99830f5b691",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.2.22",
+      "source_sha256": "12881aea93aa09dfeeea5a8bbdcfc0ba8f213d765aaaeab50b5f267c20623fdc",
+      "commit": "e927602b6e52bbaff16c1727dbee4b85c5653491",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.2.23",
+      "source_sha256": "044f8ed06c96e4dd8186daf7faf5f192e5f82eb46be5fec915d5c7fa1201a897",
+      "commit": "f1ee004c24a5e39a14554fd1e0878c02d329f96b",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.3.0",
+      "source_sha256": "e9d557ca23d4052cb744c2a69d82b3bb8eed455cf1db42f45b2336bddbd23f4d",
+      "commit": "1264bfe9995f07b8934f35afe394702a7aa937d3",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.3.1",
+      "source_sha256": "e3ade3549dd07387a9b2980c4f645b69230b5f0656186f646e28940d196a562b",
+      "commit": "d4e6cb73d8f5553adc4b78db01524be7cce8ecd3",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.3.2",
+      "source_sha256": "c326e80a159c81b18d48220690b47fb6c04758dd506e9a86e466b276929f62e8",
+      "commit": "5e936b0a49b3a6f05be6c0007e665f04fe9261d9",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.3.3",
+      "source_sha256": "159ee4c64ee8598a10252575b3e350a285ce4045085f435ef2cf18d7ddca612d",
+      "commit": "01d0b4cfb2b73ced6bd114a41a1a7b211a53fd43",
+      "reports_fingerprint": false,
+      "tags": [
+        "v0.3.3"
+      ]
+    },
+    {
+      "version": "0.3.4",
+      "source_sha256": "1317ad4308eecdef0fe1f9b2f272db9f61744cec36c8acff2cc253478ed3f526",
+      "commit": "600d2cec8308a5991935de5537b017f4fc50601d",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.4.0",
+      "source_sha256": "8d04f094309182741c8e511a274a8fb4554cf23dcd38b4369e297c7df4973231",
+      "commit": "e95ad6d709208719675a325ca0081111cb48df4b",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.4.1",
+      "source_sha256": "a2362f99d65c33941e8f9a052ab7f274680c75e0a90b71ca78d976076c2d98b0",
+      "commit": "e0480a96b364360a3f1c8b178b20e0b12a1aa513",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.4.2",
+      "source_sha256": "1fac1ed99b452cce6067b41b850f06186b45b453d62301ad952fd1af80779c59",
+      "commit": "bf516bd2ba616bc6d9649650514faac2cd1e21ae",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.4.3",
+      "source_sha256": "fb76bf60578a6aeaf615875a4e7d14c91975241f308af95c251c1f158f654e71",
+      "commit": "13ba35b4dba6db26dddcb6d5bdb8af847565396d",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.4.4",
+      "source_sha256": "1a2675a2ddb1fc86ec56eb0c9239dabd4e46c8075a3a4a0336dbf894c9e87b10",
+      "commit": "36aeb952d860b8991d698a3d497e3022ca2ba42b",
+      "reports_fingerprint": false,
+      "tags": [
+        "v0.4.4"
+      ]
+    },
+    {
+      "version": "0.5.0",
+      "source_sha256": "76307635bc53142fe97ede85ec760dcbaa6861c9632fcdfd32b28412c22e2b81",
+      "commit": "e5db711dd2d07fe79f73e21a85f0a3cb43e0e025",
+      "reports_fingerprint": true,
+      "tags": [
+        "v0.5.0"
+      ]
+    },
+    {
+      "version": "0.5.1",
+      "source_sha256": "b2f2a16bb363f446ca0c7e9b8e72c02e18e3a1c44181a916eac9416e118b1e04",
+      "commit": "8362b2be3ded91e9d7985dd05b07fa0b3f63c1c3",
+      "reports_fingerprint": true,
+      "tags": [
+        "v0.5.1"
+      ]
+    },
+    {
+      "version": "0.5.2",
+      "source_sha256": "b4d7232bd90ca49ca020ba1f4456f072a673f332d459f600882c29946c924b89",
+      "commit": "eefd220cadda2a7ae005126bbad6a7e41d4af914",
+      "reports_fingerprint": false,
+      "tags": []
+    },
+    {
+      "version": "0.5.3",
+      "source_sha256": "51e5e6c427ec68a4baa58c5d7c0d99cd61ff2776bf6db788b82ec548a760ad5f",
+      "commit": "d4b01f6e173a70fa8982ba1593aa73593bbd00f0",
+      "reports_fingerprint": false,
+      "tags": []
+    }
+  ]
+}

@@ -1,4 +1,6 @@
 """拆出来的「可乐保种组」插件：结构与身份。"""
+import json
+from pathlib import Path
 import unittest
 
 import support
@@ -9,7 +11,9 @@ class SplitPluginTest(unittest.TestCase):
         mod = support.load_seedgroup_plugin()
         cls = mod.ColaSeedGroup
         self.assertEqual(cls.plugin_name, "可乐保种组")
-        self.assertEqual(cls.plugin_version, "0.5.3")
+        manifest = Path(__file__).resolve().parents[1] / "package.v2.json"
+        version = json.loads(manifest.read_text(encoding="utf-8"))["ColaSeedGroup"]["version"]
+        self.assertEqual(cls.plugin_version, version)
 
     def test_keeps_seed_group_and_drops_crossseed(self):
         mod = support.load_seedgroup_plugin()

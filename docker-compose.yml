@@ -5,12 +5,13 @@ services:
     container_name: colaseedbox
     restart: unless-stopped
     ports:
-      - "3006:3006"          # 面板 / 配置 UI
+      - "0.0.0.0:${BOX_PORT:-3006}:3006" # 远程登录经 HTTPS
     volumes:
       - ./data:/data         # 配置在这里，容器重建不丢
     environment:
       TZ: Asia/Shanghai
       COLASEEDBOX_PORT: "3006"
+      FORWARDED_ALLOW_IPS: "${BOX_TRUSTED_PROXY_IPS:-127.0.0.1}"
     # 要连宿主机上的 qB 时，把下面打开（Linux 下 127.0.0.1 指的是容器自己）
     # extra_hosts:
     #   - "host.docker.internal:host-gateway"

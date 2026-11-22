@@ -86,27 +86,7 @@ SEED_GROUP_REPORT_URL = "https://www.colapt.com/api/v1/plugin/seed-group/report"
 # 档位 -> 体积下限（GiB）。固定档之外还有一个 custom（自定义），下限同样不许低于 20T。
 SEED_GROUP_TIERS: Dict[str, int] = {"2T": 2048, "5T": 5120, "10T": 10240, "15T": 15360, "20T": 20480}
 def _source_fingerprint() -> str:
-    """本插件源码的 sha256 —— 站点用来确认「这是官方发布的代码，不是自己改过的」。
-
-    # 为什么要有它
-
-    2026-11-22 规则评审指出的根子问题：站点侧的所有核验都建立在插件上报的数据上，
-    改一行代码就能绕过。现在服务端已经改成自己从 tracker 算覆盖（不再信插件的数），
-    但**客户端本身是不是官方代码**仍然需要一条证据 —— 就是这个指纹。
-
-    # 算什么
-
-    整个模块的源码文本（不是编译产物）。加一行空格、改一个常量、插一段 monkey patch，
-    哈希都会变。站点维护一份官方哈希白名单，不匹配就拒收上报。
-
-    # 为什么不读 __file__
-
-    MP 各版本加载插件的方式不同（有的复制到临时目录、有的用 importlib 从字符串加载），
-    `__file__` 不保证指向真实源码。`inspect.getsource` 走的是模块自己的代码对象，
-    对两种加载方式都成立。
-
-    取不到时返回空串：宁可不报指纹，也不能因为算不出来就崩掉一轮同步。
-    """
+    """返回源码 SHA-256，供站点比对官方发布档案。取不到源码时留空。"""
     try:
         import inspect
         import sys as _sys
@@ -1319,7 +1299,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.5.3"
+    plugin_version = "0.5.4"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1611,6 +1591,8 @@ class ColaSeedGroup(_PluginBase):
         """取可乐的种子：createDownloadLink 签一条 30 分钟的直链，再不带任何凭据 GET 它。"""
         rsp = self._cola("POST", COLA_DOWNLOAD_LINK_API.format(id=int(torrent_id)), json_body={})
         if rsp is None or rsp.status_code not in (200, 201):
+            status = rsp.status_code if rsp is not None else "无响应"
+            logger.warn(f"可乐PT 申请下载链接失败（种子 {torrent_id}）：{status}")
             return b""
         url = str((rsp.json({}) or {}).get("download_url") or "")
         if not url.startswith("http"):
@@ -2375,11 +2357,7 @@ class ColaSeedGroup(_PluginBase):
         # 多一个（plugin/version/at/uid/username…）都会 400。身份与是否工作组都由票据所属账号决定。
         payload = {
             "plugin_version": self.plugin_version,
-            # 源码指纹**暂不上报**：站点契约 SeedGroupReportInput 是
-            # additionalProperties:false，多一个字段整份上报 400 ——
-            # 2026-11-22 实测过：升级到带这个字段的版本后，上报从 10 次全成功变成全部 400。
-            # 等站点侧把 source_sha256 写进契约并部署之后，再把下面这行打开。
-            # "source_sha256": _source_fingerprint(),
+            "source_sha256": _source_fingerprint(),
             "tier": state.get("tier") or self._seedgroup_tier,
             "scope": self._seedgroup_scope,
             "target_gib": state.get("target_gib"),
@@ -3627,13 +3605,18 @@ class ColaSeedGroup(_PluginBase):
             # 保种时长的连续区间被凭空打断，而客户端里其实好好保着 1348 GiB。
             state["covered_gib"] = current_gib
             state["shortfall_gib"] = max(0.0, need)
-            # 跳过表里混着两种：net（5 分钟后自动重投）与 fail/dup（7 天）。
-            # 分开数出来，否则「跳过 410 条」会让人以为整池被锁死了。
-            net_n = sum(1 for v in skips.values()
-                        if isinstance(v, dict) and v.get("reason") in ("net", "error"))
+            counts = {"网络重试": 0, "取种失败": 0, "重复": 0, "添加失败": 0, "其他": 0}
+            labels = {"net": "网络重试", "error": "网络重试", "download": "取种失败",
+                      "dup": "重复", "fail": "添加失败"}
+            for item in pool_all:
+                if str(item.get("info_hash") or "").lower() in existing:
+                    continue
+                record = skips.get(_seed_group_key(item))
+                if record is not None:
+                    counts[labels.get(str(record.get("reason")), "其他")] += 1
+            details = "、".join(f"{name} {n} 条" for name, n in counts.items() if n)
             state["reason"] = (f"池中 {len(pool_all)} 条全部已在客户端或处于跳过表"
-                               f"（跳过 {len(skips)} 条：其中 {net_n} 条是网络重试、"
-                               f"{len(skips) - net_n} 条是坏种/重复），本轮没有可加的")
+                               f"（池内跳过：{details or '无'}），本轮没有可加的")
             self.save_data("seedgroup_state", state)
             logger.warn(f"保种组：{state['reason']}，缺口 {state['shortfall_gib']} GiB")
             self._sg_prune_if_enabled(state)

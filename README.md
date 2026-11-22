@@ -7,7 +7,7 @@
 | **MoviePilot 插件** | 已经有 MP，想用 MP 的下载器与整理 | 插件市场添加本仓库 |
 | **独立服务** | 不想装 MP，只要保种 | Docker，端口 **3006** |
 
-两种形态跑的是**同一个文件** `plugins.v2/colaseedgroup/__init__.py`，版本号也只有一处：插件里的 `plugin_version`（当前 **0.3.0**）。不存在两份代码，也不会出现版本互相落后。
+两种形态跑的是**同一个文件** `plugins.v2/colaseedgroup/__init__.py`，版本号也只有一处：插件里的 `plugin_version`。不存在两份代码，也不会出现版本互相落后。
 
 ---
 
@@ -39,7 +39,17 @@ curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colase
 curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/main/install-box.sh | bash
 ```
 
-装完打开 **http://<本机IP>:3006**，填 API Key 即可。
+仓库和安装脚本公开下载，**不需要 GitHub 登录、Token 或仓库权限**。安装机器需要 Docker 和运行 `docker compose` 的本机权限。
+
+Docker 默认发布到 `0.0.0.0:3006`。本机访问 `http://127.0.0.1:3006`。远程访问请走 HTTPS 反代，或通过 SSH 转发后打开本机地址：
+
+```bash
+ssh -N -L 3006:127.0.0.1:3006 用户@服务器
+```
+
+首次登录输入可乐 PT API Key（勾选「读取」「下载」）和安装目录 `data/panel-setup-token` 中的绑定码。站点验证通过后便绑定该 Key。已有配置或安装时提供 `BOX_KEY` 的实例使用保存的 Key 登录。只有登录后才能在管理页验证并换 Key，换 Key 会注销其他会话。
+
+使用 HTTPS 反代时，反代需覆盖 `X-Forwarded-Proto` 为 `https`，并将容器视角下反代的来源 IP 配到 `BOX_TRUSTED_PROXY_IPS`。该配置只填写实际反代 IP。
 
 **脚本做了什么**（看一眼心里有数）：检查 Docker → 下载代码到 `~/colaseedbox` → 写初始配置 → 构建镜像 → 起容器 → 等健康检查通过。
 
@@ -71,6 +81,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ReelCoreHQ/moviepilot-plugin
 ```bash
 git clone --depth 1 https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup.git
 cd moviepilot-plugin-colaseedgroup
+mkdir -p data
+(umask 077; set -C; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > data/panel-setup-token)
 docker compose up -d
 ```
 
@@ -81,6 +93,8 @@ docker compose up -d
 ```bash
 curl -fsSL https://github.com/ReelCoreHQ/moviepilot-plugin-colaseedgroup/archive/refs/heads/main.tar.gz | tar xz
 cd moviepilot-plugin-colaseedgroup-main
+mkdir -p data
+(umask 077; set -C; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > data/panel-setup-token)
 docker compose up -d
 ```
 
@@ -262,3 +276,15 @@ docker logs moviepilot-v2 2>&1 | grep -A 60 "Fatal Python error" | tail -60
 - 辅种插件：[moviepilot-plugin-colapt](https://github.com/ReelCoreHQ/moviepilot-plugin-colapt)
 - 使用文档：[可乐PT Wiki · 保种组](https://www.colapt.com/wiki/moviepilot-seedgroup)
 - 站点：[www.colapt.com](https://www.colapt.com)
+
+## 版本指纹
+
+[官方源码指纹档案](source-fingerprints.json)记录插件版本、源码 SHA-256、来源提交及标签。计算方式与客户端一致，对 UTF-8 源码统一换行为 LF 后计算 SHA-256。`reports_fingerprint` 表示版本是否发送该字段。旧客户端未发送指纹时，站点仍按未核验处理。
+
+每次发版后，在 GitHub 核对公开提交及标签，然后运行：
+
+```bash
+python3 tools/archive-source-fingerprint.py <公开提交的完整SHA> --tag <发布标签>
+```
+
+无标签的发布可省略 `--tag`。归档只追加新的源码指纹或标签；随后通过站点迁移追加新指纹到白名单，保留旧版本和已有审核决定。未发布的工作区源码不要录入白名单。

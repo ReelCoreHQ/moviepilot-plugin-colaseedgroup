@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录可乐保种组</title>
+  <style>
+    body { font: 1rem system-ui, sans-serif; margin: 10vh auto; max-width: 28rem; padding: 0 1rem; color-scheme: light dark; }
+    label, input { display: block; }
+    input { box-sizing: border-box; width: 100%; margin: .4rem 0 1rem; padding: .55rem; }
+    button { padding: .55rem 1rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{{ '登录可乐保种组' if configured else '首次绑定保种组' }}</h1>
+    <form id="login" method="post">
+      <label for="api-key">可乐 PT API Key</label>
+      <input id="api-key" type="password" autocomplete="current-password" maxlength="512" required>
+      {% if not configured %}
+      <label for="setup-token">首次绑定码</label>
+      <input id="setup-token" type="password" autocomplete="off" required>
+      <p>绑定码保存在服务器安装目录的 <code>data/panel-setup-token</code>。</p>
+      {% endif %}
+      <button type="submit">{{ '验证并登录' if configured else '验证并绑定' }}</button>
+      <p id="message" role="status"></p>
+    </form>
+  </main>
+  <script>
+    const form = document.querySelector('#login');
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = form.querySelector('button');
+      const message = document.querySelector('#message');
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: {'content-type': 'application/json', 'x-colaseedbox-action': '1'},
+          body: JSON.stringify({
+            api_key: document.querySelector('#api-key').value,
+            setup_token: document.querySelector('#setup-token')?.value,
+          }),
+        });
+        if (response.ok) location.replace('/');
+        else message.textContent = (await response.json()).detail || '验证失败';
+      } catch {
+        message.textContent = '验证请求失败';
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

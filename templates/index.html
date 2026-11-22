@@ -79,7 +79,8 @@
     <div class="card">
       <h2>① 可乐PT API Key</h2>
       <div class="grid">
-        <div class="field"><label>API Key</label><input name="api_key" type="password" autocomplete="off" spellcheck="false" placeholder="留空 = 不修改">
+        <div class="field"><label>API Key</label><input id="new-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入新的站点 API Key">
+          <button type="button" id="rotate-key">验证并更换</button><span id="key-status" role="status"></span>
           <span class="hint">在站点「账号 → Key → API Key」新建一把，范围勾「读取」和「下载」；接口说明见 <a href="https://www.colapt.com/api-docs" target="_blank" rel="noopener">www.colapt.com/api-docs</a></span></div>
       </div>
     </div>
@@ -171,7 +172,6 @@ async function loadConfig(){
     if (el.type === 'checkbox') el.checked = !!v;
     else el.value = v ?? '';
   }
-  if (c.api_key_set) form.elements.api_key.placeholder = '已设置（留空 = 不修改）';
 }
 async function loadStatus(){
   const r = await fetch('/api/status'); const s = await r.json();
@@ -196,11 +196,10 @@ form.addEventListener('submit', async e => {
     if (el.type === 'checkbox') body[k] = el.checked;
     else if (el.type === 'number') body[k] = Number(el.value || 0);
     else {
-      if (k === 'api_key' && !el.value) continue;
       body[k] = el.value;
     }
   }
-  const r = await fetch('/api/config', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  const r = await fetch('/api/config', {method:'POST',headers:{'content-type':'application/json','x-colaseedbox-action':'1'},body:JSON.stringify(body)});
   $('#save-msg').textContent = r.ok ? '已保存' : '保存失败';
   setTimeout(()=>{ $('#save-msg').textContent='' }, 2500);
   loadStatus();
@@ -208,9 +207,24 @@ form.addEventListener('submit', async e => {
 $('#btn-run').addEventListener('click', async () => {
   $('#btn-run').disabled = true; $('#msg').textContent = '跑一轮中…';
   try{
-    const r = await fetch('/api/run', {method:'POST'}); const d = await r.json();
+    const r = await fetch('/api/run', {method:'POST',headers:{'x-colaseedbox-action':'1'}}); const d = await r.json();
     $('#msg').textContent = d.ok ? ('完成：' + d.message) : ('失败：' + d.message);
   } finally { $('#btn-run').disabled = false; loadStatus(); }
+});
+$('#rotate-key').addEventListener('click', async () => {
+  const field = $('#new-api-key');
+  const status = $('#key-status');
+  try {
+    const r = await fetch('/api/config/key', {
+      method: 'POST', headers: {'content-type': 'application/json', 'x-colaseedbox-action': '1'},
+      body: JSON.stringify({api_key: field.value}),
+    });
+    const result = await r.json();
+    status.textContent = r.ok ? '已更换' : (result.detail || '更换失败');
+    if (r.ok) field.value = '';
+  } catch {
+    status.textContent = '请求失败';
+  }
 });
 loadConfig(); loadStatus();
 setInterval(loadStatus, 15000);
