@@ -125,3 +125,33 @@ class PoolHashBackfillTest(unittest.TestCase):
         got = self._candidates([{"id": 7, "official": True, "status": "approved", "size_bytes": "1"}],
                                items={"b" * 40: {"torrent_id": 7}})
         self.assertEqual(got[0]["info_hash"], "b" * 40)
+
+
+class MissingFilesIsRecheckedNotDeletedTest(unittest.TestCase):
+    """missingFiles 的种子是「重新校验让它重下」，不是删掉。
+
+    插件原有 tagged_missing(tag) 用 tag 过滤（不依赖 filter=completed），
+    能正确拿到 missingFiles 的种子，然后 recheck 让客户端自己重新下载。
+    我一度在 sync 里加了一段「删种重下」，会抢在 recheck 前面把种子删掉 —— 已移除。
+    真正要删的是「站点已下架」的那些，归 _sg_prune 管。
+    """
+
+    def test_sync_rechecks_missing_files(self):
+        import pathlib
+        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
+        idx = src.find("丢失文件自检")
+        self.assertGreater(idx, -1, "必须有丢失文件自检")
+        seg = src[idx:idx + 1200]
+        self.assertIn("tagged_missing", seg)
+        self.assertIn("recheck", seg, "应重新校验让它重下，而不是删种")
+
+    def test_sync_no_longer_deletes_missing_files(self):
+        import pathlib
+        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
+        self.assertNotIn("missing_cleaned", src, "多余的删种块必须移除")
+
+    def test_prune_handles_withdrawn_ones(self):
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_prune)
+        self.assertIn("list_all", src, "站点下架的（含未下完）由 prune 用 list_all 处理")
+PAIR = None

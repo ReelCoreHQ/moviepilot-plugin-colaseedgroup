@@ -1288,7 +1288,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.3.2"
+    plugin_version = "0.3.3"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3447,39 +3447,6 @@ class ColaSeedGroup(_PluginBase):
             planned_gib = round(sum(_seed_group_size_gib(x.get("size")) for x in picked), 3)
             shortfall = round(max(0.0, need - planned_gib), 3)
         client = clients[0]
-        # 文件已经不在磁盘上的保种种子（qB 状态 missingFiles）：留着它既做不了种、又占着
-        # 「客户端已有」的位置，覆盖永远算不上。直接删种子（不动文件，本来也没有），
-        # 下一轮从站点重新下载。
-        missing_cleaned = 0
-        try:
-            existing_torrents = client.list_completed() if hasattr(client, "list_completed") else []
-        except Exception:
-            existing_torrents = []
-        for t in existing_torrents or []:
-            if SEED_GROUP_TAG not in str(t.get("tags") or ""):
-                continue
-            if str(t.get("state") or "") != "missingFiles":
-                continue
-            h = str(t.get("hash") or "").lower()
-            if not h:
-                continue
-            try:
-                if client.delete([h], delete_files=False):
-                    missing_cleaned += 1
-                    rec = {"info_hash": h}
-                    for k, v in (items or {}).items():
-                        if k == h:
-                            rec = v
-                            items.pop(k, None)
-                            break
-                    self._sg_unmark_skip(rec)
-                    logger.info(f"保种组：{h[:12]} 文件已丢失（missingFiles），删种等待重新下载")
-            except Exception as err:
-                logger.warn(f"保种组：清理 missingFiles 种子 {h[:12]} 失败：{err}")
-        if missing_cleaned:
-            self.save_data("seedgroup_items", items)
-            state["missing_cleaned"] = missing_cleaned
-
         added = duplicate = failed = 0
         rate_limited = 0
         added_gib = 0.0
