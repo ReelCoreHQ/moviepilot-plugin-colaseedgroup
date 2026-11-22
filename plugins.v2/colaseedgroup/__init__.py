@@ -1068,6 +1068,13 @@ class QBittorrentClient(_Client):
                     return "dup"
                 logger.warn(f"qBittorrent ({self.name}) 拒绝种子（重复或无效）：{hash_hint[:12] or '未知 hash'}")
                 return "fail"
+            if rsp.status_code in (403, 429):
+                # 403/429 是「限流了」，不是这颗种子有问题：通过 Cloudflare 隧道访问时，
+                # 短时间内连续 POST 会被 CF 挡下来（2026-11-22 实测：一次补 271 颗，
+                # 全部 403，等 60 秒后恢复）。必须与「坏种」区分开，否则整池种子会被
+                # 误记成 fail 并关 7 天。
+                logger.warn(f"qBittorrent ({self.name}) 被限流（{rsp.status_code}），本轮暂停加种")
+                return "ratelimit"
             logger.warn(f"qBittorrent ({self.name}) 添加种子失败：{rsp.status_code} {body[:120]}")
         except Exception as err:
             logger.error(f"qBittorrent ({self.name}) 添加种子异常：{err}")
@@ -1253,7 +1260,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），需站点工作组头衔解锁。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.2.21"
+    plugin_version = "0.2.22"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -3262,12 +3269,14 @@ class ColaSeedGroup(_PluginBase):
     SG_MAX_PAGES = 50
     SG_BROWSE_PAGE_SIZE = 50
     SG_MACHINE_PAGE_SIZE = 100
-    SG_DOWNLOAD_GAP = 0.7        # 每颗之间停一下：站点下载限流 120 次/分，一颗要 2 个请求
+    SG_DOWNLOAD_GAP = 2.0        # 每颗之间停一下：站点下载限流 120 次/分，一颗 2 个请求；
+                                 # 走 Cloudflare 隧道时 POST 也会被 CF 限流，2 秒更稳（实测 0.7 秒会撞 403）
     SG_SKIP_TTL = 7 * 86400      # 「加不进去」的种子记 7 天，别再每轮白下载一遍
     # 网络类失败（连接被重置/超时）不是种子的问题，是那条线的问题 —— 只退避几分钟，
     # 不能像坏种那样关 7 天，否则一次抖动就把 371 条全锁死（2026-11-20 就是这么丢的缺口）。
     SG_SKIP_TTL_DUP = 86400      # 「客户端已有」的记录只留 1 天：删种后要能自愈
     SG_SKIP_TTL_NET = 300
+    SG_RATE_LIMIT_STOP = 3       # 连续这么多次被判限流就结束本轮
     SG_ADD_RETRY = 2             # 单条加种的额外重试次数（网络类才重试）
     SG_ADD_RETRY_BACKOFF = 2     # 重试间隔：2s、4s
     SG_CLIENT_OFFLINE_AFTER = 3  # 连续这么多轮读不到客户端 → 判掉线（前两轮沿用上次读数）
@@ -3716,6 +3725,7 @@ class ColaSeedGroup(_PluginBase):
             state["missing_cleaned"] = missing_cleaned
 
         added = duplicate = failed = 0
+        rate_limited = 0
         added_gib = 0.0
         for item in picked:
             if self._event.is_set():
@@ -3751,6 +3761,16 @@ class ColaSeedGroup(_PluginBase):
                     logger.warn(f"保种组：{info_hash[:12]} 在客户端但补标签未成功，下一轮重试")
                 continue
             result, err = self._sg_add_with_retry(client, data, info_hash)
+            if result == "ratelimit":
+                # 限流不等于这颗加不进去：记 net（5 分钟后重试），并且连续几次就收手，
+                # 免得继续 POST 把限流窗口越拉越长。
+                rate_limited += 1
+                if rate_limited >= self.SG_RATE_LIMIT_STOP:
+                    logger.warn(f"保种组：连续 {rate_limited} 次被限流，本轮停止加种（已加 {added} 条）")
+                    break
+                failed += 1
+                self._sg_mark_skip(item, "net")
+                continue
             if result is None:
                 # 重试过仍然连不上：这是网络问题，不是这颗种子的问题 —— 记短退避（5 分钟），
                 # 下一轮还会试它，而不是像坏种那样关 7 天。

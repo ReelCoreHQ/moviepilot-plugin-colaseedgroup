@@ -60,3 +60,28 @@ class DupSkipMustNotOutliveTheDeletionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RateLimitIsNotABadTorrentTest(unittest.TestCase):
+    """403/429 是限流，不能当坏种记 7 天。
+
+    2026-11-22 实测：清掉过期 dup 后一次补 271 颗，全部 403（Cloudflare 隧道限流），
+    旧代码把它们混进 `fail`，于是整池被关 7 天 —— 比不补还糟。
+    """
+
+    def test_rate_limit_stop_constant_exists(self):
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        self.assertGreaterEqual(p.SG_RATE_LIMIT_STOP, 2, "连续几次就收手")
+        self.assertGreaterEqual(p.SG_DOWNLOAD_GAP, 1.0, "间隔要够大，避免撞 CF 限流")
+
+    def test_qb_add_returns_ratelimit_on_403(self):
+        import inspect
+        src = inspect.getsource(SG_MOD.QBittorrentClient.add)
+        self.assertIn("ratelimit", src, "qB 的 add 必须把 403/429 单独返回")
+        self.assertIn("403", src)
+
+    def test_ratelimit_records_net_not_fail(self):
+        import pathlib
+        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
+        self.assertIn('result == "ratelimit"', src, "上层必须识别 ratelimit")
+        self.assertIn('_sg_mark_skip(item, "net")', src, "限流要记 net（5 分钟重试），不是 fail（7 天）")
+        self.assertIn("SG_RATE_LIMIT_STOP", src, "连续限流要收手")
