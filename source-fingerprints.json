@@ -152,6 +152,13 @@
       "commit": "d4b01f6e173a70fa8982ba1593aa73593bbd00f0",
       "reports_fingerprint": false,
       "tags": []
+    },
+    {
+      "version": "0.5.4",
+      "source_sha256": "34a3946a6f583592a56501a39ec0dd78154702963e049d48af3c337d4b2181d9",
+      "commit": "b42489bdb72ee970185585eaa4ab97c36fb2e179",
+      "reports_fingerprint": true,
+      "tags": []
     }
   ]
 }
