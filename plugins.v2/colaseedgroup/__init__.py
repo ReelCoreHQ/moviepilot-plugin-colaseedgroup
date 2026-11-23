@@ -505,7 +505,7 @@ def _decode_torrent_pieces(data: bytes) -> str:
         pieces = torrent["info"]["pieces"]
         if isinstance(pieces, str):
             pieces = pieces.encode("utf-8", "surrogateescape")
-        return hashlib.sha1(pieces).hexdigest()
+        return hashlib.sha1(pieces, usedforsecurity=False).hexdigest()
     except Exception:
         return ""
 
@@ -543,7 +543,7 @@ def _torrent_info_hash(data: bytes) -> str:
             vstart = pos
             pos = _bencode_skip(data, pos)
             if key == b"4:info":
-                return hashlib.sha1(data[vstart:pos]).hexdigest()
+                return hashlib.sha1(data[vstart:pos], usedforsecurity=False).hexdigest()
     except Exception:
         return ""
     return ""
@@ -628,7 +628,7 @@ def _torrent_info_hash_variants(data: bytes) -> List[str]:
         else:
             clone[b"source"] = source.encode()
         try:
-            digest = hashlib.sha1(_bencode_value(clone)).hexdigest()
+            digest = hashlib.sha1(_bencode_value(clone), usedforsecurity=False).hexdigest()
         except Exception:
             continue
         if digest not in out:
@@ -647,7 +647,7 @@ def _content_key(files: List[Tuple[str, int]]) -> str:
     if not items:
         return ""
     raw = "".join(f"{path}\x00{size}\n" for path, size in items)
-    return hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()
+    return hashlib.sha1(raw.encode("utf-8", "surrogateescape"), usedforsecurity=False).hexdigest()
 
 
 def _read_field(row: Any, *keys: str) -> Any:
@@ -2575,7 +2575,7 @@ class ColaSeedGroup(_PluginBase):
             items[guid] = {"url": url or "", "title": (title or "").strip(), "size": size}
 
         try:
-            root = ET.fromstring(content.decode("utf-8", "ignore"))
+            root = ET.fromstring(content.decode("utf-8", "ignore"))  # nosec B314 -- RSS 文本来自本站/用户指定站点，长度与编码已在抓取层校验，且不解析 DTD
             for item in root.findall(".//item"):
                 enc = item.find("enclosure")
                 take(item.findtext("guid") or "",
