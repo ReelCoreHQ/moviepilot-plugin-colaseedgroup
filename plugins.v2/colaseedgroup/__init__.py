@@ -459,8 +459,8 @@ def _curl_parallel(cmds: List[List[str]], urls: List[str], workers: int = 3) -> 
         while pending and len(running) < max(1, workers):
             index, (cmd, _url) = pending.pop(0)
             try:
-                running.append((index, subprocess.Popen(cmd, stdout=subprocess.PIPE,  # nosec B603  # 参数是代码拼的固定列表
-                                                        stderr=subprocess.DEVNULL)))
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)  # nosec B603  # 参数是代码拼的固定列表
+                running.append((index, proc))
             except Exception as err:
                 logger.warn(f"curl 启动失败：{err}")
                 results[index] = _HttpResult(0, b"", "")
