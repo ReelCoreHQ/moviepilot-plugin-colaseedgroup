@@ -48,6 +48,41 @@ class SplitPluginTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+class VersionConsistencyTest(unittest.TestCase):
+    """0.6.1 四处版本一致，三份清单 history 都有本批修复说明。"""
+
+    MANIFESTS = ("package.json", "package.v2.json", "package.v3.json")
+
+    def _root(self):
+        return Path(__file__).resolve().parents[1]
+
+    def _entry(self, name):
+        return json.loads((self._root() / name).read_text(encoding="utf-8"))["ColaSeedGroup"]
+
+    def test_four_places_share_one_version(self):
+        mod = support.load_seedgroup_plugin()
+        versions = {"plugins.v2/colaseedgroup/__init__.py":
+                    mod.ColaSeedGroup.plugin_version}
+        for name in self.MANIFESTS:
+            versions[name] = self._entry(name)["version"]
+        self.assertEqual(set(versions.values()), {"0.6.1"}, versions)
+
+    def test_three_histories_carry_the_0_6_1_note(self):
+        notes = {}
+        for name in self.MANIFESTS:
+            with self.subTest(manifest=name):
+                entry = self._entry(name)
+                history = entry["history"]
+                self.assertEqual(list(history)[0], "v0.6.1",
+                                 f"{name} 的 history 最新一条必须是 v0.6.1")
+                note = history["v0.6.1"]
+                for keyword in ("_seed_group_tasks", "_sg_delete_allowed", "Transmission",
+                                "fail-closed", "0.6.1"):
+                    self.assertIn(keyword, note, f"{name} 的 v0.6.1 说明缺 {keyword}")
+                notes[name] = note
+        self.assertEqual(len(set(notes.values())), 1, "三份清单的 v0.6.1 说明必须逐字一致")
+
+
 class MarketManifestTest(unittest.TestCase):
     """两份清单必须一致：v1（package.json，绑定仓库用）与 v2（package.v2.json，官方市场用）。"""
 

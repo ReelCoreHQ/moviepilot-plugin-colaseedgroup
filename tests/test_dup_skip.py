@@ -86,7 +86,10 @@ class RateLimitIsNotABadTorrentTest(unittest.TestCase):
         import pathlib
         src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
         self.assertIn('result == "ratelimit"', src, "上层必须识别 ratelimit")
-        self.assertIn('_sg_mark_skip(item, "net")', src, "限流要记 net（5 分钟重试），不是 fail（7 天）")
+        # 0.6.1 起任务单路径的记账与自己无关，改用独立的任务单退避表；
+        # 断言的语义不变：限流记 net（5 分钟重试），不是 fail（7 天）。
+        self.assertIn('_sg_task_backoff_mark(item, "net")', src,
+                      "限流要记 net（5 分钟重试），不是 fail（7 天）")
         self.assertIn("SG_RATE_LIMIT_STOP", src, "连续限流要收手")
 
 

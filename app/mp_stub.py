@@ -73,7 +73,11 @@ def install() -> None:
     if getattr(install, "_done", False):
         return
     logger = _Logger()
-    _module("app")
+    app_module = _module("app")
+    # 独立版标记：插件探测不到 MoviePilot 版本时是 fail-closed（不注册任务、不执行任务单）。
+    # 只有「MP_RUNTIME=standalone」+ 这个桩标记同时成立才放行独立入口；MoviePilot 的 `app`
+    # 包里没有这个属性，所以 MP 路径不可能被它放行。
+    app_module.__colaseedbox_standalone__ = True
     _module("app.log", logger=logger)
     _module("app.plugins", _PluginBase=_PluginBase)
     _module("app.schemas", NotificationType=object)

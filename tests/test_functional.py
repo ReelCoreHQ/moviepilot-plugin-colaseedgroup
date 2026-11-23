@@ -11,6 +11,7 @@ import shutil
 import sys
 import time
 import unittest
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -483,7 +484,10 @@ class SeedGroupTasksExecutionTest(CycleCase):
         plugin, _ = self._plugin_with(add=[add_item(5, info_hash="a" * 40)], clients=[client])
         plugin.seed_group_tasks_cycle()
         self.assertEqual(plugin.get_data("seedgroup_state")["failed"], 1)
-        self.assertIn("5", plugin.get_data("seedgroup_skip"))
+        # 任务单路径的失败记在自己的退避表里，不往 fallback 的跳过表里写
+        self.assertIn("5", plugin.get_data("seedgroup_task_backoff"))
+        self.assertNotIn("5", plugin.get_data("seedgroup_skip") or {},
+                         "任务单失败不能污染 fallback 的跳过表")
         # 第二轮：同一条任务在退避窗口里，不再白下第二次
         second = support.FakeClient()
         plugin._sg_clients = lambda: [second]
@@ -499,7 +503,7 @@ class SeedGroupTasksExecutionTest(CycleCase):
         state = plugin.seed_group_tasks_cycle()
         self.assertEqual(state["failed"], 1)
         self.assertEqual(state.get("fail_reasons"), {"站点 5xx": 1})
-        entry = plugin.get_data("seedgroup_skip")["71"]
+        entry = plugin.get_data("seedgroup_task_backoff")["71"]
         self.assertEqual(entry["reason"], "http_5xx")
         self.assertEqual(entry["ttl"], plugin.SG_SKIP_TTL_NET)
         self.assertIn("502", entry["detail"])
@@ -512,7 +516,7 @@ class SeedGroupTasksExecutionTest(CycleCase):
 
         plugin, _ = self._plugin_with(add=[add_item(72, info_hash="d" * 40)], _sg_download=gone)
         plugin.seed_group_tasks_cycle()
-        entry = plugin.get_data("seedgroup_skip")["72"]
+        entry = plugin.get_data("seedgroup_task_backoff")["72"]
         self.assertEqual(entry["reason"], "http_4xx")
         self.assertEqual(entry["ttl"], plugin.SG_SKIP_TTL)
 
@@ -1074,12 +1078,38 @@ class RuntimeVersionGateTest(unittest.TestCase):
         self.assertIn("无法判定 MoviePilot 版本", state["reason"])
         plugin._seed_group_tasks.assert_not_called()
 
-    def test_standalone_runtime_is_exempt_from_the_gate(self):
-        """独立版（app/ 那一套）没有 MP 版本可探测，由 MP_RUNTIME 显式放行。"""
+    def test_standalone_runtime_needs_both_flag_and_stub_marker(self):
+        """独立版豁免必须两道同时成立：MP_RUNTIME=standalone **+** app 桩标记。"""
         plugin = self._plugin()
+        fresh = ModuleType("app")
         with patch.object(SG_MOD, "_mp_version", return_value=""), \
-                patch.object(SG_MOD, "MP_RUNTIME", "standalone"):
+                patch.object(SG_MOD, "MP_RUNTIME", "standalone"), \
+                patch.dict(sys.modules, {"app": fresh}):
+            # 只有常量、没有桩标记：这就是「MP 路径残留了该常量」的场景 → 照常 fail-closed
+            self.assertEqual(plugin.get_service(), [],
+                             "仅凭 MP_RUNTIME 不能放行 MoviePilot 路径")
+            self.assertIn("无法判定 MoviePilot 版本",
+                          json.dumps(plugin.get_page(), ensure_ascii=False))
+            state = plugin.seed_group_tasks_cycle()
+            self.assertIn("无法判定 MoviePilot 版本", state["reason"])
+            # 桩标记到位（独立版入口注入）才放行
+            setattr(fresh, SG_MOD.STANDALONE_MARKER, True)
             self.assertEqual([s["id"] for s in plugin.get_service()], ["ColaSeedGroup"])
+
+    def test_unknown_version_always_pauses_without_standalone_entry(self):
+        """MP 路径（无标记）：版本未知时注册与执行都停，不受 MP_RUNTIME 残留影响。"""
+        plugin = self._plugin()
+        tasks = Mock(side_effect=AssertionError("版本未知不该拉任务单"))
+        plugin._seed_group_tasks = tasks
+        fresh = ModuleType("app")
+        with patch.object(SG_MOD, "_mp_version", return_value=""), \
+                patch.object(SG_MOD, "MP_RUNTIME", "standalone"), \
+                patch.dict(sys.modules, {"app": fresh}):
+            self.assertFalse(SG_MOD._standalone_runtime())
+            self.assertEqual(plugin.get_service(), [])
+            state = plugin.seed_group_tasks_cycle()
+        self.assertIn("无法判定 MoviePilot 版本", state["reason"])
+        tasks.assert_not_called()
 
     def test_v2_runtime_cycle_does_not_touch_the_site(self):
         plugin = self._plugin()
@@ -1434,16 +1464,30 @@ class SeedGroupPluginTest(unittest.TestCase):
         self.assertEqual(state["covered_gib"], 2100.0, "覆盖是站点给的数字")
         self.assertEqual(state["shortfall_gib"], 0.0)
 
-    def test_cycle_respects_skip_table_from_previous_round(self):
+    def test_cycle_respects_task_backoff_from_previous_round(self):
         plugin = self._plugin()
         client = support.FakeClient()
         plugin._sg_clients = lambda: [client]
         plugin._sg_download = lambda item: support.make_torrent()
-        plugin.save_data("seedgroup_skip", {"21": {"at": 9_999_999_999, "reason": "fail", "ttl": 604800}})
+        plugin.save_data("seedgroup_task_backoff",
+                         {"21": {"at": 9_999_999_999, "reason": "fail", "ttl": 604800}})
         plugin._seed_group_tasks = lambda tier, custom=None: tasks_payload(add=[add_item(21)])
         state = plugin.seed_group_tasks_cycle()
-        self.assertEqual(client.added, [], "退避窗口里的条目不重试")
+        self.assertEqual(client.added, [], "任务单自己的退避窗口里不重试")
         self.assertEqual(state["add_count"], 1)
+
+    def test_cycle_ignores_fallback_skip_table(self):
+        """fallback 的跳过表（任何原因）都不参与任务单路径：站点点名就要加。"""
+        plugin = self._plugin()
+        client = support.FakeClient()
+        plugin._sg_clients = lambda: [client]
+        plugin._sg_download = lambda item: support.make_torrent()
+        plugin.save_data("seedgroup_skip",
+                         {"21": {"at": 9_999_999_999, "reason": "fail", "ttl": 604800}})
+        plugin._seed_group_tasks = lambda tier, custom=None: tasks_payload(add=[add_item(21)])
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(len(client.added), 1, "本地轮换的跳过记录不能挡站点任务")
+        self.assertEqual(state["added"], 1)
 
     def test_browse_page_extracts_official_versions(self):
         plugin = self._plugin()
@@ -2209,31 +2253,54 @@ class SeedGroupLimitReadingTest(CycleCase):
 
 
 class TasksSkipTableScopeTest(CycleCase):
-    """次重要 4：本地轮换留下的 `rotated` 记录只服务于 fallback，不挡站点任务单。"""
+    """次重要 4：任务单路径与 fallback 跳过表**物理隔离**。
 
-    def _plugin(self, reason, ttl):
+    站点任务只查自己的 `seedgroup_task_backoff`；`seedgroup_skip`（fallback 的记账，
+    不管什么原因）一律不参与。规格 §5.2 的加种退避由任务单自己的表保留，两条路径互不影响。
+    """
+
+    FALLBACK_REASONS = ("rotated", "rotate-fail", "dup", "fail", "net", "download",
+                        "http_5xx", "http_4xx", "error")
+
+    def _plugin(self, store_key="seedgroup_skip", reason="rotated", ttl=7 * 86400):
         plugin, grown = self.make_cycle_plugin(tasks=tasks_payload(add=[add_item(5)]))
-        plugin.save_data("seedgroup_skip", {
+        plugin.save_data(store_key, {
             "5": {"at": int(time.time()), "reason": reason, "ttl": ttl, "fails": 1}})
         return plugin, grown[0]
 
-    def test_rotated_record_does_not_block_the_site_task(self):
-        plugin, client = self._plugin("rotated", 7 * 86400)
-        state = plugin.seed_group_tasks_cycle()
-        self.assertEqual(len(client.added), 1, "站点点名的种子不能被本地轮换记录挡 7 天")
-        self.assertEqual(state["added"], 1)
+    def test_fallback_skip_table_never_blocks_a_site_task(self):
+        for reason in self.FALLBACK_REASONS:
+            with self.subTest(reason=reason):
+                plugin, client = self._plugin(reason=reason)
+                state = plugin.seed_group_tasks_cycle()
+                self.assertEqual(len(client.added), 1,
+                                 f"fallback 的 {reason} 记录不该挡站点任务")
+                self.assertEqual(state["added"], 1)
 
-    def test_rotate_fail_record_does_not_block_either(self):
-        plugin, client = self._plugin("rotate-fail", 7 * 86400)
-        plugin.seed_group_tasks_cycle()
-        self.assertEqual(len(client.added), 1)
+    def test_task_path_never_reads_the_fallback_table(self):
+        """代码级隔离：_sg_add_tasks 里不出现 _sg_skips()，只问 _sg_task_backoff。"""
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_add_tasks)
+        self.assertNotIn("_sg_skips", src)
+        self.assertNotIn("seedgroup_skip", src)
+        self.assertIn("_sg_task_backoff", src)
 
-    def test_failure_backoff_still_applies(self):
-        """规格 §5.2 要求保留退避：这颗自己失败过的记录仍然要挡住本轮。"""
-        plugin, client = self._plugin("http_5xx", 300)
+    def test_failure_backoff_still_applies_on_the_task_path(self):
+        """规格 §5.2：任务单自己的退避仍然生效（独立表，不靠 fallback 记账）。"""
+        plugin, client = self._plugin(store_key="seedgroup_task_backoff",
+                                      reason="http_5xx", ttl=300)
         state = plugin.seed_group_tasks_cycle()
         self.assertEqual(client.added, [])
         self.assertEqual(state["added"], 0)
+
+    def test_task_failure_writes_only_its_own_table(self):
+        client = support.FakeClient(add_result="fail")
+        plugin, _ = self.make_cycle_plugin(tasks=tasks_payload(add=[add_item(9)]),
+                                           clients=[client])
+        plugin.seed_group_tasks_cycle()
+        self.assertIn("9", plugin.get_data("seedgroup_task_backoff"))
+        self.assertEqual(plugin.get_data("seedgroup_skip") or {}, {},
+                         "任务单失败不能写进 fallback 的跳过表")
 
 
 class RotateEndpointLockTest(unittest.TestCase):

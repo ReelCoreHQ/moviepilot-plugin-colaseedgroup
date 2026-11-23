@@ -111,8 +111,12 @@ SEED_GROUP_DELETE_LABELS: Dict[str, str] = {
 # 只支持 MoviePilot v3：v2 运行时、以及探测不到版本时都不注册定时任务（面板给一行警告），不抛异常。
 MP_MIN_VERSION = (3, 0, 0)
 #: 运行时形态："" = MoviePilot（版本必须探测得到）；"standalone" = 本仓库的独立版服务
-#: （app/ 那一套，压根没有 MP 版本可探测 —— 由 app/sync.py 显式声明，别让版本闸门把它一起停掉）。
+#: （app/ 那一套，压根没有 MP 版本可探测）。**只有**配上 `app.__colaseedbox_standalone__`
+#: 这个桩标记才生效（见 `_standalone_runtime`）：MP 的 `app` 包里没有它，所以 MP 路径
+#: 无论这个常量残留成什么值，都会照常 fail-closed。
 MP_RUNTIME = ""
+#: 独立版桩标记：由 `app/mp_stub.py` 在独立入口注入，MoviePilot 运行时不可能带上它。
+STANDALONE_MARKER = "__colaseedbox_standalone__"
 # 限速上报的上限（站点的 JSON Schema 同值）：0 = 不限速
 SEED_GROUP_LIMIT_MAX_KIB = 1048576
 
@@ -185,17 +189,35 @@ def mp_version_supported(value: Any) -> bool:
     return parsed >= MP_MIN_VERSION
 
 
+def _standalone_runtime() -> bool:
+    """是不是**独立版服务**入口（不是 MoviePilot）。
+
+    两道同时成立才算：`MP_RUNTIME == "standalone"` **且** `app` 模块带着
+    `__colaseedbox_standalone__` 桩标记（由 app/mp_stub.py 在独立入口注入）。
+    为什么必须两道：`MP_RUNTIME` 只是一个模块常量，打包脚本/镜像里误设或残留，
+    单看它就能绕过 fail-closed；而 MP 的 `app` 包里没有那个桩标记 —— 于是
+    MoviePilot 路径永远拿不到这道豁免，版本未知时无条件停。
+    """
+    if MP_RUNTIME != "standalone":
+        return False
+    try:
+        import app
+    except Exception:
+        return False
+    return bool(getattr(app, STANDALONE_MARKER, False))
+
+
 def mp_runtime_gate() -> Tuple[bool, str]:
     """运行时闸门：返回 (能不能跑, 不能跑的原因)。
 
     三条分支，全部集中在这一处 —— cron 注册、面板警告、任务单执行都问它：
       · 版本 >= 3.0.0          → 能跑；
-      · 探测不到版本（空串）    → 不能跑（fail-closed）；独立版由 `MP_RUNTIME` 放行；
+      · 探测不到版本（空串）    → 不能跑（fail-closed）；仅独立版入口（`_standalone_runtime`）放行；
       · 版本 < 3.0.0（v2）      → 不能跑。
     """
     version = _mp_version()
     if not mp_version_tuple(version):
-        if MP_RUNTIME == "standalone":
+        if _standalone_runtime():
             return True, ""
         return False, "无法判定 MoviePilot 版本，已暂停自动任务"
     if mp_version_supported(version):
@@ -1398,10 +1420,6 @@ class TransmissionClient(_Client):
         logger.warn(f"Transmission ({self.name}) 添加种子失败：{rsp}")
         return "fail"
 
-#: 任务单路径**不认**的跳过原因：它们是本地轮换留下的记账（`_sg_rotate` 删完记 rotated），
-#: 只服务于 fallback 的候选过滤。站点任务单点名要某颗时，不能被这张表挡 7 天。
-SG_TASKS_IGNORED_SKIP_REASONS = ("rotated", "rotate-fail")
-
 #: 失败原因的中文说法，面板与日志共用（未知码原样显示）。
 SEED_GROUP_FETCH_LABELS = {
     "net": "网络/超时",
@@ -2218,6 +2236,7 @@ class ColaSeedGroup(_PluginBase):
             # 刚被轮换删掉的种子 7 天内不再回来 —— 否则池子贴着目标时，
             # 删掉 2 颗、下一轮又把同样 2 颗加回去，天天来回折腾（评审第 6 条）。
             self._sg_unmark_skip(record)
+            self._sg_task_backoff_clear(record)
             self._sg_mark_skip(record, "rotated")
             time.sleep(1.0)          # 别把删除请求打成一串，qB 在慢链路上会 403
         self.save_data("seedgroup_items", items)
@@ -3381,6 +3400,8 @@ class ColaSeedGroup(_PluginBase):
     # 删掉 2 颗之后能补的候选就只剩刚删掉的那几颗，每天删了又重下（评审第 6 条）。
     SG_ROTATE_MIN_HEADROOM_GIB = 50.0
     SG_SKIP_TTL_NET = 300
+    # 站点任务单自己的加种失败退避表（与 fallback 的 seedgroup_skip 分开存，互不查询）
+    SG_TASK_BACKOFF_KEY = "seedgroup_task_backoff"
     SG_RATE_LIMIT_STOP = 3       # 连续这么多次被判限流就结束本轮
     # ── 动态轮换（老板 2026-11-22 定的规则，全部强制，不对外暴露数值）──
     # 每天最多删几颗（老板 2026-11-22 定：2 颗）。不是「每轮」，是一天一次：
@@ -3407,12 +3428,15 @@ class ColaSeedGroup(_PluginBase):
             return self.SG_SKIP_TTL_DUP
         return self.SG_SKIP_TTL
 
-    def _sg_skips(self) -> Dict[str, Any]:
-        """读的时候也清一遍过期：没有新写入时，过期条目不能永久生效。
+    def _sg_live_entries(self, store_key: str) -> Dict[str, Any]:
+        """读一张「跳过/退避」表，顺手清过期（每条按自己记下的 `ttl`）。
 
-        每条按自己记下的 `ttl` 判定 —— 网络类失败只关 5 分钟，坏种关 7 天。
+        两张表共用这段过期规则：
+          · `seedgroup_skip`        —— 本地轮换 / fallback 的记账（rotated、dup…）；
+          · `seedgroup_task_backoff` —— 站点任务单路径的加种失败退避。
+        两者**物理分开**：任务单只读后者，fallback 只读前者（路径隔离，见 `_sg_task_backoff`）。
         """
-        data = self.get_data("seedgroup_skip") or {}
+        data = self.get_data(store_key) or {}
         if not isinstance(data, dict):
             return {}
         now = int(time.time())
@@ -3427,24 +3451,60 @@ class ColaSeedGroup(_PluginBase):
             if now - int(v.get("at") or 0) < ttl:
                 fresh[k] = v
         if len(fresh) != len(data):
-            self.save_data("seedgroup_skip", fresh)
+            self.save_data(store_key, fresh)
         return fresh
 
-    def _sg_mark_skip(self, item: Dict[str, Any], reason: str, detail: str = "") -> None:
-        """记一条跳过。带 detail 与失败次数，面板和日志能说清「为什么跳过」。"""
+    def _sg_mark_entry(self, store_key: str, item: Dict[str, Any], reason: str,
+                       detail: str = "") -> None:
+        """往指定表里记一条。带 detail 与失败次数，面板和日志能说清「为什么跳过」。"""
         key = _seed_group_key(item)
         if not key:
             return
         now = int(time.time())
-        skips = self._sg_skips()
-        prev = skips.get(key) or {}
+        entries = self._sg_live_entries(store_key)
+        prev = entries.get(key) or {}
         try:
             fails = int(prev.get("fails") or 0) + 1
         except Exception:
             fails = 1
-        skips[key] = {"at": now, "reason": reason, "ttl": self._sg_skip_ttl(reason),
-                      "detail": str(detail or "")[:120], "fails": fails}
-        self.save_data("seedgroup_skip", skips)
+        entries[key] = {"at": now, "reason": reason, "ttl": self._sg_skip_ttl(reason),
+                        "detail": str(detail or "")[:120], "fails": fails}
+        self.save_data(store_key, entries)
+
+    def _sg_clear_entry(self, store_key: str, record: Dict[str, Any]) -> bool:
+        key = _seed_group_key(record or {})
+        if not key:
+            return False
+        entries = self._sg_live_entries(store_key)
+        if entries.pop(key, None) is None:
+            return False
+        self.save_data(store_key, entries)
+        return True
+
+    def _sg_skips(self) -> Dict[str, Any]:
+        """**本地轮换（fallback）专用**的跳过表：候选过滤只认这张。
+
+        任务单路径**不读它**（`_sg_add_tasks` 只读 `_sg_task_backoff`）：
+        站点点名的种子不能被 fallback 的 rotated/dup 记录挡住。
+        """
+        return self._sg_live_entries("seedgroup_skip")
+
+    def _sg_mark_skip(self, item: Dict[str, Any], reason: str, detail: str = "") -> None:
+        self._sg_mark_entry("seedgroup_skip", item, reason, detail)
+
+    def _sg_task_backoff(self) -> Dict[str, Any]:
+        """**站点任务单专用**的加种失败退避表（规格 §5.2 的「保留退避」）。
+
+        与 `seedgroup_skip` 分开存：任务单不再查询 fallback 的记账表，
+        fallback 也不会被任务单的失败记录影响 —— 这是两条独立路径。
+        """
+        return self._sg_live_entries(self.SG_TASK_BACKOFF_KEY)
+
+    def _sg_task_backoff_mark(self, item: Dict[str, Any], reason: str, detail: str = "") -> None:
+        self._sg_mark_entry(self.SG_TASK_BACKOFF_KEY, item, reason, detail)
+
+    def _sg_task_backoff_clear(self, record: Dict[str, Any]) -> bool:
+        return self._sg_clear_entry(self.SG_TASK_BACKOFF_KEY, record)
 
     def _sg_add_with_retry(self, client: "_Client", data: bytes, info_hash: str) -> Tuple[Optional[str], Optional[Exception]]:
         """加一颗种子，网络类失败就地重试两次。
@@ -3470,7 +3530,7 @@ class ColaSeedGroup(_PluginBase):
         return None, last
 
     def _sg_unmark_skip(self, record: Dict[str, Any]) -> None:
-        """删掉种子之后清掉它的跳过记录。
+        """删掉种子之后清掉它的**本地轮换**跳过记录（任务单退避见 `_sg_task_backoff_clear`）。
 
         为什么必须清：跳过表的 `dup` 表示「客户端里已经有这颗」。会话面的资源池
         **不带 info_hash**（见 `_sg_candidates` 的注释），所以候选过滤里那条
@@ -3602,6 +3662,7 @@ class ColaSeedGroup(_PluginBase):
                 items.pop(info_hash, None)
                 # 同上：删了就清跳过记录，否则下架的种子被重新上架后永远加不回来
                 self._sg_unmark_skip(record)
+                self._sg_task_backoff_clear(record)
                 why = "连文件一起删" if delete_files else "保留文件"
                 progress_text = "未知" if progress is None else f"{progress:.0%}"
                 logger.info(f"保种组清理：{client.name} 删除 {info_hash[:12]}"
@@ -3884,8 +3945,9 @@ class ColaSeedGroup(_PluginBase):
                 continue
             removed += 1
             items.pop(info_hash, None)
-            # 删了就清跳过记录：否则「客户端已有（dup）」会在 TTL 内挡住它重新加回来
+            # 删了就清干净两张表：否则「客户端已有（dup）」/ 失败退避会在 TTL 内挡住它重新加回来
             self._sg_unmark_skip(record)
+            self._sg_task_backoff_clear(record)
             logger.info(f"保种组删种：{info_hash[:12]} 已删除（{item.get('reason') or 'remove'}，"
                         f"{'连文件一起删' if delete_files else '保留文件'}）")
             time.sleep(1.0)      # 别把删除请求打成一串，qB 在慢链路上会 403
@@ -3914,7 +3976,9 @@ class ColaSeedGroup(_PluginBase):
                                f"等这一批下完再继续补")
             logger.info(f"保种组：{state['reason']}")
             return 0, 0, 0, reasons
-        skips = self._sg_skips()
+        # 只读**任务单自己的**退避表：fallback 的 rotated / dup 记录一律不参与
+        # （站点在这轮任务单里点名要这颗，不能被另一条路径的记账挡住）。
+        backoff = self._sg_task_backoff()
         added = duplicate = failed = picked = rate_limited = 0
         for item in adds:
             if self._event.is_set():
@@ -3924,11 +3988,8 @@ class ColaSeedGroup(_PluginBase):
                 logger.info(f"保种组：本轮进种额度 {quota} 已用满，剩下的 {state['quota_trimmed']} 条下次再说")
                 break
             key = _seed_group_key(item)
-            skip = skips.get(key) if key else None
-            if skip and str(skip.get("reason") or "") not in SG_TASKS_IGNORED_SKIP_REASONS:
-                # 只挡「这颗自己失败过」的退避（网络类 5 分钟 / 坏种 7 天）——见规格 §5.2；
-                # 本地轮换留下的 `rotated` / `rotate-fail` 不算：那是 fallback 的记账，
-                # 站点在这轮任务单里**点名要这颗**，插件不该拿本地跳过表挡它 7 天。
+            if key and key in backoff:
+                # 这颗在任务单路径上自己失败过（网络类 5 分钟 / 坏种 7 天）—— 规格 §5.2 的退避
                 continue
             if added or failed:
                 time.sleep(self.SG_DOWNLOAD_GAP)
@@ -3943,14 +4004,14 @@ class ColaSeedGroup(_PluginBase):
                     tagged = False
                     logger.warn(f"保种组：给已有种子补标签失败（{info_hash[:12]}）：{err}")
                 if tagged:
-                    self._sg_mark_skip(item, "dup")
+                    self._sg_task_backoff_mark(item, "dup")
                 continue
             try:
                 data = self._sg_download(item)
             except _SeedGroupFetchError as err:
                 failed += 1
                 reasons[err.reason] = reasons.get(err.reason, 0) + 1
-                self._sg_mark_skip(item, err.reason, err.detail)
+                self._sg_task_backoff_mark(item, err.reason, err.detail)
                 wait = "下一轮重试" if err.transient else f"{self._sg_skip_ttl(err.reason) // 3600} 小时后重试"
                 logger.warn(f"保种组取种子失败（{item.get('torrent_id')}）："
                             f"{seed_group_fetch_label(err.reason)} {err.detail}；{wait}")
@@ -3958,7 +4019,7 @@ class ColaSeedGroup(_PluginBase):
             if not data:
                 failed += 1
                 reasons["download"] = reasons.get("download", 0) + 1
-                self._sg_mark_skip(item, "download")
+                self._sg_task_backoff_mark(item, "download")
                 continue
             info_hash = _torrent_info_hash(data) or info_hash
             result, err = self._sg_add_with_retry(client, data, info_hash)
@@ -3969,12 +4030,12 @@ class ColaSeedGroup(_PluginBase):
                     logger.warn(f"保种组：连续 {rate_limited} 次被限流，本轮停止加种（已加 {added} 条）")
                     break
                 failed += 1
-                self._sg_mark_skip(item, "net")
+                self._sg_task_backoff_mark(item, "net")
                 continue
             if result is None:
                 logger.warn(f"保种组加种异常（{item.get('torrent_id')}，重试 {self.SG_ADD_RETRY} 次后仍失败）：{err}")
                 failed += 1
-                self._sg_mark_skip(item, "net")
+                self._sg_task_backoff_mark(item, "net")
                 continue
             if result == "ok":
                 added += 1
@@ -3982,11 +4043,11 @@ class ColaSeedGroup(_PluginBase):
                 self._sg_remember_item(info_hash, item)
             elif result == "dup":
                 duplicate += 1
-                self._sg_mark_skip(item, "dup")
+                self._sg_task_backoff_mark(item, "dup")
                 self._sg_remember_item(info_hash, item)
             else:
                 failed += 1
-                self._sg_mark_skip(item, "fail")
+                self._sg_task_backoff_mark(item, "fail")
         return added, duplicate, failed, reasons
 
     def _sg_recheck_missing(self, clients: List[_Client], state: Dict[str, Any]) -> None:
