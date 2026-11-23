@@ -38,7 +38,10 @@ CONFIG_KEYS = (
     "seedgroup_client_mode", "seedgroup_clients_lines", "seedgroup_target_client",
     "seedgroup_save_path", "seedgroup_skip_check",
     "seedgroup_prune_mode", "seedgroup_rotate_count", "seedgroup_rotate_files",
-    "limit_dl_kib", "limit_up_kib", "limit_lines",
+    # 0.6.0：任务单里 remove 的删法（keep / torrent_only / torrent_and_files）。
+    # 限速接管那三项（limit_dl_kib / limit_up_kib / limit_lines）已随「只读」改动移除：
+    # 插件现在只上报客户端限速读数，不再给客户端写限速。
+    "seedgroup_delete_mode",
 )
 
 DEFAULTS: dict[str, Any] = {
@@ -49,7 +52,7 @@ DEFAULTS: dict[str, Any] = {
     "seedgroup_client_mode": "custom", "seedgroup_clients_lines": "", "seedgroup_target_client": "",
     "seedgroup_save_path": "", "seedgroup_skip_check": False,
     "seedgroup_prune_mode": "seed", "seedgroup_rotate_count": 5, "seedgroup_rotate_files": True,
-    "limit_dl_kib": 0, "limit_up_kib": 0, "limit_lines": "",
+    "seedgroup_delete_mode": "torrent_only",
 }
 
 
@@ -151,10 +154,13 @@ class Syncer:
             "cron": cfg.get("seedgroup_cron"),
             "last": None if last is None else {
                 "at": last.at, "ok": last.ok, "message": last.message,
+                # 0.6.0：这几个数字都是**站点**给的（老的 0.5.x 站点没有任务单时为 0）
+                "mode": last.state.get("mode"),
+                "revision": last.state.get("tasks_revision"),
                 "covered_gib": last.state.get("covered_gib"),
                 "target_gib": last.state.get("target_gib"),
                 "shortfall_gib": last.state.get("shortfall_gib"),
                 "added": last.state.get("added"),
-                "clients_offline": last.state.get("clients_offline"),
+                "removed": last.state.get("removed"),
             },
         }

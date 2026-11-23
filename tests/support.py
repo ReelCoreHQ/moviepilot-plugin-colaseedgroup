@@ -157,6 +157,7 @@ class FakeClient:
         self.added = []
         self.trackers = []
         self.deleted = []
+        self.delete_calls = []       # (hashes, delete_files) 逐次记录，用来断言删种三档
         self.speed_limits = None
         # 进种限流用：客户端里「正在下载」的条数（默认 0 = 队列空，永远有额度）
         self.inflight_count = 0
@@ -180,7 +181,13 @@ class FakeClient:
         self.trackers.append((info_hash, list(urls)))
         return True
 
+    def get_speed_limits(self):
+        """默认「读不到」（空 dict）：要测读数的用例自己覆盖它。"""
+        self.reads = getattr(self, "reads", 0) + 1
+        return {}
+
     def set_speed_limits(self, dl_kib, up_kib):
+        # 保种组链路只读：它出现在这里是为了断言「绝不被调用」
         self.speed_limits = (dl_kib, up_kib)
         return True
 
@@ -189,13 +196,17 @@ class FakeClient:
 
     def delete(self, hashes, delete_files=False):
         self.deleted.extend(hashes)
+        self.delete_calls.append((list(hashes), bool(delete_files)))
         return True
 
 
-def make_plugin(module, store=None, cls_name=None, **attrs):
+def make_plugin(module, store=None, cls_name=None, _live_report=False, **attrs):
     """绕过 _PluginBase.__init__ 造一个实例，插件数据换成内存字典。
 
     拆出「保种组」插件之后一个仓库里有两个类，所以按名字取（不传就自动找）。
+
+    `_live_report=True` 保留真实的限速上报方法；默认换成记录器 —— 大多数用例只想跑流程，
+    真发一次 POST 既慢又依赖网络，上报本身在 `SeedGroupLimitsTest` 里单独测。
     """
     cls = getattr(module, cls_name) if cls_name else (
         getattr(module, "ColaCrossSeed", None) or getattr(module, "ColaSeedGroup"))
@@ -229,7 +240,6 @@ def make_plugin(module, store=None, cls_name=None, **attrs):
     plugin._site_counter = {}
     plugin._site_fails = {}
     plugin._iyuu_rate_limited = False
-    plugin._seedgroup_report = False      # 测试默认不往 23 汇报，避免真发请求
     plugin._max_per_hour = 0
     plugin._max_per_site = 20
     plugin._skip_check = True
@@ -239,6 +249,8 @@ def make_plugin(module, store=None, cls_name=None, **attrs):
     plugin._inherit_tags = True
     plugin._extra_tags = ""
     plugin._target_client = ""
+    if not _live_report:
+        plugin._seed_group_report_limits = lambda *a, **k: {"ok": False, "skipped": True}
     for key, value in attrs.items():
         setattr(plugin, key, value)
     return plugin

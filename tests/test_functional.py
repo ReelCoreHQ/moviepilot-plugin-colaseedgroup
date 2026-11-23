@@ -7,10 +7,11 @@
 
 import json
 import os
+import shutil
 import sys
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -73,11 +74,16 @@ class InitOrderTest(unittest.TestCase):
         calls = []
         plugin._cola = lambda *a, **k: calls.append(a)
         plugin.init_plugin({"enabled": True, "seedgroup_enabled": True, "api_key": " rcapi_x ",
-                            "limit_dl_kib": 500, "limit_up_kib": 300})
+                            "seedgroup_delete_mode": "torrent_and_files"})
         self.assertTrue(plugin._seedgroup_enabled)
         self.assertEqual(plugin._api_key, "rcapi_x")
-        self.assertEqual((plugin._limit_dl_kib, plugin._limit_up_kib), (500, 300))
+        self.assertEqual(plugin._seedgroup_delete_mode, "torrent_and_files")
         self.assertEqual(calls, [], "保存配置不该再去站点查资格")
+
+    def test_unknown_delete_mode_falls_back_to_torrent_only(self):
+        plugin = self._plugin()
+        plugin.init_plugin({"enabled": True, "seedgroup_delete_mode": "nuke-everything"})
+        self.assertEqual(plugin._seedgroup_delete_mode, "torrent_only", "默认只删种、留文件")
 
     def test_old_login_fields_are_dropped(self):
         plugin = self._plugin()
@@ -137,26 +143,6 @@ class SeedGroupPaginationTest(unittest.TestCase):
 
         items, _, _ = plugin._sg_collect(probe)
         self.assertEqual([x["torrent_id"] for x in items], [1, 2])
-
-
-class EmptyPoolKeepsCoverageTest(unittest.TestCase):
-    """池子空了也不能把覆盖报成 0。
-
-    2026-11-19 事故：`not candidates` 分支只更新 shortfall_gib，covered_gib 留着
-    上一次的值 —— 上一轮没写过就一直是 0.0，于是「池子空了」的每一轮都上报
-    covered=0 / on_target=0，保种时长的连续区间被凭空打断，而客户端里其实好好
-    保着 1348 GiB。
-    """
-
-    def test_empty_pool_branch_writes_covered(self):
-        import inspect
-        src = inspect.getsource(SG_MOD.ColaSeedGroup._seed_group_sync)
-        # 找到 not candidates 分支，断言它同时写了 covered_gib
-        idx = src.find("if not candidates:")
-        self.assertGreater(idx, 0, "分支不存在")
-        block = src[idx:idx + 1200]
-        self.assertIn('state["covered_gib"] = current_gib', block,
-                      "池子空的分支必须把本轮实测覆盖写进 state")
 
 
 class NoMpFallbackTest(unittest.TestCase):
@@ -346,189 +332,205 @@ class PaginatedListTest(unittest.TestCase):
         self.assertEqual(calls[0]["limit"], page)
 
 
-class OnTargetToleranceTest(unittest.TestCase):
-    """达标判定要留容差：covered 与 target 天然差几 MB，严格 >= 会让保种时长永远 0。"""
-
-    def test_exact_goal_counts(self):
-        self.assertTrue(SG_MOD._sg_on_target(1152.4, 1152.4))
-
-    def test_slightly_under_still_counts(self):
-        self.assertTrue(SG_MOD._sg_on_target(1149.4, 1152.4))
-
-    def test_clearly_short_does_not_count(self):
-        self.assertFalse(SG_MOD._sg_on_target(1132.4, 1152.4))
-
-    def test_all_tier_counts_at_sixty_percent(self):
-        """all 档：覆盖到 60% 就算达标（目标每天都在涨，要求 100% 追不上）。"""
-        r = SG_MOD.SEED_GROUP_ALL_TARGET_RATIO
-        self.assertEqual(r, 0.6)
-        self.assertTrue(SG_MOD._sg_on_target(840, 1400, ratio=r), "60% 该达标")
-        # 同样 50%：不传 ratio（默认 100%）不达标；传 60% 阈值下也不达标
-        self.assertFalse(SG_MOD._sg_on_target(700, 1400, ratio=r), "50% 不该达标")
-        self.assertFalse(SG_MOD._sg_on_target(700, 1400), "不传 ratio 时是 100% 语义")
-
-    def test_all_tier_still_needs_sixty_percent(self):
-        r = SG_MOD.SEED_GROUP_ALL_TARGET_RATIO
-        self.assertFalse(SG_MOD._sg_on_target(820, 1400, ratio=r), "58.6% 不该达标")
-        self.assertTrue(SG_MOD._sg_on_target(845, 1400, ratio=r), "60.4% 该达标")
-
-    def test_missing_values_do_not_count(self):
-        for c, t in ((0, 1152), (None, 1152), (1152, 0), (1152, None)):
-            self.assertFalse(SG_MOD._sg_on_target(c, t))
+def tasks_payload(add=(), remove=(), revision="9f2c0a7d13be55a1",
+                  target_gib=2048.0, covered_gib=1203.5, shortfall_gib=844.5):
+    """站点 `GET /plugin/seed-group/tasks` 的响应体（形状见 seedgroup-v2-wire.md §2）。"""
+    return {"revision": revision, "target_gib": target_gib, "covered_gib": covered_gib,
+            "shortfall_gib": shortfall_gib, "add": list(add), "remove": list(remove)}
 
 
-class SeedGroupDownloadQuotaTest(unittest.TestCase):
-    """进种限流（2026-11-16）：客户端「正在下载」达到上限就停止进种，低于就按剩余额度补。"""
+def add_item(torrent_id, size_gib=1.0, reason="fill", info_hash=""):
+    return {"torrent_id": torrent_id, "info_hash": info_hash or f"{torrent_id:040x}",
+            "size_gib": size_gib, "reason": reason}
 
-    def _plugin(self, inflight, limit=5):
-        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+
+def remove_item(torrent_id, info_hash, size_gib=30.0, reason="surplus"):
+    return {"torrent_id": torrent_id, "info_hash": info_hash, "size_gib": size_gib, "reason": reason}
+
+
+#: make_cycle_plugin(tasks=...) 的「不覆盖真实方法」哨兵（端点用例要真方法）
+REAL_TASKS = object()
+
+
+class CycleCase(unittest.TestCase):
+    """跑一轮 `seed_group_tasks_cycle` 的公共夹具（站点任务单 + 替身客户端）。"""
+
+    def make_cycle_plugin(self, tasks=REAL_TASKS, clients=None, live_report=False, **attrs):
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup", _live_report=live_report)
         plugin._api_key = "rcapi_test"
         plugin._seedgroup_enabled = True
         plugin._seedgroup_tier = "2T"
         plugin._seedgroup_custom_gib = 2048
-        plugin._seedgroup_cron = "0 */6 * * *"
-        plugin._seedgroup_max_downloading = limit
-        plugin.update_config = lambda cfg: None
+        plugin._seedgroup_max_downloading = 0        # 默认不限进种额度：要测限流自己改
+        plugin._seedgroup_prune = False
+        plugin._seedgroup_save_path = ""
+        plugin._seedgroup_skip_check = True
+        plugin.SG_DOWNLOAD_GAP = 0        # 测试里不等节流（默认 2 秒/颗）
+        plugin._plugin_credentials = lambda: ("rcapi_ticket", "signing-key")
         plugin.post_message = lambda **k: None
+        plugin.update_config = lambda cfg: None
+        clients = clients if clients is not None else [support.FakeClient()]
+        plugin._sg_clients = lambda: clients
+        plugin._sg_candidates = lambda: []
+        plugin._sg_download = lambda item: support.make_torrent(
+            name=f"t{item['torrent_id']}.mkv", source=f"s{item['torrent_id']}")
+        if tasks is not REAL_TASKS:
+            plugin._seed_group_tasks = lambda tier, custom=None, _t=tasks: _t
+        for key, value in attrs.items():
+            setattr(plugin, key, value)
+        return plugin, clients
+
+
+class SeedGroupDownloadQuotaTest(CycleCase):
+    """进种限流（2026-11-16）：客户端「正在下载」达到上限就停，低于就按剩余额度加任务单。"""
+
+    def _plugin(self, inflight, limit=5, count=5):
         client = support.FakeClient()
         client.inflight_count = inflight
-        plugin._sg_clients = lambda: [client]
-        plugin._sg_current = lambda clients: (set(), 0.0, 0, 0)
-        plugin._sg_skips = lambda: set()
-        plugin._sg_candidates = lambda: [
-            {"torrent_id": i, "info_hash": f"{i:040x}", "size": 500 * SG_MOD.GIB, "official": True}
-            for i in range(1, 21)]
-        plugin._sg_download = lambda item: support.make_torrent(name=f"t{item['torrent_id']}.mkv",
-                                                                source=f"s{item['torrent_id']}")
-        plugin._maybe_report = lambda clients, state: None
-        plugin._sg_prune_if_enabled = lambda state: None
+        plugin, _ = self.make_cycle_plugin(
+            tasks=tasks_payload(add=[add_item(i) for i in range(1, count + 1)]),
+            clients=[client],
+            _seedgroup_max_downloading=limit,
+        )
         return plugin, client
 
     def test_queue_full_stops_ingesting(self):
         plugin, client = self._plugin(inflight=5, limit=5)
-        plugin.seed_group_sync()
-        state = plugin.get_data("seedgroup_state") or {}
+        state = plugin.seed_group_tasks_cycle()
         self.assertEqual(state.get("downloading"), 5)
         self.assertEqual(state.get("download_quota"), 0)
         self.assertEqual(client.added, [], "队列满时一颗都不该加")
         self.assertIn("下载队列已满", str(state.get("reason") or ""))
-        self.assertGreater(state.get("shortfall_gib", 0), 0)
+        self.assertEqual(state["add_count"], 5, "站点给的 add 条数照实记，只是没执行")
 
     def test_partial_quota_adds_only_remaining(self):
         plugin, client = self._plugin(inflight=3, limit=5)
-        plugin.seed_group_sync()
-        state = plugin.get_data("seedgroup_state") or {}
+        state = plugin.seed_group_tasks_cycle()
         self.assertEqual(state.get("downloading"), 3)
         self.assertEqual(state.get("download_quota"), 2)
         self.assertEqual(len(client.added), 2, "只剩 2 个额度就只加 2 颗")
-        self.assertEqual(state.get("quota_trimmed"), 3, "按目标本该挑 5 颗，额度只给 2 颗，砍掉 3 颗留到下一轮")
+        self.assertEqual(state.get("quota_trimmed"), 3, "5 条里只加了 2 条，剩下 3 条下次再说")
 
     def test_zero_limit_means_unlimited(self):
         plugin, client = self._plugin(inflight=50, limit=0)
-        plugin.seed_group_sync()
-        state = plugin.get_data("seedgroup_state") or {}
+        state = plugin.seed_group_tasks_cycle()
         self.assertEqual(state.get("download_quota"), "unlimited")
-        self.assertGreater(len(client.added), 0, "0 = 不限制，门槛不该卡住")
+        self.assertEqual(len(client.added), 5)
 
     def test_unreadable_inflight_does_not_block(self):
         plugin, client = self._plugin(inflight=-1, limit=5)
-        plugin.seed_group_sync()
-        self.assertGreater(len(client.added), 0, "读不到队列时不能把保种卡死")
+        plugin.seed_group_tasks_cycle()
+        self.assertEqual(len(client.added), 5, "读不到队列时不能把保种卡死")
 
 
-class SeedGroupSyncRobustnessTest(unittest.TestCase):
-    def _plugin(self):
-        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
-        plugin._api_key = "rcapi_test"
-        plugin._seedgroup_enabled = True
-        plugin._seedgroup_tier = "2T"
-        plugin._seedgroup_custom_gib = 2048
-        plugin._seedgroup_cron = "0 */6 * * *"
-        plugin._seedgroup_use_mp_clients = True
-        plugin._seedgroup_clients_lines = ""
-        plugin._seedgroup_target_client = ""
-        plugin._seedgroup_save_path = ""
-        plugin._seedgroup_skip_check = True
-        plugin.update_config = lambda cfg: None
-        plugin.post_message = lambda **k: None
-        return plugin
+class SeedGroupTasksExecutionTest(CycleCase):
+    """任务单执行：加种带标签、失败退避、删种三档、只在任务单范围内动手。"""
 
-    def test_duplicate_does_not_inflate_coverage(self):
-        plugin = self._plugin()
-        torrent = support.make_torrent()
-        hash_ = support.info_hash_of(torrent)
-        client = support.FakeClient(has_hash=[hash_])
-        client.list_completed = lambda: [
-            {"hash": hash_, "name": "x", "size": 1024 * SG_MOD.GIB,
-             "tags": SG_MOD.SEED_GROUP_TAG, "state": "uploading"}]
-        plugin._sg_clients = lambda: [client]
-        plugin._cola = lambda m, p, **k: SG_MOD._HttpResult(200, b"{}", "{}")
-        plugin._sg_candidates = lambda: [{"torrent_id": 9, "size": 1500 * SG_MOD.GIB}]
-        plugin._sg_download = lambda item: torrent
-        plugin._seed_group_sync()
-        state = plugin.get_data("seedgroup_state")
+    def test_add_uses_download_cola_and_seed_group_tag(self):
+        plugin, client = self._plugin_with(add=[add_item(11), add_item(12)])
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(len(client.added), 2)
+        self.assertTrue(all(a["label"] == SG_MOD.SEED_GROUP_TAG for a in client.added))
+        self.assertEqual(state["added"], 2)
+        self.assertEqual(state["add_count"], 2)
+        self.assertEqual(plugin.get_data("tasks_revision"), "9f2c0a7d13be55a1")
+        # 站点给的数字原样进 state，插件不再自算 target/covered
+        self.assertEqual((state["target_gib"], state["covered_gib"], state["shortfall_gib"]),
+                         (2048.0, 1203.5, 844.5))
+
+    def _plugin_with(self, add=(), remove=(), clients=None, **attrs):
+        plugin, grown = self.make_cycle_plugin(tasks=tasks_payload(add=add, remove=remove),
+                                               clients=clients, **attrs)
+        return plugin, grown[0]
+
+    def test_remove_three_modes(self):
+        cases = (("keep", []),
+                 ("torrent_only", [(["a" * 40], False)]),
+                 ("torrent_and_files", [(["a" * 40], True)]))
+        for mode, expected in cases:
+            with self.subTest(mode=mode):
+                client = support.FakeClient(has_hash=["a" * 40])
+                plugin, _ = self._plugin_with(
+                    remove=[remove_item(7, "a" * 40)], clients=[client],
+                    _seedgroup_delete_mode=mode)
+                state = plugin.seed_group_tasks_cycle()
+                self.assertEqual(client.delete_calls, expected)
+                self.assertEqual(state["removed"], 0 if mode == "keep" else 1)
+
+    def test_remove_only_touches_listed_hashes(self):
+        hashes = ["a" * 40, "b" * 40, "c" * 40]
+        client = support.FakeClient(has_hash=hashes)
+        plugin, _ = self._plugin_with(remove=[remove_item(7, "b" * 40)], clients=[client])
+        plugin.seed_group_tasks_cycle()
+        self.assertEqual(client.deleted, ["b" * 40], "delete 模式只处理任务单里那条")
+
+    def test_remove_missing_from_client_is_not_counted(self):
+        client = support.FakeClient(has_hash=[])
+        plugin, _ = self._plugin_with(remove=[remove_item(7, "d" * 40)], clients=[client])
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(state["removed"], 0)
+        self.assertEqual(client.delete_calls, [])
+
+    def test_duplicate_hash_is_not_added_twice(self):
+        client = support.FakeClient(has_hash=[f"{11:040x}"])
+        plugin, _ = self._plugin_with(add=[add_item(11)], clients=[client])
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(client.added, [])
         self.assertEqual(state["duplicate"], 1)
-        self.assertEqual(state["added"], 0)
-        # 重复的那颗不能算进覆盖：1024 还是 1024，缺口照实报
-        self.assertEqual(state["covered_gib"], 1024)
-        self.assertEqual(state["shortfall_gib"], 1024)
 
     def test_failed_add_is_skipped_next_round(self):
-        plugin = self._plugin()
         client = support.FakeClient(add_result="fail")
-        client.list_completed = lambda: []
-        plugin._sg_clients = lambda: [client]
-        plugin._sg_candidates = lambda: [{"torrent_id": 5, "info_hash": "a" * 40, "size": 3000 * SG_MOD.GIB}]
-        plugin._sg_download = lambda item: support.make_torrent()
-        plugin._seed_group_sync()
+        plugin, _ = self._plugin_with(add=[add_item(5, info_hash="a" * 40)], clients=[client])
+        plugin.seed_group_tasks_cycle()
         self.assertEqual(plugin.get_data("seedgroup_state")["failed"], 1)
         self.assertIn("5", plugin.get_data("seedgroup_skip"))
+        # 第二轮：同一条任务在退避窗口里，不再白下第二次
+        second = support.FakeClient()
+        plugin._sg_clients = lambda: [second]
+        plugin.seed_group_tasks_cycle()
+        self.assertEqual(second.added, [], "失败过的条目在退避内不该重试")
 
     def test_transient_fetch_failure_retries_next_round(self):
         """502 这种临时故障只退避几分钟，下一轮就重试，不能像坏种那样关 7 天。"""
-        plugin = self._plugin()
-        client = support.FakeClient()
-        client.list_completed = lambda: []
-        plugin._sg_clients = lambda: [client]
-        plugin._sg_candidates = lambda: [{"torrent_id": 71, "info_hash": "c" * 40, "size": 3000 * SG_MOD.GIB}]
-
         def boom(item):
             raise SG_MOD._SeedGroupFetchError("http_5xx", "申请下载链接 HTTP 502")
 
-        plugin._sg_download = boom
-        plugin._seed_group_sync()
-        state = plugin.get_data("seedgroup_state")
+        plugin, _ = self._plugin_with(add=[add_item(71, info_hash="c" * 40)], _sg_download=boom)
+        state = plugin.seed_group_tasks_cycle()
         self.assertEqual(state["failed"], 1)
-        self.assertIn("站点 5xx", state["reason"])
+        self.assertEqual(state.get("fail_reasons"), {"站点 5xx": 1})
         entry = plugin.get_data("seedgroup_skip")["71"]
         self.assertEqual(entry["reason"], "http_5xx")
         self.assertEqual(entry["ttl"], plugin.SG_SKIP_TTL_NET)
         self.assertIn("502", entry["detail"])
-        self.assertEqual(entry["fails"], 1)
-        # 到下一轮（5 分钟）这条跳过就过期，候选重新出现。
         with patch.object(SG_MOD.time, "time", return_value=entry["at"] + plugin.SG_SKIP_TTL_NET + 1):
             self.assertNotIn("71", plugin._sg_skips())
 
     def test_permanent_fetch_failure_backs_off_longer(self):
-        """4xx 是站点明确拒绝，按坏种处理，别每轮白下载一遍。"""
-        plugin = self._plugin()
-        client = support.FakeClient()
-        client.list_completed = lambda: []
-        plugin._sg_clients = lambda: [client]
-        plugin._sg_candidates = lambda: [{"torrent_id": 72, "info_hash": "d" * 40, "size": 3000 * SG_MOD.GIB}]
-
         def gone(item):
             raise SG_MOD._SeedGroupFetchError("http_4xx", "直链 HTTP 404")
 
-        plugin._sg_download = gone
-        plugin._seed_group_sync()
+        plugin, _ = self._plugin_with(add=[add_item(72, info_hash="d" * 40)], _sg_download=gone)
+        plugin.seed_group_tasks_cycle()
         entry = plugin.get_data("seedgroup_skip")["72"]
         self.assertEqual(entry["reason"], "http_4xx")
         self.assertEqual(entry["ttl"], plugin.SG_SKIP_TTL)
 
+    def test_add_exception_does_not_kill_round(self):
+        client = support.FakeClient()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("qb 连接断了")
+
+        client.add = boom
+        plugin, _ = self._plugin_with(add=[add_item(6, info_hash="b" * 40)], clients=[client])
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(state["failed"], 1)
+        self.assertEqual(state["mode"], "tasks", "整轮不该因为一颗加不进去就崩")
+
     def test_download_link_failures_carry_reason_codes(self):
         """_download_cola 把状态码翻译成原因码，而不是一律 b""。"""
-        plugin = self._plugin()
+        plugin, _ = self._plugin_with()
         plugin._cola = lambda method, path, **kw: SG_MOD._HttpResult(502, b"", "")
         with self.assertRaises(SG_MOD._SeedGroupFetchError) as caught:
             plugin._download_cola(11)
@@ -546,22 +548,182 @@ class SeedGroupSyncRobustnessTest(unittest.TestCase):
             plugin._download_cola(13)
         self.assertEqual(caught.exception.reason, "no_url")
 
-    def test_add_exception_does_not_kill_round(self):
-        plugin = self._plugin()
-        client = support.FakeClient()
 
-        def boom(*args, **kwargs):
-            raise RuntimeError("qb 连接断了")
+class SeedGroupTasksEndpointTest(CycleCase):
+    """`GET /plugin/seed-group/tasks` 的请求与解析：失败一律 None（不抛）。"""
 
-        client.add = boom
-        client.list_completed = lambda: []
-        plugin._sg_clients = lambda: [client]
-        plugin._sg_candidates = lambda: [{"torrent_id": 6, "info_hash": "b" * 40, "size": 3000 * SG_MOD.GIB}]
-        plugin._sg_download = lambda item: support.make_torrent()
-        plugin._seed_group_sync()
-        state = plugin.get_data("seedgroup_state")
-        self.assertEqual(state["failed"], 1)
-        self.assertGreater(state["shortfall_gib"], 0)
+    def _call(self, answers, tier="2T", custom=2048, headers=None, plugin=None):
+        plugin = plugin or self.make_cycle_plugin()[0]
+        calls = []
+        queue = list(answers)
+
+        def fake_curl(method, url, **kwargs):
+            calls.append({"method": method, "url": url, "headers": kwargs.get("headers") or {}})
+            out = kwargs.get("headers_out")
+            if out is not None and headers:
+                out.update(headers)
+            if not queue:
+                return SG_MOD._HttpResult(0, b"", "")
+            status, body = queue.pop(0)
+            text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+            return SG_MOD._HttpResult(status, text.encode(), text)
+
+        with patch.object(SG_MOD, "_curl", fake_curl):
+            tasks = plugin._seed_group_tasks(tier, custom)
+        return plugin, tasks, calls
+
+    def test_200_is_parsed_and_signed_with_query(self):
+        body = tasks_payload(add=[add_item(1)], remove=[remove_item(2, "b" * 40)])
+        plugin, tasks, calls = self._call([(200, body)])
+        self.assertEqual(tasks["revision"], "9f2c0a7d13be55a1")
+        self.assertEqual(tasks["target_gib"], 2048.0)
+        self.assertEqual(tasks["covered_gib"], 1203.5)
+        self.assertEqual(tasks["shortfall_gib"], 844.5)
+        self.assertEqual([x["torrent_id"] for x in tasks["add"]], [1])
+        self.assertEqual([x["torrent_id"] for x in tasks["remove"]], [2])
+        self.assertEqual(calls[0]["method"], "GET")
+        self.assertIn("/api/v1/plugin/seed-group/tasks?", calls[0]["url"])
+        self.assertIn("tier=2T", calls[0]["url"])
+        self.assertIn("custom_gib=2048", calls[0]["url"])
+        self.assertNotIn("since_revision", calls[0]["url"], "还没有 revision 时不该带这个参数")
+        # 签名覆盖的是「路径 + 查询串」：URL 里带 query 才能和站点逐字节对上
+        self.assertTrue(calls[0]["headers"]["X-Plugin-Signature"].startswith("v1 ts="))
+        self.assertEqual(calls[0]["headers"]["X-API-Key"], "rcapi_ticket")
+
+    def test_since_revision_is_sent_after_first_round(self):
+        plugin, _, _ = self._call([(200, tasks_payload())])
+        plugin.save_data("tasks_revision", "9f2c0a7d13be55a1")
+        _, _, calls = self._call([(200, tasks_payload())], plugin=plugin)
+        self.assertIn("since_revision=9f2c0a7d13be55a1", calls[0]["url"])
+
+    def test_missing_collections_become_empty_lists(self):
+        _, tasks, _ = self._call([(200, {"revision": "x", "add": None, "remove": "bad"})])
+        self.assertEqual(tasks["add"], [])
+        self.assertEqual(tasks["remove"], [])
+
+    def test_old_site_and_errors_return_none(self):
+        for status in (404, 405, 500, 0, 403):
+            with self.subTest(status=status):
+                _, tasks, _ = self._call([(status, {})])
+                self.assertIsNone(tasks, f"HTTP {status} 应退回本地轮换")
+
+    def test_non_json_body_returns_none(self):
+        _, tasks, _ = self._call([(200, "<html>gateway</html>")])
+        self.assertIsNone(tasks)
+
+    def test_ticket_renewal_header_is_recorded(self):
+        plugin, _, _ = self._call(
+            [(200, tasks_payload())],
+            headers={"x-plugin-key-expires-at": "2026-11-23T18:00:00Z"})
+        self.assertEqual(plugin.get_data("plugin_key_expires_at"), "2026-11-23T18:00:00Z")
+
+
+class SeedGroupLimitsTest(CycleCase):
+    """`POST /plugin/seed-group/limits`：只统计、不改限速，多台取最紧的一档。"""
+
+    class _Limited(support.FakeClient):
+        def __init__(self, name, dl, up, readable=True):
+            super().__init__()
+            self.name = name
+            self._dl, self._up, self._readable = dl, up, readable
+
+        def get_speed_limits(self):
+            if not self._readable:
+                return {}
+            return {"dl_kib": self._dl, "up_kib": self._up,
+                    "dl_enabled": bool(self._dl), "up_enabled": bool(self._up)}
+
+    def _report(self, clients, answers=None, revision="9f2c0a7d13be55a1"):
+        plugin, _ = self.make_cycle_plugin(clients=clients, live_report=True)
+        calls = []
+        queue = list(answers or [(200, {"ok": True, "throttled": False,
+                                       "revision": revision})])
+
+        def fake_curl(method, url, **kwargs):
+            calls.append({"method": method, "url": url, "body": kwargs.get("json_body"),
+                          "headers": kwargs.get("headers") or {}})
+            status, body = queue.pop(0)
+            text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+            return SG_MOD._HttpResult(status, text.encode(), text)
+
+        with patch.object(SG_MOD, "_curl", fake_curl):
+            out = plugin._seed_group_report_limits(clients, revision)
+        return plugin, out, calls
+
+    def test_tightest_client_wins(self):
+        clients = [self._Limited("qb-a", 1024, 2048), self._Limited("qb-b", 512, 4096)]
+        plugin, out, calls = self._report(clients)
+        body = calls[0]["body"]
+        self.assertEqual(body["download_limit_kib"], 512, "多台里取非零最小值")
+        self.assertEqual(body["upload_limit_kib"], 2048)
+        self.assertEqual(body["instance_id"], plugin._plugin_instance_id())
+        self.assertEqual(body["revision"], "9f2c0a7d13be55a1")
+        self.assertEqual([row["client"] for row in body["clients"]], ["qb-a", "qb-b"])
+        self.assertTrue(out["ok"])
+        self.assertIn("/api/v1/plugin/seed-group/limits", calls[0]["url"])
+        self.assertEqual(calls[0]["method"], "POST")
+
+    def test_all_unlimited_reports_zero(self):
+        clients = [self._Limited("qb-a", 0, 0)]
+        _, _, calls = self._report(clients)
+        self.assertEqual(calls[0]["body"]["download_limit_kib"], 0)
+        self.assertEqual(calls[0]["body"]["upload_limit_kib"], 0)
+
+    def test_unreadable_client_is_marked_and_excluded(self):
+        clients = [self._Limited("qb-a", 0, 0), self._Limited("qb-b", 0, 0, readable=False)]
+        plugin, _, calls = self._report(clients)
+        rows = calls[0]["body"]["clients"]
+        self.assertTrue(rows[0]["readable"])
+        self.assertFalse(rows[1]["readable"])
+        self.assertNotIn("error", rows[1], "多一个字段站点就整份不认")
+        self.assertEqual(calls[0]["body"]["upload_limit_kib"], 0)
+
+    def test_read_only_never_writes_limits(self):
+        client = self._Limited("qb-a", 100, 200)
+        plugin, _ = self.make_cycle_plugin(clients=[client], live_report=True)
+        with patch.object(SG_MOD, "_curl", return_value=SG_MOD._HttpResult(200, b"{}", "{}")):
+            plugin.seed_group_tasks_cycle()
+        self.assertIsNone(client.speed_limits, "保种组链路绝不调 set_speed_limits")
+
+    def test_conflict_is_recorded_not_raised(self):
+        plugin, out, _ = self._report([self._Limited("qb-a", 0, 0)],
+                                      answers=[(409, {"revision": "aaaaaaaaaaaaaaaa"})])
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["conflict"], "aaaaaaaaaaaaaaaa")
+        self.assertIn("revision", out["reason"])
+        self.assertEqual(plugin.get_data("seedgroup_limits_last")["conflict"], "aaaaaaaaaaaaaaaa")
+
+    def test_401_renews_ticket_then_reposts(self):
+        clients = [self._Limited("qb-a", 0, 0)]
+        plugin, _ = self.make_cycle_plugin(clients=clients, live_report=True)
+        calls = []
+        queue = [(401, {"error": {"code": "invalid_credentials"}}),
+                 (200, {"token": "rcapi_new", "signing_key": "sk_new"}),
+                 (200, {"ok": True, "throttled": True, "revision": "r2"})]
+
+        def fake_curl(method, url, **kwargs):
+            calls.append(url)
+            status, body = queue.pop(0)
+            text = json.dumps(body)
+            return SG_MOD._HttpResult(status, text.encode(), text)
+
+        with patch.object(SG_MOD, "_curl", fake_curl):
+            out = plugin._seed_group_report_limits(clients)
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["renewed"])
+        self.assertTrue(out["throttled"])
+        self.assertTrue(calls[1].endswith("/api/v1/plugin/keys/renew"))
+        self.assertEqual(calls[2], calls[0])
+
+    def test_missing_ticket_skips_without_request(self):
+        plugin, _ = self.make_cycle_plugin(live_report=True)
+        plugin._api_key = ""
+        plugin._plugin_credentials = lambda: ("", "")
+        with patch.object(SG_MOD, "_curl") as send:
+            out = plugin._seed_group_report_limits([self._Limited("qb-a", 0, 0)])
+        send.assert_not_called()
+        self.assertFalse(out["ok"])
+        self.assertIn("票据", out["reason"])
 
 
 class SeedGroupPruneTest(unittest.TestCase):
@@ -811,166 +973,113 @@ class RotateTest(unittest.TestCase):
 
 
 class AllTierTest(unittest.TestCase):
-    """「全站官种」档：目标按未过滤的池子算，跳过表不能让它缩水。"""
+    """「全站官种」档：目标由站点算，插件只把档位传上去（不再自己按池子总量算）。"""
 
     def _plugin(self):
         plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
-        plugin._api_key = "rcapi_test"
-        plugin._seedgroup_enabled = True
-        plugin._seedgroup_tier = "all"
-        plugin._seedgroup_custom_gib = 2048
-        plugin._seedgroup_cron = "0 */6 * * *"
-        plugin._seedgroup_client_mode = "custom"
-        plugin._seedgroup_use_mp_clients = False
-        plugin._seedgroup_clients_lines = ""
-        plugin._seedgroup_target_client = ""
-        plugin._seedgroup_save_path = ""
-        plugin._seedgroup_skip_check = True
-        plugin._seedgroup_prune_mode = "off"
-        plugin._seedgroup_prune = False
-        plugin._seedgroup_report = False
         plugin.update_config = lambda cfg: None
+        plugin.run_tests = lambda persist=True: None
         plugin.post_message = lambda **k: None
         return plugin
 
-    def test_target_ignores_skip_table(self):
+    def test_all_tier_sends_tier_without_local_target(self):
         plugin = self._plugin()
-        client = support.FakeClient()
-        client.list_completed = lambda: []
-        plugin._sg_clients = lambda: [client]
-        plugin._cola = lambda m, p, **k: SG_MOD._HttpResult(200, b"{}", "{}")
-        plugin._sg_candidates = lambda: [
-            {"torrent_id": 1, "info_hash": "a" * 40, "size": 100 * SG_MOD.GIB},
-            {"torrent_id": 2, "info_hash": "c" * 40, "size": 50 * SG_MOD.GIB},
-        ]
-        plugin.save_data("seedgroup_skip", {"2": {"at": 9_999_999_999, "reason": "fail"}})
-        plugin._sg_download = lambda item: support.make_torrent()
-        plugin._seed_group_sync()
-        state = plugin.get_data("seedgroup_state")
-        # 池子总量 150；跳过的 50 只是这轮不加，目标不能缩成 100
-        self.assertEqual(state["target_gib"], 150.0)
-        self.assertEqual(state["pool_count"], 2)
-        self.assertEqual(state["pool_pending"], 1)
+        plugin._api_key = "rcapi_test"
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_tier = "all"
+        plugin._seedgroup_prune = False
+        plugin._plugin_credentials = lambda: ("ticket", "secret")
+        seen = {}
+
+        def tasks(tier, custom=None):
+            seen.update(tier=tier, custom=custom)
+            return tasks_payload(target_gib=1200.0, covered_gib=1200.0, shortfall_gib=0.0)
+
+        plugin._seed_group_tasks = tasks
+        plugin._sg_clients = lambda: [support.FakeClient()]
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(seen["tier"], "all")
+        # 站点给的 1200 原样进 state：all 档的 target 由站点按池子总量算
+        self.assertEqual(state["target_gib"], 1200.0)
 
     def test_custom_unit_from_config(self):
         plugin = self._plugin()
-        plugin.update_config = lambda cfg: None
-        plugin.run_tests = lambda persist=True: None
         plugin._api_key = ""
         plugin.init_plugin({"seedgroup_tier": "custom", "seedgroup_custom_gib": "1T"})
         self.assertEqual(plugin._seedgroup_custom_gib, 1024)
         self.assertEqual(SG_MOD.seed_group_target_gib("custom", plugin._seedgroup_custom_gib), 1024)
 
 
-class SpeedReportTest(unittest.TestCase):
-    """限速情况上报：只统计开了保种组的用户。"""
+class RuntimeVersionGateTest(unittest.TestCase):
+    """只支持 MoviePilot v3：v2 运行时不注册任务、面板给一行警告、不抛异常。"""
 
-    def _plugin(self, enabled=True, report=True):
+    def _plugin(self):
         plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
-        plugin._seedgroup_enabled = enabled
-        plugin._seedgroup_report = report
-        plugin._seedgroup_report_url = "http://23.81.118.186:18099/report"
-        plugin._seedgroup_report_token = ""
-        plugin._seedgroup_tier = "2T"
-        plugin._seedgroup_scope = "site"
-        plugin._seedgroup_custom_gib = 2048
-        plugin._plugin_save_credentials("rcapi_ticket", "signing-key")
+        plugin._enabled = True
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_cron = "0 * * * *"
+        plugin._api_key = "rcapi_test"
+        plugin.update_config = lambda cfg: None
+        plugin.post_message = lambda **k: None
         return plugin
 
-    def test_skips_when_group_disabled(self):
-        plugin = self._plugin(enabled=False)
-        out = plugin._report_seedgroup([support.FakeClient()], {})
-        self.assertTrue(out["skipped"])
-        self.assertIn("未启用", out["reason"])
-
-    def test_skips_when_report_off(self):
-        plugin = self._plugin(report=False)
-        out = plugin._report_seedgroup([support.FakeClient()], {})
-        self.assertTrue(out["skipped"])
-
-    def test_no_ticket_and_no_key_sends_nothing(self):
+    def test_v2_does_not_register_service_and_warns(self):
         plugin = self._plugin()
-        plugin.save_data("plugin_key", "")
-        plugin._api_key = ""
-        calls = []
-        original, SG_MOD._curl = SG_MOD._curl, (lambda *a, **k: calls.append(a))
-        try:
-            out = plugin._report_seedgroup([support.FakeClient()], {})
-        finally:
-            SG_MOD._curl = original
-        self.assertEqual(calls, [], "没有票据的上报只会被 401，不该发")
-        self.assertTrue(out["skipped"])
-        self.assertIn("票据", plugin.get_data("seedgroup_report_last")["reason"])
+        with patch.object(SG_MOD, "_mp_version", return_value="2.9.4"):
+            self.assertEqual(plugin.get_service(), [], "v2 运行时不注册定时任务")
+            page = json.dumps(plugin.get_page(), ensure_ascii=False)
+        self.assertIn("只支持 v3", page)
+        self.assertIn("2.9.4", page)
 
-    def test_payload_contains_client_limits(self):
+    def test_v3_registers_service(self):
         plugin = self._plugin()
+        with patch.object(SG_MOD, "_mp_version", return_value="3.1.2"):
+            self.assertEqual([s["id"] for s in plugin.get_service()], ["ColaSeedGroup"])
+            page = json.dumps(plugin.get_page(), ensure_ascii=False)
+        self.assertNotIn("只支持 v3", page)
 
-        class Limited(support.FakeClient):
-            name = "198.72.127.68:8081"
+    def test_unknown_version_is_treated_as_supported(self):
+        """独立版（没有 MP 运行时）取不到版本 → 照常跑。"""
+        self.assertTrue(SG_MOD.mp_version_supported(""))
+        self.assertTrue(SG_MOD.mp_version_supported(None))
+        self.assertFalse(SG_MOD.mp_version_supported("2.9.4"))
+        self.assertTrue(SG_MOD.mp_version_supported("3.0.0-beta2"))
+        self.assertFalse(SG_MOD.mp_version_supported("1.9.16"))
 
-            def get_speed_limits(self):
-                return {"dl_kib": 1024, "up_kib": 2048, "dl_enabled": True, "up_enabled": True}
-
-        captured = {}
-
-        def fake_curl(method, url, **kwargs):
-            captured["url"] = url
-            captured["body"] = kwargs.get("json_body")
-            return SG_MOD._HttpResult(200, b"{}", "{}")
-
-        original, SG_MOD._curl = SG_MOD._curl, fake_curl
-        try:
-            out = plugin._report_seedgroup([Limited()], {"tier": "2T", "covered_gib": 100})
-        finally:
-            SG_MOD._curl = original
-        self.assertTrue(out["ok"])
-        client = captured["body"]["clients"][0]
-        self.assertEqual(client["client"], "198.72.127.68:8081")
-        self.assertEqual(client["dl_kib"], 1024)
-        self.assertEqual(client["up_kib"], 2048)
-        # 身份由会话决定，payload 不再自带 uid（站点契约 additionalProperties:false）
-        self.assertNotIn("uid", captured["body"])
-        self.assertNotIn("username", captured["body"])   # 同上：身份来自会话
-        self.assertIn("enforced", captured["body"])
-        # 是否工作组由站点按票据所属账号判定，插件不再报 groups
-        self.assertNotIn("groups", captured["body"])
-
-    def test_failure_is_recorded_not_raised(self):
+    def test_v2_runtime_cycle_does_not_touch_the_site(self):
         plugin = self._plugin()
+        plugin._seed_group_tasks = Mock(side_effect=AssertionError("v2 不该拉任务单"))
+        with patch.object(SG_MOD, "_mp_version", return_value="2.9.4"):
+            state = plugin.seed_group_tasks_cycle()
+        self.assertIn("只支持 v3", state["reason"])
+        plugin._seed_group_tasks.assert_not_called()
 
-        def fake_curl(method, url, **kwargs):
-            return SG_MOD._HttpResult(404, b"", "404 page not found")
 
-        original, SG_MOD._curl = SG_MOD._curl, fake_curl
-        try:
-            out = plugin._report_seedgroup([support.FakeClient()], {})
-        finally:
-            SG_MOD._curl = original
-        self.assertFalse(out["ok"])
-        self.assertIn("404", out["reason"])
-        self.assertFalse(plugin.get_data("seedgroup_report_last")["ok"])
+class SiteNumbersPanelTest(CycleCase):
+    """面板只显示站点给的数字 + 本轮任务条数 + 限速读数 + 删除模式。"""
 
-    def test_unreadable_client_marked(self):
-        plugin = self._plugin()
+    def test_panel_shows_site_numbers_and_no_local_coverage(self):
+        plugin, _ = self.make_cycle_plugin(
+            tasks=tasks_payload(add=[add_item(1)], remove=[remove_item(2, "b" * 40)]),
+            _seedgroup_delete_mode="torrent_and_files")
+        plugin.seed_group_tasks_cycle()
+        blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
+        self.assertIn("9f2c0a7d13be55a1", blob)
+        self.assertIn("2048.0 GiB", blob)
+        self.assertIn("1203.5 GiB", blob)
+        self.assertIn("844.5 GiB", blob)
+        self.assertIn("add 1 条、remove 1 条", blob)
+        self.assertIn("种子和文件一起删", blob)
+        self.assertNotIn("current_gib", blob)
+        self.assertNotIn("实际覆盖", blob, "插件自算的覆盖不再出现在面板")
 
-        class Blind(support.FakeClient):
-            name = "mp-client"
-
-        captured = {}
-
-        def fake_curl(method, url, **kwargs):
-            captured["body"] = kwargs.get("json_body")
-            return SG_MOD._HttpResult(200, b"", "")
-
-        original, SG_MOD._curl = SG_MOD._curl, fake_curl
-        try:
-            plugin._report_seedgroup([Blind()], {})
-        finally:
-            SG_MOD._curl = original
-        row = captured["body"]["clients"][0]
-        self.assertFalse(row["readable"])
-        self.assertEqual(row["dl_kib"], 0)      # 契约要整数：读不到记 0（= 不限），靠 readable 区分
-        self.assertNotIn("error", row)          # 多一个字段整份上报就 400
+    def test_panel_marks_fallback_mode(self):
+        plugin, _ = self.make_cycle_plugin(tasks=None)
+        plugin._sg_rotate = lambda clients, state, pool: {"dropped": 0, "added": 0,
+                                                          "failed": 0, "reason": "未达标"}
+        plugin.seed_group_tasks_cycle()
+        blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
+        self.assertIn("老站点", blob)
 
 
 class SeedGroupModeTest(unittest.TestCase):
@@ -1073,8 +1182,8 @@ class FormLayoutTest(unittest.TestCase):
         for key in ("api_key", "seedgroup_enabled", "seedgroup_tier", "seedgroup_cron",
                     "seedgroup_max_downloading", "seedgroup_save_path",
                     "seedgroup_skip_check", "seedgroup_client_mode",
-                    "seedgroup_prune_mode", "seedgroup_rotate_files",
-                    "seedgroup_clients_lines", "limit_dl_kib", "limit_up_kib", "limit_lines"):
+                    "seedgroup_prune_mode", "seedgroup_delete_mode", "seedgroup_rotate_files",
+                    "seedgroup_clients_lines"):
             self.assertIn(key, models, f"表单缺少字段 {key}")
         self.assertNotIn("seedgroup_rotate_count", models,
                          "轮换频率固定，不该再有这个数值输入框")
@@ -1179,50 +1288,6 @@ class SeedGroupTierTest(unittest.TestCase):
         self.assertEqual(SG_MOD._seed_group_size_gib("bad"), 0.0)
 
 
-class SeedGroupPlanTest(unittest.TestCase):
-    def test_never_below_target(self):
-        items = [{"info_hash": f"h{i}", "size": i * SG_MOD.GIB} for i in (60, 50, 40, 30)]
-        picked, total, shortfall = SG_MOD.seed_group_plan(items, 100)
-        self.assertGreaterEqual(total, 100)
-        self.assertEqual(shortfall, 0)
-        self.assertEqual(sum(x["size_gib"] for x in picked), total)
-
-    def test_best_fit_fills_exactly(self):
-        items = [{"info_hash": "a", "size": 60 * SG_MOD.GIB},
-                 {"info_hash": "b", "size": 50 * SG_MOD.GIB},
-                 {"info_hash": "c", "size": 40 * SG_MOD.GIB}]
-        picked, total, shortfall = SG_MOD.seed_group_plan(items, 100)
-        self.assertEqual(total, 100)
-        self.assertEqual([x["info_hash"] for x in picked], ["a", "c"])
-        self.assertEqual(shortfall, 0)
-
-    def test_overflow_single_too_big(self):
-        # 一颗就超过档位：照样收下（只超不少）
-        picked, total, shortfall = SG_MOD.seed_group_plan(
-            [{"info_hash": "big", "size": 300 * SG_MOD.GIB}], 100)
-        self.assertEqual(len(picked), 1)
-        self.assertEqual(total, 300)
-        self.assertEqual(shortfall, 0)
-
-    def test_shortfall_reported_when_pool_too_small(self):
-        items = [{"info_hash": "a", "size": 40 * SG_MOD.GIB},
-                 {"info_hash": "b", "size": 60 * SG_MOD.GIB}]
-        picked, total, shortfall = SG_MOD.seed_group_plan(items, 1000)
-        self.assertEqual(len(picked), 2)
-        self.assertEqual(total, 100)
-        self.assertEqual(shortfall, 900)
-
-    def test_official_first(self):
-        items = [{"info_hash": "plain", "size": 60 * SG_MOD.GIB, "official": False},
-                 {"info_hash": "official", "size": 50 * SG_MOD.GIB, "official": True}]
-        picked, _, _ = SG_MOD.seed_group_plan(items, 50)
-        self.assertEqual(picked[0]["info_hash"], "official")
-
-    def test_empty_pool(self):
-        picked, total, shortfall = SG_MOD.seed_group_plan([], 2048)
-        self.assertEqual((picked, total, shortfall), ([], 0.0, 2048.0))
-
-
 class SeedGroupPluginTest(unittest.TestCase):
     def _plugin(self, **attrs):
         plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup", **attrs)
@@ -1249,11 +1314,11 @@ class SeedGroupPluginTest(unittest.TestCase):
             return SG_MOD._HttpResult(404, b"", "404")
         return call
 
-    def test_panel_says_site_decides_assessment(self):
+    def test_panel_says_site_is_the_only_judge(self):
         plugin = self._plugin()
         blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
         self.assertIn("可乐保种组", blob)
-        self.assertIn("站点按每次上报时的账号身份判定", blob)
+        self.assertIn("站点", blob)
         self.assertNotIn("解锁", blob)
 
     def test_no_identity_or_unlock_left(self):
@@ -1303,59 +1368,47 @@ class SeedGroupPluginTest(unittest.TestCase):
         plugin._enabled = False
         self.assertEqual(plugin.get_service(), [])
 
-    def test_sync_adds_without_identity_lookup(self):
-        """进种不看工作组头衔：只要 Key 能用就拉官种（考核由站点按上报判定）。"""
+    def test_cycle_adds_without_identity_lookup(self):
+        """进种不看工作组头衔：站点给什么就执行什么（考核由站点按账号身份判定）。"""
         plugin = self._plugin()
         client = support.FakeClient()
         plugin._sg_clients = lambda: [client]
-        plugin._maybe_report = lambda clients, state: None
+        plugin._sg_download = lambda item: support.make_torrent()
+        plugin._seed_group_tasks = lambda tier, custom=None: tasks_payload(add=[add_item(1)])
         paths = []
         fake = self._fake_cola()
         plugin._cola = lambda m, p, **k: (paths.append(p), fake(m, p, **k))[1]
-        plugin._sg_candidates = lambda: [{"torrent_id": 1, "info_hash": "a", "size": SG_MOD.GIB}]
-        plugin._sg_download = lambda item: support.make_torrent()
-        plugin._seed_group_sync()
+        plugin.seed_group_tasks_cycle()
         self.assertTrue(client.added)
         self.assertFalse([p for p in paths if p == "/api/v1/me" or "/profile" in p], paths)
 
-    def test_sync_fills_to_tier_and_reports_covered(self):
+    def test_cycle_reports_site_numbers_not_local_ones(self):
         plugin = self._plugin()
         client = support.FakeClient()
         plugin._sg_clients = lambda: [client]
-        plugin._cola = self._fake_cola(
-            me={"id": 7, "username": "yg", "roles": ["member"]},
-            profile={"groups": ["工作组-保种"]})
-        plugin._sg_candidates = lambda: [
-            {"torrent_id": 11, "info_hash": "a" * 40, "size": 1500 * SG_MOD.GIB},
-            {"torrent_id": 12, "info_hash": "b" * 40, "size": 600 * SG_MOD.GIB},
-            {"torrent_id": 13, "info_hash": "c" * 40, "size": 100 * SG_MOD.GIB},
-        ]
         plugin._sg_download = lambda item: support.make_torrent(name=f"t{item['torrent_id']}.mkv")
-        plugin._seed_group_sync()
-        self.assertEqual(len(client.added), 2)          # 1500 + 600 = 2100 ≥ 2048
-        self.assertTrue(all(SG_MOD.SEED_GROUP_TAG in a["label"] for a in client.added))
+        plugin._seed_group_tasks = lambda tier, custom=None: tasks_payload(
+            add=[add_item(11, size_gib=1500.0), add_item(12, size_gib=600.0)],
+            target_gib=2048.0, covered_gib=2100.0, shortfall_gib=0.0)
+        state = plugin.get_data("seedgroup_state") or plugin.seed_group_tasks_cycle()
         state = plugin.get_data("seedgroup_state")
+        self.assertEqual(len(client.added), 2)
+        self.assertTrue(all(SG_MOD.SEED_GROUP_TAG in a["label"] for a in client.added))
         self.assertEqual(state["added"], 2)
-        self.assertGreaterEqual(state["covered_gib"], 2048)
-        self.assertEqual(state["shortfall_gib"], 0)
+        self.assertEqual(state["target_gib"], 2048.0)
+        self.assertEqual(state["covered_gib"], 2100.0, "覆盖是站点给的数字")
+        self.assertEqual(state["shortfall_gib"], 0.0)
 
-    def test_sync_counts_existing_tagged_volume(self):
+    def test_cycle_respects_skip_table_from_previous_round(self):
         plugin = self._plugin()
         client = support.FakeClient()
-        client.list_completed = lambda: [
-            {"hash": "e" * 40, "name": "old", "size": 2048 * SG_MOD.GIB,
-             "tags": f"{SG_MOD.MANDATORY_TAG},{SG_MOD.SEED_GROUP_TAG}", "state": "uploading"},
-        ]
         plugin._sg_clients = lambda: [client]
-        plugin._cola = self._fake_cola(
-            me={"id": 7, "username": "yg", "roles": ["member"]},
-            profile={"groups": ["工作组-保种"]})
-        plugin._sg_candidates = lambda: [
-            {"torrent_id": 21, "info_hash": "f" * 40, "size": 300 * SG_MOD.GIB}]
         plugin._sg_download = lambda item: support.make_torrent()
-        plugin._seed_group_sync()
-        self.assertEqual(client.added, [])
-        self.assertGreaterEqual(plugin.get_data("seedgroup_state")["covered_gib"], 2048)
+        plugin.save_data("seedgroup_skip", {"21": {"at": 9_999_999_999, "reason": "fail", "ttl": 604800}})
+        plugin._seed_group_tasks = lambda tier, custom=None: tasks_payload(add=[add_item(21)])
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(client.added, [], "退避窗口里的条目不重试")
+        self.assertEqual(state["add_count"], 1)
 
     def test_browse_page_extracts_official_versions(self):
         plugin = self._plugin()
@@ -1402,8 +1455,8 @@ class OpenApiTest(unittest.TestCase):
         finally:
             SG_MOD._curl = original
 
-    def _plugin(self, key=KEY):
-        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+    def _plugin(self, key=KEY, live_report=False):
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup", _live_report=live_report)
         plugin._api_key = key
         plugin._key_alerted = False
         return plugin
@@ -1478,27 +1531,23 @@ class OpenApiTest(unittest.TestCase):
         self.assertFalse(got)
         self.assertEqual(calls, [])
 
-    def test_report_reenrolls_when_ticket_revoked(self):
+    def test_limits_report_reenrolls_when_ticket_revoked(self):
         """票据被撤销（换票也 401）：用 API Key 重领一把再报，不用人回来处理。"""
-        plugin = self._plugin()
+        plugin = self._plugin(live_report=True)
         plugin._seedgroup_enabled = True
-        plugin._seedgroup_report = True
-        plugin._seedgroup_report_url = SG_MOD.SEED_GROUP_REPORT_URL
         plugin._seedgroup_tier = "2T"
-        plugin._seedgroup_scope = "site"
-        plugin._seedgroup_custom_gib = 2048
         plugin._plugin_save_credentials("rcapi_old", "sk_old")
-        answers = [(401, {"error": {"code": "invalid_credentials"}}),      # 上报
+        answers = [(401, {"error": {"code": "invalid_credentials"}}),      # 限速上报
                    (401, {"error": {"code": "invalid_credentials"}}),      # 换票
                    (201, {"token": "rcapi_new", "signing_key": "sk_new"}),  # 重领
-                   (200, {"ok": True})]                                     # 重报
-        out, calls = self._run(answers, plugin._report_seedgroup, [support.FakeClient()], {"tier": "2T"})
+                   (200, {"ok": True, "throttled": False})]                 # 重报
+        out, calls = self._run(answers, plugin._seed_group_report_limits, [support.FakeClient()])
         self.assertTrue(out["ok"], out)
-        self.assertTrue(out.get("reenrolled"))
         self.assertTrue(calls[2]["url"].endswith("/api/v1/plugin/keys"))
         self.assertKeyOnly(calls[2])
         self.assertEqual(calls[3]["headers"]["X-API-Key"], "rcapi_new")
         self.assertNotIn("groups", calls[3]["json_body"])
+        self.assertIn("instance_id", calls[3]["json_body"])
 
     def test_missing_key_page_points_to_key_page(self):
         plugin = self._plugin(key="")
@@ -1511,6 +1560,44 @@ class OpenApiTest(unittest.TestCase):
                      "/authorizations", "reelcore_session", "X-CSRF-Token", "/api/v1/automation/",
                      "/profile\"", "\"/api/v1/me\""):
             self.assertNotIn(gone, source)
+
+
+class CurlHeaderCaptureTest(unittest.TestCase):
+    """真发一次 curl：`-D` 落头文件不能弄坏 body，响应头要能读回来。
+
+    插件端点靠响应头 `X-Plugin-Key-Expires-At` 记票据到期时间；这条链路在单测里
+    全被 `_curl` 替身挡掉了，所以这里起一个本地 HTTP 服务真跑一次系统 curl。
+    """
+
+    @unittest.skipUnless(shutil.which("curl"), "需要系统 curl")
+    def test_headers_are_captured_without_breaking_the_body(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        payload = {"ok": True, "throttled": False}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("X-Plugin-Key-Expires-At", "2026-11-23T20:00:00Z")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        headers = {}
+        rsp = SG_MOD._curl("GET", f"http://127.0.0.1:{port}/x", timeout=10, headers_out=headers)
+        self.assertEqual(rsp.status_code, 200)
+        self.assertEqual(rsp.json({}), payload, "-D 落头文件不能污染 body")
+        self.assertEqual(headers.get("x-plugin-key-expires-at"), "2026-11-23T20:00:00Z")
 
 
 class SeedGroupClientTest(unittest.TestCase):
@@ -1751,7 +1838,7 @@ class MhClientHasMustNotRaiseTest(unittest.TestCase):
     """_MPClient.has() 在加种循环里被调用，读失败必须咽下，不能让整轮崩。
 
     list_completed() 为了不让上层把「读不到」当成「空客户端」，已改成抛异常。
-    但 has() 没有这层保护时，异常会冒到 _seed_group_sync 外面，整轮中断。
+    但 has() 没有这层保护时，异常会冒到 seed_group_tasks_cycle 外面，整轮中断。
     """
 
     def test_has_returns_false_when_list_raises(self):
@@ -1764,36 +1851,3 @@ class MhClientHasMustNotRaiseTest(unittest.TestCase):
         c.list_completed = boom
         self.assertFalse(c.has("a" * 40), "读失败应答 False，而不是抛出去")
 
-class OldestSeededSecsTest(unittest.TestCase):
-    """seeded_secs 必须真的算出来（2026-11-21 查实一直是 0）。
-
-    站点按 covered>50 且 seeded_secs<300 判 zero_seeded（「声称保了很多，
-    但最老的才做了几分钟」）。而 list_completed() 以前不返回 added_on，
-    _sg_oldest_seeded_secs 拿不到时间就一直是 0 —— 覆盖正常也会被标可疑。
-    """
-
-    def test_added_on_flows_from_client_to_seeded_secs(self):
-        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
-        now = int(__import__("time").time())
-
-        class C:
-            name = "remote"
-
-            def list_completed(self):
-                return [{"hash": "a" * 40, "tags": "可乐保种组",
-                         "size": 1024 ** 3, "added_on": now - 7200}]
-
-        secs = p._sg_oldest_seeded_secs([C()])
-        self.assertGreaterEqual(secs, 7100, "两小时前加进来的种子，seeded_secs 应接近 7200")
-        self.assertLessEqual(secs, 7300)
-
-    def test_missing_added_on_yields_zero_not_crash(self):
-        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
-
-        class C:
-            name = "remote"
-
-            def list_completed(self):
-                return [{"hash": "a" * 40, "tags": "可乐保种组", "size": 1024 ** 3}]
-
-        self.assertEqual(p._sg_oldest_seeded_secs([C()]), 0)
