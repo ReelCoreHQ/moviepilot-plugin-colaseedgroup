@@ -44,3 +44,16 @@ class SplitPluginTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class MarketManifestTest(unittest.TestCase):
+    """两份清单必须一致：v1（package.json，绑定仓库用）与 v2（package.v2.json，官方市场用）。"""
+
+    def test_v1_manifest_mirrors_v2(self):
+        import json, pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        v2 = json.loads((root / "package.v2.json").read_text("utf-8"))
+        v1 = json.loads((root / "package.json").read_text("utf-8"))
+        self.assertEqual(sorted(v1), sorted(v2), "plugin id 必须一一对应")
+        for pid, entry in v2.items():
+            for key in ("name", "description", "labels", "version", "icon", "author", "level", "history"):
+                self.assertEqual(v1[pid].get(key), entry.get(key), f"{pid}.{key} 两份清单不一致")
