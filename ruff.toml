@@ -17,5 +17,9 @@ ignore = [
 ]
 
 [lint.per-file-ignores]
-# 测试里允许 assert 与直接引用被测模块的私有符号。
-"tests/**" = ["E741"]
+# 中文注释与 docstring 用全角标点（命令行 --select 会覆盖 lint.select，但 per-file-ignores 仍然生效，
+# 所以这条放在这里而不是 lint.ignore）。
+"**/*.py" = ["RUF001", "RUF002", "RUF003"]
+# 测试里允许 assert、允许用 lambda 造替身、允许忽略被测函数返回的一部分；
+# RUF059 是「解包后没用到的返回值」，在夹具里正是不关心的那些。
+"tests/**" = ["E741", "RUF059", "PIE807", "B009", "UP031", "B017", "UP012"]

@@ -1,3 +1,4 @@
+# ruff: noqa: E402  # 先注入 sys.path 再 import 同目录模块，顺序由运行方式决定
 """把拖管插件的核心逻辑包装成独立服务可用的同步器。
 
 复用而不是重写：档位规划、下载器客户端、种子解析、覆盖统计、掉线判定、加种重试
@@ -10,8 +11,8 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ mp_stub.install()
 # 独立版不打第二份副本 —— 修一次两边同时生效，这正是「一个仓库两种打包」的意义。
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugins.v2" / "colaseedgroup"))
 
-import __init__ as _plugin  # noqa: E402  （必须在打桩之后）
+import __init__ as _plugin
 
 #: 独立版支持的配置键。与插件 get_form 的 model 一一对应，
 #: 去掉辅种专用项（direction / sites_* / iyuu_* / max_per_hour …）。
@@ -132,7 +133,7 @@ class Syncer:
             res = RunResult(time.time(), True, str(state.get("reason") or "完成"), state)
             self._last = res
             return res
-        except Exception as err:  # noqa: BLE001 - 任何异常都不能让调度器停摆
+        except Exception as err:
             res = RunResult(time.time(), False, f"{type(err).__name__}: {err}")
             self._last = res
             return res
