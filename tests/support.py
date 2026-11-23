@@ -16,6 +16,8 @@ import types
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 # 拆出来的保种插件（2026-11-17）：它有自己的入口，测试用同一个装载器
 SEEDGROUP_PLUGIN_PATH = ROOT / "plugins.v2" / "colaseedgroup" / "__init__.py"
+#: 测试用的 MoviePilot 运行时版本（见 load_seedgroup_plugin 里的说明）
+TEST_MP_VERSION = "3.1.2"
 
 
 def _loadable(name: str) -> bool:
@@ -142,6 +144,10 @@ def load_seedgroup_plugin():
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
+    # 测试环境没有 MoviePilot 运行时，`_mp_version()` 只能探到空串；0.6.1 起「版本未知」
+    # 是 fail-closed（不注册任务、不执行任务单），所以装配时先把版本钉成 v3 基线。
+    # 版本闸门相关的用例自己用 `patch.object(module, "_mp_version", ...)` 覆盖成 v2 / 空串。
+    module._mp_version = lambda: TEST_MP_VERSION
     return module
 
 

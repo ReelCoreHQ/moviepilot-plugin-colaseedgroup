@@ -88,7 +88,7 @@ class RotateRunsWheneverTasksAreMissingTest(unittest.TestCase):
         return p
 
     def test_rotate_called_on_fallback(self):
-        p = self._plugin(None)
+        p = self._plugin("unsupported")     # 只有「站点没有 tasks 端点」才走本地轮换
         seen = {}
 
         def rotate(clients, state, pool):
