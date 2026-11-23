@@ -12,6 +12,7 @@ import re
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -485,6 +486,68 @@ class SeedGroupSyncRobustnessTest(unittest.TestCase):
         plugin._seed_group_sync()
         self.assertEqual(plugin.get_data("seedgroup_state")["failed"], 1)
         self.assertIn("5", plugin.get_data("seedgroup_skip"))
+
+    def test_transient_fetch_failure_retries_next_round(self):
+        """502 这种临时故障只退避几分钟，下一轮就重试，不能像坏种那样关 7 天。"""
+        plugin = self._plugin()
+        client = support.FakeClient()
+        client.list_completed = lambda: []
+        plugin._sg_clients = lambda: [client]
+        plugin._sg_candidates = lambda: [{"torrent_id": 71, "info_hash": "c" * 40, "size": 3000 * SG_MOD.GIB}]
+
+        def boom(item):
+            raise SG_MOD._SeedGroupFetchError("http_5xx", "申请下载链接 HTTP 502")
+
+        plugin._sg_download = boom
+        plugin._seed_group_sync()
+        state = plugin.get_data("seedgroup_state")
+        self.assertEqual(state["failed"], 1)
+        self.assertIn("站点 5xx", state["reason"])
+        entry = plugin.get_data("seedgroup_skip")["71"]
+        self.assertEqual(entry["reason"], "http_5xx")
+        self.assertEqual(entry["ttl"], plugin.SG_SKIP_TTL_NET)
+        self.assertIn("502", entry["detail"])
+        self.assertEqual(entry["fails"], 1)
+        # 到下一轮（5 分钟）这条跳过就过期，候选重新出现。
+        with patch.object(SG_MOD.time, "time", return_value=entry["at"] + plugin.SG_SKIP_TTL_NET + 1):
+            self.assertNotIn("71", plugin._sg_skips())
+
+    def test_permanent_fetch_failure_backs_off_longer(self):
+        """4xx 是站点明确拒绝，按坏种处理，别每轮白下载一遍。"""
+        plugin = self._plugin()
+        client = support.FakeClient()
+        client.list_completed = lambda: []
+        plugin._sg_clients = lambda: [client]
+        plugin._sg_candidates = lambda: [{"torrent_id": 72, "info_hash": "d" * 40, "size": 3000 * SG_MOD.GIB}]
+
+        def gone(item):
+            raise SG_MOD._SeedGroupFetchError("http_4xx", "直链 HTTP 404")
+
+        plugin._sg_download = gone
+        plugin._seed_group_sync()
+        entry = plugin.get_data("seedgroup_skip")["72"]
+        self.assertEqual(entry["reason"], "http_4xx")
+        self.assertEqual(entry["ttl"], plugin.SG_SKIP_TTL)
+
+    def test_download_link_failures_carry_reason_codes(self):
+        """_download_cola 把状态码翻译成原因码，而不是一律 b""。"""
+        plugin = self._plugin()
+        plugin._cola = lambda method, path, **kw: SG_MOD._HttpResult(502, b"", "")
+        with self.assertRaises(SG_MOD._SeedGroupFetchError) as caught:
+            plugin._download_cola(11)
+        self.assertEqual(caught.exception.reason, "http_5xx")
+        self.assertTrue(caught.exception.transient)
+
+        plugin._cola = lambda method, path, **kw: SG_MOD._HttpResult(404, b"", "")
+        with self.assertRaises(SG_MOD._SeedGroupFetchError) as caught:
+            plugin._download_cola(12)
+        self.assertEqual(caught.exception.reason, "http_4xx")
+        self.assertFalse(caught.exception.transient)
+
+        plugin._cola = lambda method, path, **kw: SG_MOD._HttpResult(200, b'{"no":"url"}', '{"no":"url"}')
+        with self.assertRaises(SG_MOD._SeedGroupFetchError) as caught:
+            plugin._download_cola(13)
+        self.assertEqual(caught.exception.reason, "no_url")
 
     def test_add_exception_does_not_kill_round(self):
         plugin = self._plugin()
