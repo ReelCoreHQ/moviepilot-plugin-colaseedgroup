@@ -19,7 +19,10 @@ class PanelAuthTest(unittest.TestCase):
             def verify(key):
                 if key == b'invalid':
                     raise HTTPException(401)
-            with patch.object(main, 'syncer', Syncer(config)), patch.object(main, 'SETUP_TOKEN_PATH', setup), patch.object(main, '_verify_site_key', side_effect=verify) as upstream, patch.object(main, 'SESSION_SECRET', main.SESSION_SECRET):
+            with patch.object(main, 'syncer', Syncer(config)), \
+                    patch.object(main, 'SETUP_TOKEN_PATH', setup), \
+                    patch.object(main, '_verify_site_key', side_effect=verify) as upstream, \
+                    patch.object(main, 'SESSION_SECRET', main.SESSION_SECRET):
                 browser = TestClient(main.app, base_url='https://box.example', follow_redirects=False)
                 other = TestClient(main.app, base_url='https://box.example', follow_redirects=False)
                 headers = {'x-colaseedbox-action': '1'}

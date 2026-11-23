@@ -32,12 +32,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin
 
 import requests
-from apscheduler.triggers.cron import CronTrigger
-from bencode import bdecode
-
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import NotificationType
+from apscheduler.triggers.cron import CronTrigger
+from bencode import bdecode
 
 # 段错误时把当时的线程栈打进日志（MoviePilot 直接被 SIGSEGV 杀掉时，只有内核那一行
 # "segfault at 1 ... libpython3.14.so" 是没法定位的）。enable() 只是注册信号处理器，
@@ -1267,7 +1266,8 @@ class _SeedGroupFetchError(RuntimeError):
 
 class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
-    plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
+    plugin_desc = ("可乐PT 保种组：把站点官方种按档位搬进下载器长期保种"
+                   "（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。")
     plugin_icon = "https://www.colapt.com/favicon.ico"
     plugin_version = "0.5.5"
     plugin_author = "ColaPT"
@@ -3639,7 +3639,6 @@ class ColaSeedGroup(_PluginBase):
             state["quota_trimmed"] = len(picked) - quota
             picked = picked[:quota]
             planned_gib = round(sum(_seed_group_size_gib(x.get("size")) for x in picked), 3)
-            shortfall = round(max(0.0, need - planned_gib), 3)
         client = clients[0]
         added = duplicate = failed = 0
         rate_limited = 0
@@ -3982,7 +3981,8 @@ class ColaSeedGroup(_PluginBase):
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12, "sm": 12, "md": 6}, "content": [
-                            {"component": "VSelect", "props": {"model": "seedgroup_prune_mode", "label": "下架清理", "persistent-hint": True,
+                            {"component": "VSelect", "props": {"model": "seedgroup_prune_mode",
+                                                              "label": "下架清理", "persistent-hint": True,
                              "hint": "每轮回站点核对 status/official", "items": [
                                 {"title": "只删种子，保留文件（默认）", "value": "seed"},
                                 {"title": "种子和文件一起删", "value": "files"},
@@ -4008,7 +4008,8 @@ class ColaSeedGroup(_PluginBase):
                             {"component": "VTextarea", "props": {"model": "limit_lines", "rows": 3,
                              "persistent-hint": True,
                              "label": "每客户端单独限速",
-                             "hint": "每行 客户端名或地址,下载KiB/s,上传KiB/s；包含匹配（写 10.0 或 MP-qb 都能命中）；没列出的用上面的全局值",
+                             "hint": "每行 客户端名或地址,下载KiB/s,上传KiB/s；"
+                                     "包含匹配（写 10.0 或 MP-qb 都能命中）；没列出的用上面的全局值",
                              "placeholder": "10.0.0.5:8081,1024,2048\nMP-qb,0,3000"}}]},
                     ]},
                     {"component": "VRow", "content": [
