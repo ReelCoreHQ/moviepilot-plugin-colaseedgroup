@@ -11,6 +11,7 @@ import shutil
 import sys
 import time
 import unittest
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -483,7 +484,10 @@ class SeedGroupTasksExecutionTest(CycleCase):
         plugin, _ = self._plugin_with(add=[add_item(5, info_hash="a" * 40)], clients=[client])
         plugin.seed_group_tasks_cycle()
         self.assertEqual(plugin.get_data("seedgroup_state")["failed"], 1)
-        self.assertIn("5", plugin.get_data("seedgroup_skip"))
+        # 任务单路径的失败记在自己的退避表里，不往 fallback 的跳过表里写
+        self.assertIn("5", plugin.get_data("seedgroup_task_backoff"))
+        self.assertNotIn("5", plugin.get_data("seedgroup_skip") or {},
+                         "任务单失败不能污染 fallback 的跳过表")
         # 第二轮：同一条任务在退避窗口里，不再白下第二次
         second = support.FakeClient()
         plugin._sg_clients = lambda: [second]
@@ -499,7 +503,7 @@ class SeedGroupTasksExecutionTest(CycleCase):
         state = plugin.seed_group_tasks_cycle()
         self.assertEqual(state["failed"], 1)
         self.assertEqual(state.get("fail_reasons"), {"站点 5xx": 1})
-        entry = plugin.get_data("seedgroup_skip")["71"]
+        entry = plugin.get_data("seedgroup_task_backoff")["71"]
         self.assertEqual(entry["reason"], "http_5xx")
         self.assertEqual(entry["ttl"], plugin.SG_SKIP_TTL_NET)
         self.assertIn("502", entry["detail"])
@@ -512,7 +516,7 @@ class SeedGroupTasksExecutionTest(CycleCase):
 
         plugin, _ = self._plugin_with(add=[add_item(72, info_hash="d" * 40)], _sg_download=gone)
         plugin.seed_group_tasks_cycle()
-        entry = plugin.get_data("seedgroup_skip")["72"]
+        entry = plugin.get_data("seedgroup_task_backoff")["72"]
         self.assertEqual(entry["reason"], "http_4xx")
         self.assertEqual(entry["ttl"], plugin.SG_SKIP_TTL)
 
@@ -601,15 +605,22 @@ class SeedGroupTasksEndpointTest(CycleCase):
         self.assertEqual(tasks["add"], [])
         self.assertEqual(tasks["remove"], [])
 
-    def test_old_site_and_errors_return_none(self):
-        for status in (404, 405, 500, 0, 403):
+    def test_old_site_is_unsupported_and_other_errors_are_none(self):
+        """三态：只有 404/405/501 算「老站点」；其它失败一律 None（本轮不动，不退回本地轮换）。"""
+        for status in (404, 405, 501):
             with self.subTest(status=status):
                 _, tasks, _ = self._call([(status, {})])
-                self.assertIsNone(tasks, f"HTTP {status} 应退回本地轮换")
+                self.assertEqual(tasks, "unsupported", f"HTTP {status} 应退回本地轮换")
+        for status, code in ((500, "http_500"), (0, "timeout"), (403, "auth_failed")):
+            with self.subTest(status=status):
+                plugin, tasks, _ = self._call([(status, {})])
+                self.assertIsNone(tasks, f"HTTP {status} 不该退回本地轮换")
+                self.assertEqual(plugin._sg_tasks_error, code)
 
     def test_non_json_body_returns_none(self):
-        _, tasks, _ = self._call([(200, "<html>gateway</html>")])
+        plugin, tasks, _ = self._call([(200, "<html>gateway</html>")])
         self.assertIsNone(tasks)
+        self.assertEqual(plugin._sg_tasks_error, "bad_json")
 
     def test_ticket_renewal_header_is_recorded(self):
         plugin, _, _ = self._call(
@@ -788,14 +799,18 @@ class SeedGroupPruneTest(unittest.TestCase):
         self.assertEqual(out["removed"], 0)
         self.assertEqual(client.deleted, [])
 
-    def test_delete_files_flag_is_honoured(self):
+    def test_delete_files_only_follows_delete_mode(self):
+        """0.6.1：文件删不删只由删种三档决定 —— 单独的 prune_files 开关绕不过 torrent_only。"""
         plugin, client = self._plugin(status="withdrawn")
-        plugin._seedgroup_prune_files = True
-        seen = {}
-        client.delete = lambda hashes, delete_files=False: seen.update(
-            {"hashes": hashes, "files": delete_files}) or True
+        plugin._seedgroup_prune_files = True          # 旧开关，已不参与判断
         plugin._sg_prune()
-        self.assertTrue(seen["files"])
+        self.assertEqual(client.delete_calls, [([self.HASH], False)],
+                         "torrent_only 下 prune 只能删种、留文件")
+
+        plugin, client = self._plugin(status="withdrawn")
+        plugin._seedgroup_delete_mode = "torrent_and_files"
+        plugin._sg_prune()
+        self.assertEqual(client.delete_calls, [([self.HASH], True)])
 
 
 class PruneSafetyTest(unittest.TestCase):
@@ -1038,13 +1053,63 @@ class RuntimeVersionGateTest(unittest.TestCase):
             page = json.dumps(plugin.get_page(), ensure_ascii=False)
         self.assertNotIn("只支持 v3", page)
 
-    def test_unknown_version_is_treated_as_supported(self):
-        """独立版（没有 MP 运行时）取不到版本 → 照常跑。"""
-        self.assertTrue(SG_MOD.mp_version_supported(""))
-        self.assertTrue(SG_MOD.mp_version_supported(None))
+    def test_unknown_version_is_not_supported(self):
+        """0.6.1 fail-closed：版本未知 = 不支持（0.6.0 当成支持放行，MP v2 会真执行）。"""
+        self.assertFalse(SG_MOD.mp_version_supported(""))
+        self.assertFalse(SG_MOD.mp_version_supported(None))
+        self.assertFalse(SG_MOD.mp_version_supported("unknown"))
         self.assertFalse(SG_MOD.mp_version_supported("2.9.4"))
         self.assertTrue(SG_MOD.mp_version_supported("3.0.0-beta2"))
         self.assertFalse(SG_MOD.mp_version_supported("1.9.16"))
+
+    def test_unknown_version_pauses_with_warning(self):
+        plugin = self._plugin()
+        with patch.object(SG_MOD, "_mp_version", return_value=""):
+            self.assertEqual(plugin.get_service(), [], "版本未知不注册定时任务")
+            page = json.dumps(plugin.get_page(), ensure_ascii=False)
+        self.assertIn("无法判定 MoviePilot 版本", page)
+        self.assertIn("已暂停自动任务", page)
+
+    def test_unknown_version_cycle_does_not_touch_the_site(self):
+        plugin = self._plugin()
+        plugin._seed_group_tasks = Mock(side_effect=AssertionError("版本未知不该拉任务单"))
+        with patch.object(SG_MOD, "_mp_version", return_value=""):
+            state = plugin.seed_group_tasks_cycle()
+        self.assertIn("无法判定 MoviePilot 版本", state["reason"])
+        plugin._seed_group_tasks.assert_not_called()
+
+    def test_standalone_runtime_needs_both_flag_and_stub_marker(self):
+        """独立版豁免必须两道同时成立：MP_RUNTIME=standalone **+** app 桩标记。"""
+        plugin = self._plugin()
+        fresh = ModuleType("app")
+        with patch.object(SG_MOD, "_mp_version", return_value=""), \
+                patch.object(SG_MOD, "MP_RUNTIME", "standalone"), \
+                patch.dict(sys.modules, {"app": fresh}):
+            # 只有常量、没有桩标记：这就是「MP 路径残留了该常量」的场景 → 照常 fail-closed
+            self.assertEqual(plugin.get_service(), [],
+                             "仅凭 MP_RUNTIME 不能放行 MoviePilot 路径")
+            self.assertIn("无法判定 MoviePilot 版本",
+                          json.dumps(plugin.get_page(), ensure_ascii=False))
+            state = plugin.seed_group_tasks_cycle()
+            self.assertIn("无法判定 MoviePilot 版本", state["reason"])
+            # 桩标记到位（独立版入口注入）才放行
+            setattr(fresh, SG_MOD.STANDALONE_MARKER, True)
+            self.assertEqual([s["id"] for s in plugin.get_service()], ["ColaSeedGroup"])
+
+    def test_unknown_version_always_pauses_without_standalone_entry(self):
+        """MP 路径（无标记）：版本未知时注册与执行都停，不受 MP_RUNTIME 残留影响。"""
+        plugin = self._plugin()
+        tasks = Mock(side_effect=AssertionError("版本未知不该拉任务单"))
+        plugin._seed_group_tasks = tasks
+        fresh = ModuleType("app")
+        with patch.object(SG_MOD, "_mp_version", return_value=""), \
+                patch.object(SG_MOD, "MP_RUNTIME", "standalone"), \
+                patch.dict(sys.modules, {"app": fresh}):
+            self.assertFalse(SG_MOD._standalone_runtime())
+            self.assertEqual(plugin.get_service(), [])
+            state = plugin.seed_group_tasks_cycle()
+        self.assertIn("无法判定 MoviePilot 版本", state["reason"])
+        tasks.assert_not_called()
 
     def test_v2_runtime_cycle_does_not_touch_the_site(self):
         plugin = self._plugin()
@@ -1074,7 +1139,7 @@ class SiteNumbersPanelTest(CycleCase):
         self.assertNotIn("实际覆盖", blob, "插件自算的覆盖不再出现在面板")
 
     def test_panel_marks_fallback_mode(self):
-        plugin, _ = self.make_cycle_plugin(tasks=None)
+        plugin, _ = self.make_cycle_plugin(tasks="unsupported")
         plugin._sg_rotate = lambda clients, state, pool: {"dropped": 0, "added": 0,
                                                           "failed": 0, "reason": "未达标"}
         plugin.seed_group_tasks_cycle()
@@ -1399,16 +1464,30 @@ class SeedGroupPluginTest(unittest.TestCase):
         self.assertEqual(state["covered_gib"], 2100.0, "覆盖是站点给的数字")
         self.assertEqual(state["shortfall_gib"], 0.0)
 
-    def test_cycle_respects_skip_table_from_previous_round(self):
+    def test_cycle_respects_task_backoff_from_previous_round(self):
         plugin = self._plugin()
         client = support.FakeClient()
         plugin._sg_clients = lambda: [client]
         plugin._sg_download = lambda item: support.make_torrent()
-        plugin.save_data("seedgroup_skip", {"21": {"at": 9_999_999_999, "reason": "fail", "ttl": 604800}})
+        plugin.save_data("seedgroup_task_backoff",
+                         {"21": {"at": 9_999_999_999, "reason": "fail", "ttl": 604800}})
         plugin._seed_group_tasks = lambda tier, custom=None: tasks_payload(add=[add_item(21)])
         state = plugin.seed_group_tasks_cycle()
-        self.assertEqual(client.added, [], "退避窗口里的条目不重试")
+        self.assertEqual(client.added, [], "任务单自己的退避窗口里不重试")
         self.assertEqual(state["add_count"], 1)
+
+    def test_cycle_ignores_fallback_skip_table(self):
+        """fallback 的跳过表（任何原因）都不参与任务单路径：站点点名就要加。"""
+        plugin = self._plugin()
+        client = support.FakeClient()
+        plugin._sg_clients = lambda: [client]
+        plugin._sg_download = lambda item: support.make_torrent()
+        plugin.save_data("seedgroup_skip",
+                         {"21": {"at": 9_999_999_999, "reason": "fail", "ttl": 604800}})
+        plugin._seed_group_tasks = lambda tier, custom=None: tasks_payload(add=[add_item(21)])
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(len(client.added), 1, "本地轮换的跳过记录不能挡站点任务")
+        self.assertEqual(state["added"], 1)
 
     def test_browse_page_extracts_official_versions(self):
         plugin = self._plugin()
@@ -1541,7 +1620,10 @@ class OpenApiTest(unittest.TestCase):
                    (401, {"error": {"code": "invalid_credentials"}}),      # 换票
                    (201, {"token": "rcapi_new", "signing_key": "sk_new"}),  # 重领
                    (200, {"ok": True, "throttled": False})]                 # 重报
-        out, calls = self._run(answers, plugin._seed_group_report_limits, [support.FakeClient()])
+        client = support.FakeClient()
+        client.get_speed_limits = lambda: {"dl_kib": 0, "up_kib": 0,
+                                           "dl_enabled": False, "up_enabled": False}
+        out, calls = self._run(answers, plugin._seed_group_report_limits, [client])
         self.assertTrue(out["ok"], out)
         self.assertTrue(calls[2]["url"].endswith("/api/v1/plugin/keys"))
         self.assertKeyOnly(calls[2])
@@ -1851,3 +1933,434 @@ class MhClientHasMustNotRaiseTest(unittest.TestCase):
         c.list_completed = boom
         self.assertFalse(c.has("a" * 40), "读失败应答 False，而不是抛出去")
 
+
+
+class SeedGroupTasksFailureTest(CycleCase):
+    """阻塞 1：任务单失败（401 / 500 / 超时 / 坏 JSON）→ 本轮不动，绝不退回本地轮换删种。
+
+    0.6.0 把 401/500/超时/JSON 漂移全 `return None`，调用方一见 None 就 `_sg_local_fallback`
+    → `_sg_rotate`，而 rotate 按 `seedgroup_rotate_files`（默认 True）**连文件一起删**。
+    实测 `delete_mode=keep` + 站点 404 就删掉了种子；站点 500 同理。
+    三态之后：只有 404/405/501 才 fallback，其它失败 `mode=skip`。
+    """
+
+    HASH = "a" * 40
+
+    def _rotatable(self):
+        """装一套「立刻就能轮换删掉」的局面：老代码在 500 下会真的删掉它。"""
+        client = support.FakeClient(has_hash=[self.HASH])
+        live = [{"hash": self.HASH, "tags": SG_MOD.SEED_GROUP_TAG,
+                 "size": SG_MOD.GIB * 100, "added_on": int(time.time()) - 4 * 86400,
+                 "progress": 0.4}]
+
+        def _delete(hashes, delete_files=False):
+            live[:] = [row for row in live if row["hash"] not in hashes]
+            client.deleted.extend(hashes)
+            client.delete_calls.append((list(hashes), bool(delete_files)))
+            return True
+
+        client.delete = _delete
+        client.list_completed = lambda: list(live)
+        client.list_all = lambda: list(live)
+        plugin, _ = self.make_cycle_plugin(
+            clients=[client], _seedgroup_tier="custom", _seedgroup_custom_gib=100,
+            _seedgroup_delete_mode="torrent_and_files", _seedgroup_rotate_files=True)
+        plugin.save_data("seedgroup_items", {self.HASH: {"torrent_id": 1, "name": "A"}})
+        plugin._sg_candidates = lambda: [
+            {"torrent_id": 1, "info_hash": self.HASH, "name": "A", "seeders": 900,
+             "size": SG_MOD.GIB * 100},
+            {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 1,
+             "size": SG_MOD.GIB * 100},
+        ]
+        return plugin, client
+
+    def _cycle(self, answers, mock_local=True):
+        plugin, client = self._rotatable()
+        queue = list(answers)
+        calls = []
+
+        def fake_curl(method, url, **kwargs):
+            calls.append({"method": method, "url": url})
+            if not queue:
+                return SG_MOD._HttpResult(0, b"", "")
+            status, body = queue.pop(0)
+            if isinstance(body, BaseException):
+                raise body
+            text = body if isinstance(body, str) else json.dumps(body)
+            return SG_MOD._HttpResult(status, text.encode(), text)
+
+        local = Mock(return_value=None) if mock_local else plugin._sg_local_fallback
+        if mock_local:
+            plugin._sg_local_fallback = local
+        plugin._cola = lambda *a, **k: SG_MOD._HttpResult(500, b"", "")
+        with patch.object(SG_MOD, "_curl", fake_curl):
+            state = plugin.seed_group_tasks_cycle()
+        return plugin, client, state, calls, local
+
+    def _assert_untouched(self, client, state):
+        self.assertEqual(client.delete_calls, [], "本轮一个 delete 都不该发")
+        self.assertEqual(client.deleted, [])
+        self.assertEqual(client.added, [], "本轮也不该加种")
+        self.assertEqual(state["mode"], "skip", "失败不是 fallback")
+        self.assertEqual(state["added"], 0)
+        self.assertEqual(state["removed"], 0)
+
+    def test_500_skips_without_touching_seeds(self):
+        plugin, client, state, _, local = self._cycle([(500, {})])
+        self._assert_untouched(client, state)
+        self.assertEqual(state["tasks_error"], "http_500")
+        self.assertIn("http_500", str(state["reason"]))
+        local.assert_not_called()
+        self.assertEqual(plugin.get_data("seedgroup_state")["tasks_error"], "http_500")
+
+    def test_timeout_status_zero_skips(self):
+        plugin, client, state, _, local = self._cycle([(0, "")])
+        self._assert_untouched(client, state)
+        self.assertEqual(state["tasks_error"], "timeout")
+        local.assert_not_called()
+
+    def test_timeout_exception_skips(self):
+        plugin, client, state, _, local = self._cycle([TimeoutError("fixture timeout")])
+        self._assert_untouched(client, state)
+        self.assertEqual(state["tasks_error"], "timeout")
+        local.assert_not_called()
+
+    def test_bad_json_skips(self):
+        plugin, client, state, _, local = self._cycle([(200, "<html>gateway</html>")])
+        self._assert_untouched(client, state)
+        self.assertEqual(state["tasks_error"], "bad_json")
+        local.assert_not_called()
+
+    def test_401_after_renew_and_enroll_fail_skips(self):
+        """票据被撤销：renew 401、enroll 也失败 → auth_failed，并把 fields.plugin 记下来。"""
+        denied = {"error": {"code": "invalid_credentials",
+                            "fields": {"plugin": ["票据已过期或被撤销"]}}}
+        plugin, client, state, calls, local = self._cycle([(401, denied), (401, denied)])
+        self._assert_untouched(client, state)
+        self.assertEqual(state["tasks_error"], "auth_failed")
+        self.assertIn("票据已过期或被撤销", str(state.get("tasks_error_detail") or ""))
+        self.assertTrue(any("/keys/renew" in item["url"] for item in calls),
+                        "401 仍然要先试换票")
+        local.assert_not_called()
+
+    def test_404_falls_back_and_really_rotates(self):
+        """对照组：只有 404/405（老站点）才 fallback —— 这套夹具确实能删出东西。"""
+        plugin, client, state, _, local = self._cycle([(404, {})], mock_local=False)
+        self.assertEqual(state["mode"], "fallback")
+        self.assertEqual(state["tasks_error"], "", "老站点不是错误")
+        self.assertEqual(client.delete_calls, [([self.HASH], True)],
+                         "fallback 的本地轮换确实会动手（所以其它失败绝不能走这里）")
+
+    def test_405_and_501_are_unsupported(self):
+        for status in (405, 501):
+            with self.subTest(status=status):
+                plugin, client, state, _, local = self._cycle([(status, {})], mock_local=False)
+                self.assertEqual(state["mode"], "fallback")
+
+
+class SeedGroupDeleteMatrixTest(unittest.TestCase):
+    """阻塞 2：删种三档 × 三条删除路径（任务单 remove / 本地轮换 / 下架清理）。
+
+    keep → 三条路径都不发 delete；torrent_only → 一律 `delete_files=False`；
+    只有 torrent_and_files 才出现 `delete_files=True`。
+    两个「旧开关」故意设成会误导的值（rotate_files=False、prune_files=True），
+    新闸门 `_sg_delete_allowed()` 必须无视它们。
+    """
+
+    HASH = "a" * 40
+
+    def _client(self):
+        client = support.FakeClient(has_hash=[self.HASH])
+        rows = [{"hash": self.HASH, "tags": SG_MOD.SEED_GROUP_TAG,
+                 "size": SG_MOD.GIB * 100, "added_on": int(time.time()) - 4 * 86400,
+                 "progress": 0.4}]
+        client.list_completed = lambda: list(rows)
+        client.list_all = lambda: list(rows)
+        return client
+
+    def _plugin(self, mode):
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        plugin._seedgroup_enabled = True
+        plugin._seedgroup_tier = "custom"
+        plugin._seedgroup_custom_gib = 100
+        plugin._seedgroup_rotate = True
+        plugin._seedgroup_prune = True
+        plugin._seedgroup_prune_mode = "seed"
+        plugin._seedgroup_delete_mode = mode
+        plugin._seedgroup_rotate_files = False     # 旧开关：谎称「不删文件」
+        plugin._seedgroup_prune_files = True       # 旧开关：谎称「删文件」
+        plugin.SG_DOWNLOAD_GAP = 0
+        plugin.update_config = lambda cfg: None
+        plugin.post_message = lambda **k: None
+        plugin._sg_download = lambda item: support.make_torrent(name=str(item.get("name") or "x"))
+        return plugin
+
+    def _pool(self):
+        return [
+            {"torrent_id": 1, "info_hash": self.HASH, "name": "A", "seeders": 900,
+             "size": SG_MOD.GIB * 100},
+            {"torrent_id": 2, "info_hash": "b" * 40, "name": "B", "seeders": 1,
+             "size": SG_MOD.GIB * 100},
+        ]
+
+    def _run_remove(self, mode):
+        client = self._client()
+        plugin = self._plugin(mode)
+        removed = plugin._sg_remove_tasks([client], [remove_item(7, self.HASH)])
+        return client, {"removed": removed}
+
+    def _run_rotate(self, mode):
+        client = self._client()
+        plugin = self._plugin(mode)
+        plugin.save_data("seedgroup_items", {self.HASH: {"torrent_id": 1, "name": "A"}})
+        out = plugin._sg_rotate([client], {"target_gib": 100.0}, self._pool())
+        return client, out
+
+    def _run_prune(self, mode):
+        client = self._client()
+        plugin = self._plugin(mode)
+        plugin._sg_clients = lambda: [client]
+        plugin.save_data("seedgroup_items", {self.HASH: {"torrent_id": 1}})
+        body = json.dumps({"id": 1, "status": "withdrawn", "official": False}).encode()
+        plugin._cola = lambda m, p, **k: SG_MOD._HttpResult(200, body, body.decode())
+        return client, plugin._sg_prune()
+
+    def test_nine_groups(self):
+        expected = {
+            "keep": [],
+            "torrent_only": [([self.HASH], False)],
+            "torrent_and_files": [([self.HASH], True)],
+        }
+        for path, runner in (("remove", self._run_remove),
+                             ("rotate", self._run_rotate),
+                             ("prune", self._run_prune)):
+            for mode, calls in expected.items():
+                with self.subTest(path=path, mode=mode):
+                    client, _out = runner(mode)
+                    self.assertEqual(client.delete_calls, calls,
+                                     f"{path} / {mode}：删除动作不符合三档")
+
+    def test_keep_suppresses_but_still_counts(self):
+        """keep 不是「看不见」：候选照算、日志照记，只是不调 delete。"""
+        _, rotate = self._run_rotate("keep")
+        self.assertEqual(rotate["dropped"], 0)
+        self.assertEqual(rotate["skipped_delete"], 1)
+        self.assertIn("keep", rotate["reason"])
+
+        _, prune = self._run_prune("keep")
+        self.assertEqual(prune["removed"], 0)
+        self.assertEqual(prune["suppressed"], 1)
+
+
+class SeedGroupLimitReadingTest(CycleCase):
+    """阻塞 3：Transmission 的「未启用」不能当成「限速值」；全读不到就不上报。"""
+
+    def test_tr_disabled_limit_reads_zero(self):
+        limits = SG_MOD._tr_speed_limits({
+            "speed_limit_up": 100, "speed_limit_up_enabled": False,
+            "speed_limit_down": 50, "speed_limit_down_enabled": True})
+        self.assertEqual(limits["up_kib"], 0, "未启用的上传限速 = 不限速 = 0")
+        self.assertEqual(limits["dl_kib"], 50)
+        self.assertFalse(limits["up_enabled"])
+        self.assertEqual(limits["up_kib_raw"], 100, "原始值留着排查，但不进上报")
+
+    def test_tr_both_disabled_reads_zero(self):
+        limits = SG_MOD._tr_speed_limits({
+            "speed_limit_up": 100, "speed_limit_up_enabled": False,
+            "speed_limit_down": 200, "speed_limit_down_enabled": False})
+        self.assertEqual((limits["dl_kib"], limits["up_kib"]), (0, 0))
+
+    def _tr_client(self, session):
+        class TR:
+            name = "tr-default"
+            kind = "tr"
+
+            def get_speed_limits(self):
+                return SG_MOD._tr_speed_limits(session)
+
+            def set_speed_limits(self, dl_kib, up_kib):
+                raise AssertionError("保种组链路绝不写回限速")
+
+        return TR()
+
+    def _report(self, clients):
+        plugin, _ = self.make_cycle_plugin(clients=clients, live_report=True)
+        calls = []
+
+        def fake_curl(method, url, **kwargs):
+            calls.append({"method": method, "url": url, "body": kwargs.get("json_body")})
+            return SG_MOD._HttpResult(200, b'{"ok": true, "throttled": false}', '{"ok": true, "throttled": false}')
+
+        with patch.object(SG_MOD, "_curl", fake_curl):
+            out = plugin._seed_group_report_limits(clients)
+        return plugin, out, calls
+
+    def test_tr_default_session_is_not_reported_as_throttled(self):
+        """默认 TR（speed-limit-up=100, up-enabled=false）→ 上传 0，站点不会判「被限速」。"""
+        client = self._tr_client({"speed_limit_up": 100, "speed_limit_up_enabled": False,
+                                  "speed_limit_down": 0, "speed_limit_down_enabled": False})
+        plugin, out, calls = self._report([client])
+        body = calls[0]["body"]
+        self.assertEqual(body["upload_limit_kib"], 0)
+        self.assertEqual(body["download_limit_kib"], 0)
+        self.assertEqual(body["clients"][0]["up_kib"], 0)
+        self.assertTrue(body["clients"][0]["readable"])
+        self.assertFalse(out["throttled"])
+
+    def test_all_unreadable_skips_the_post(self):
+        """全部读不到：不发 POST（顶层 0 是「不限速」的意思，发了就是假读数）。"""
+        clients = [support.FakeClient(), support.FakeClient()]
+        plugin, _ = self.make_cycle_plugin(clients=clients, live_report=True)
+        with patch.object(SG_MOD, "_curl") as send:
+            out = plugin._seed_group_report_limits(clients)
+        send.assert_not_called()
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["skipped"], "no_readings")
+        self.assertEqual(out["limits_readable"], "0/2")
+        self.assertIn("没有可读的限速读数", out["reason"])
+        snapshot = plugin.get_data("seedgroup_limits_last")
+        self.assertEqual(snapshot["limits_readable"], "0/2")
+        self.assertEqual(snapshot["skipped"], "no_readings")
+        self.assertIsNone(snapshot["upload_limit_kib"], "不要落一个假的 0")
+
+    def test_panel_says_no_readings(self):
+        clients = [support.FakeClient(), support.FakeClient()]
+        plugin, _ = self.make_cycle_plugin(clients=clients, live_report=True)
+        with patch.object(SG_MOD, "_curl"):
+            plugin._seed_group_report_limits(clients)
+        blob = json.dumps(plugin._seedgroup_panel(), ensure_ascii=False)
+        self.assertIn("本轮无读数", blob)
+        self.assertIn("0/2", blob)
+
+    def test_conflict_reads_error_fields_revision(self):
+        """次重要 8：站点把最新 revision 放在 error.fields.revision[0]。"""
+        client = self._tr_client({"speed_limit_up": 0, "speed_limit_up_enabled": False,
+                                  "speed_limit_down": 0, "speed_limit_down_enabled": False})
+        plugin, _ = self.make_cycle_plugin(clients=[client], live_report=True)
+
+        def fake_curl(method, url, **kwargs):
+            body = {"error": {"code": "state_conflict",
+                              "fields": {"revision": ["abcdef0123456789"]}}}
+            text = json.dumps(body)
+            return SG_MOD._HttpResult(409, text.encode(), text)
+
+        with patch.object(SG_MOD, "_curl", fake_curl):
+            out = plugin._seed_group_report_limits([client])
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["conflict"], "abcdef0123456789")
+        self.assertIn("abcdef0123456789", out["reason"])
+        self.assertEqual(plugin.get_data("seedgroup_limits_last")["conflict"], "abcdef0123456789")
+
+
+class TasksSkipTableScopeTest(CycleCase):
+    """次重要 4：任务单路径与 fallback 跳过表**物理隔离**。
+
+    站点任务只查自己的 `seedgroup_task_backoff`；`seedgroup_skip`（fallback 的记账，
+    不管什么原因）一律不参与。规格 §5.2 的加种退避由任务单自己的表保留，两条路径互不影响。
+    """
+
+    FALLBACK_REASONS = ("rotated", "rotate-fail", "dup", "fail", "net", "download",
+                        "http_5xx", "http_4xx", "error")
+
+    def _plugin(self, store_key="seedgroup_skip", reason="rotated", ttl=7 * 86400):
+        plugin, grown = self.make_cycle_plugin(tasks=tasks_payload(add=[add_item(5)]))
+        plugin.save_data(store_key, {
+            "5": {"at": int(time.time()), "reason": reason, "ttl": ttl, "fails": 1}})
+        return plugin, grown[0]
+
+    def test_fallback_skip_table_never_blocks_a_site_task(self):
+        for reason in self.FALLBACK_REASONS:
+            with self.subTest(reason=reason):
+                plugin, client = self._plugin(reason=reason)
+                state = plugin.seed_group_tasks_cycle()
+                self.assertEqual(len(client.added), 1,
+                                 f"fallback 的 {reason} 记录不该挡站点任务")
+                self.assertEqual(state["added"], 1)
+
+    def test_task_path_never_reads_the_fallback_table(self):
+        """代码级隔离：_sg_add_tasks 里不出现 _sg_skips()，只问 _sg_task_backoff。"""
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_add_tasks)
+        self.assertNotIn("_sg_skips", src)
+        self.assertNotIn("seedgroup_skip", src)
+        self.assertIn("_sg_task_backoff", src)
+
+    def test_failure_backoff_still_applies_on_the_task_path(self):
+        """规格 §5.2：任务单自己的退避仍然生效（独立表，不靠 fallback 记账）。"""
+        plugin, client = self._plugin(store_key="seedgroup_task_backoff",
+                                      reason="http_5xx", ttl=300)
+        state = plugin.seed_group_tasks_cycle()
+        self.assertEqual(client.added, [])
+        self.assertEqual(state["added"], 0)
+
+    def test_task_failure_writes_only_its_own_table(self):
+        client = support.FakeClient(add_result="fail")
+        plugin, _ = self.make_cycle_plugin(tasks=tasks_payload(add=[add_item(9)]),
+                                           clients=[client])
+        plugin.seed_group_tasks_cycle()
+        self.assertIn("9", plugin.get_data("seedgroup_task_backoff"))
+        self.assertEqual(plugin.get_data("seedgroup_skip") or {}, {},
+                         "任务单失败不能写进 fallback 的跳过表")
+
+
+class RotateEndpointLockTest(unittest.TestCase):
+    """次重要 5：手动轮换与 cron 抢同一把运行锁。"""
+
+    def _plugin(self):
+        plugin = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        plugin._sg_clients = lambda: []
+        plugin._sg_candidates = lambda: []
+        plugin._sg_rotate = lambda clients, state, pool: {"dropped": 0, "added": 0,
+                                                          "failed": 0, "reason": "fixture"}
+        return plugin
+
+    def test_rotate_endpoint_takes_and_releases_the_run_lock(self):
+        plugin = self._plugin()
+        self.assertTrue(plugin._seedgroup_run_lock.acquire(blocking=False))
+        try:
+            busy = plugin.seed_group_rotate()
+        finally:
+            plugin._seedgroup_run_lock.release()
+        self.assertTrue(busy["busy"], "锁被 cron 占着时手动轮换必须立刻返回忙")
+        self.assertFalse(busy["ok"])
+        self.assertFalse(plugin._seedgroup_run_lock.locked())
+        out = plugin.seed_group_rotate()
+        self.assertEqual(out["reason"], "fixture")
+        self.assertFalse(plugin._seedgroup_run_lock.locked(), "正常结束后必须把锁放回去")
+
+
+class TransmissionDeleteTest(unittest.TestCase):
+    """次重要 6：原生 TR 客户端补上 delete()（torrent-remove + delete-local-data）。"""
+
+    def _client(self, result="success"):
+        client = SG_MOD.TransmissionClient("tr-1", "http://127.0.0.1:9091")
+        calls = []
+
+        def fake_rpc(payload):
+            calls.append(payload)
+            return None if result == "none" else {"result": result}
+
+        client._rpc = fake_rpc
+        return client, calls
+
+    def test_delete_sends_torrent_remove(self):
+        client, calls = self._client()
+        self.assertTrue(client.delete(["A" * 40], delete_files=True))
+        self.assertEqual(calls, [{"method": "torrent-remove",
+                                  "arguments": {"ids": ["a" * 40], "delete-local-data": True}}])
+
+    def test_delete_without_files_keeps_local_data_false(self):
+        client, calls = self._client()
+        self.assertTrue(client.delete(["b" * 40]))
+        self.assertIs(calls[0]["arguments"]["delete-local-data"], False)
+
+    def test_delete_reports_failure(self):
+        client, _ = self._client(result="invalid")
+        self.assertFalse(client.delete(["c" * 40]))
+        client, _ = self._client(result="none")
+        self.assertFalse(client.delete(["c" * 40]))
+
+    def test_delete_with_no_hashes_is_a_noop(self):
+        client, calls = self._client()
+        self.assertFalse(client.delete([]))
+        self.assertEqual(calls, [])

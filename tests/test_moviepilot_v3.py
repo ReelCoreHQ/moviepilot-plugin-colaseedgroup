@@ -256,7 +256,8 @@ class MoviePilotV3Test(unittest.TestCase):
         out = self.plugin.seed_group_prune()
 
         self.assertEqual((out["checked"], out["removed"], out["failed"]), (2, 2, 0))
-        self.assertEqual(chosen.deleted, [(["a" * 40], False), (["b" * 40], True)])
+        # 默认 torrent_only：连「未下完」的那颗也只删种、留文件
+        self.assertEqual(chosen.deleted, [(["a" * 40], False), (["b" * 40], False)])
         self.assertEqual(self.plugin.get_data("seedgroup_items"), {})
 
     def test_prune_keeps_files_when_progress_is_unknown(self):
@@ -279,6 +280,8 @@ class MoviePilotV3Test(unittest.TestCase):
         chosen = self._withdrawn_torrents([torrent_row("a")])
         self.plugin._seedgroup_prune_mode = "files"
         self.plugin._seedgroup_prune_files = True
+        # 0.6.1：文件删除统一由「任务单删种」三档决定，prune_files 不再单独生效
+        self.plugin._seedgroup_delete_mode = "torrent_and_files"
 
         out = self.plugin.seed_group_prune()
 
@@ -321,8 +324,10 @@ class MoviePilotV3Test(unittest.TestCase):
         out = self.plugin.seed_group_prune()
 
         self.assertEqual((out["checked"], out["removed"], out["failed"]), (5, 5, 0))
+        # 文件删不删只由 seedgroup_delete_mode 决定（默认 torrent_only → 一律不连文件删），
+        # 不再按「未下完就顺手删残缺文件」绕过去
         self.assertEqual(chosen.deleted, [
-            ([row.hashString], row.name == "b") for row in torrents
+            ([row.hashString], False) for row in torrents
         ])
         self.assertEqual(self.plugin.get_data("seedgroup_items"), {})
 
@@ -375,9 +380,10 @@ class MoviePilotV3Test(unittest.TestCase):
             row("timeout", "qb", 0, 0, False),
             row("partial", "qb", 0, 0, False),
             row("unlimited", "qb", 0, 0, True),
-            row("tr", "tr", 768, 512, True),
+            # TR 的 speed-limit-up-enabled=false：读数记 0（0 = 不限速），不是 512
+            row("tr", "tr", 768, 0, True),
         ])
-        # 顶层取「读得到的那些里最紧的一台」：上传 256（qb）、下载 512（qb）
+        # 顶层取「读得到的那些里最紧的一台」：上传 256（qb）、下载 512（qb）；TR 的 0 不参与
         self.assertEqual(payload["download_limit_kib"], 512)
         self.assertEqual(payload["upload_limit_kib"], 256)
         self.assertEqual(payload["revision"], "9f2c0a7d13be55a1")
@@ -443,6 +449,7 @@ class MoviePilotV3Test(unittest.TestCase):
         chosen = self._withdrawn_torrents([torrent_row("a")])
         p._api_key = True
         p._seedgroup_prune = False
+        p._seed_group_tasks = lambda tier, custom=None: "unsupported"   # 走 fallback，在 _sg_candidates 处暂停
         cron = p.get_service()[0]["func"]
         sync = self._post_endpoint("/seedgroup/sync")
         prune = self._post_endpoint("/seedgroup/prune")
@@ -477,6 +484,7 @@ class MoviePilotV3Test(unittest.TestCase):
         chosen = self._withdrawn_torrents([torrent_row("a")])
         p._api_key = True
         p._seedgroup_prune = False
+        p._seed_group_tasks = lambda tier, custom=None: "unsupported"   # 走 fallback 占住锁
         sync_path, prune_path = "/seedgroup/sync", "/seedgroup/prune"
         app = FastAPI()
         for route in p.get_api():
@@ -509,6 +517,7 @@ class MoviePilotV3Test(unittest.TestCase):
         chosen = self._withdrawn_torrents([torrent_row("a")])
         p._api_key = True
         p._seedgroup_prune = False
+        p._seed_group_tasks = lambda tier, custom=None: "unsupported"   # 走 fallback 占住锁
         cron = p.get_service()[0]["func"]
         prune = self._post_endpoint("/seedgroup/prune")
 
@@ -528,6 +537,7 @@ class MoviePilotV3Test(unittest.TestCase):
         p = self.plugin
         chosen = self._withdrawn_torrents([torrent_row("a")])
         p._api_key = True
+        p._seed_group_tasks = lambda tier, custom=None: "unsupported"   # 走 fallback 占住锁
         p._sg_candidates = Mock(return_value=[])
         cron = p.get_service()[0]["func"]
         sync = self._post_endpoint("/seedgroup/sync")
@@ -552,6 +562,7 @@ class MoviePilotV3Test(unittest.TestCase):
         p = self.plugin
         chosen = self._withdrawn_torrents([torrent_row("a")])
         p._api_key = True
+        p._seed_group_tasks = lambda tier, custom=None: "unsupported"   # 走 fallback 占住锁
         p._sg_download = Mock(return_value=None)
         cron = p.get_service()[0]["func"]
         replies = []
@@ -656,7 +667,8 @@ class LegacyMoviePilotTest(unittest.TestCase):
         out = self.plugin.seed_group_prune()
 
         self.assertEqual((out["checked"], out["removed"], out["failed"]), (1, 1, 0))
-        self.assertEqual(self.qb.deleted, [([row["hash"]], True)])
+        # 默认 torrent_only：只删种、留文件（0.6.1 起 prune 不再按「未下完」删文件）
+        self.assertEqual(self.qb.deleted, [([row["hash"]], False)])
         self.assertEqual(self.tr.deleted, [])
         self.assertEqual(self.plugin.get_data("seedgroup_items"), {})
         self.qb_factory.assert_called_once_with()
@@ -678,9 +690,11 @@ class LegacyMoviePilotTest(unittest.TestCase):
         self.assertEqual(rows[0]["size"], SG_MOD.GIB)
         self.assertEqual(rows[0]["tags"], SG_MOD.SEED_GROUP_TAG)
         self.assertEqual((qb.inflight(), tr.inflight()), (0, 1))
-        self.assertEqual(tr.get_speed_limits(), {
-            "dl_kib": 768, "up_kib": 512, "dl_enabled": True, "up_enabled": False,
-        })
+        self.assertEqual(tr.get_speed_limits()["dl_kib"], 768)
+        # speed-limit-up-enabled=false → up_kib 记 0（0 = 不限速）；原始值只留在 *_raw
+        self.assertEqual(tr.get_speed_limits()["up_kib"], 0)
+        self.assertEqual(tr.get_speed_limits()["up_kib_raw"], 512)
+        self.assertFalse(tr.get_speed_limits()["up_enabled"])
         data = support.make_torrent()
         tag = SG_MOD.SEED_GROUP_TAG
         self.assertEqual(qb.add(data, "/fixture", True, label=tag), "ok")

@@ -20,7 +20,8 @@
   4. 每轮 `POST /api/v1/plugin/seed-group/limits` 上报客户端限速读数（只读，**不写回**客户端）；
   5. 老站点（没有 tasks 端点，404/405）→ 退回本地轮换 `_sg_rotate`，且不再调用已废弃的 report。
 
-MP 版本：只支持 MoviePilot v3（>=3.0.0）。v2 运行时插件不注册定时任务，面板显示一行警告。
+MP 版本：只支持 MoviePilot v3（>=3.0.0）。v2 运行时、以及**探测不到版本**时插件都不注册定时任务
+（fail-closed：版本未知就暂停自动任务），面板显示一行警告说明原因。
 
 凭据：可乐PT 开放 API 的 API Key（站点「账号 → Key → API Key」创建，勾「读取」+「下载」），只放在
 请求头 X-API-Key 里；插件侧另用站点签发的两小时票据 + 实例签名调 /plugin/seed-group/*。
@@ -107,8 +108,15 @@ SEED_GROUP_DELETE_LABELS: Dict[str, str] = {
     "torrent_only": "只删种子，保留文件（默认）",
     "torrent_and_files": "种子和文件一起删",
 }
-# 只支持 MoviePilot v3：v2 运行时不注册定时任务（面板给一行警告），不抛异常。
+# 只支持 MoviePilot v3：v2 运行时、以及探测不到版本时都不注册定时任务（面板给一行警告），不抛异常。
 MP_MIN_VERSION = (3, 0, 0)
+#: 运行时形态："" = MoviePilot（版本必须探测得到）；"standalone" = 本仓库的独立版服务
+#: （app/ 那一套，压根没有 MP 版本可探测）。**只有**配上 `app.__colaseedbox_standalone__`
+#: 这个桩标记才生效（见 `_standalone_runtime`）：MP 的 `app` 包里没有它，所以 MP 路径
+#: 无论这个常量残留成什么值，都会照常 fail-closed。
+MP_RUNTIME = ""
+#: 独立版桩标记：由 `app/mp_stub.py` 在独立入口注入，MoviePilot 运行时不可能带上它。
+STANDALONE_MARKER = "__colaseedbox_standalone__"
 # 限速上报的上限（站点的 JSON Schema 同值）：0 = 不限速
 SEED_GROUP_LIMIT_MAX_KIB = 1048576
 
@@ -120,8 +128,10 @@ def _mp_version() -> str:
     """取 MoviePilot 运行时版本；取不到返回空串。
 
     取值顺序：importlib.metadata 的 moviepilot 分发 → app.core.config.settings 的版本字段 →
-    app.__version__。取不到时按「没有 MP 运行时」处理（独立版 Docker / 测试环境），由调用方放行。
+    app.__version__。取不到就是**空串**：调用方一律按「版本未知」处理 —— 0.6.1 起是
+    fail-closed（不注册任务、不执行任务单），只有独立版（`MP_RUNTIME = "standalone"`）例外。
     结果缓存：进程内版本不会变，而 importlib.metadata 每次都要扫一遍已装分发。
+    独立版不缓存：它的 MP_RUNTIME 是导入后才声明的。
     """
     cached = _MP_VERSION_CACHE.get("value")
     if cached is not None:
@@ -167,11 +177,53 @@ def mp_version_tuple(value: Any) -> Tuple[int, ...]:
 
 
 def mp_version_supported(value: Any) -> bool:
-    """只有 >= 3.0.0 才算支持；版本未知（独立版取不到）按支持处理。"""
+    """只有 >= 3.0.0 才算支持；**版本未知一律判不支持**（fail-closed）。
+
+    0.6.0 把「探测不到版本」当成「没有 MP 运行时」直接放行：在 MP v2 容器里
+    （或 importlib 元数据缺失的镜像里）照样注册 cron 并真去执行任务单，会删种删文件。
+    现在宁可不跑自动化，也不在未知运行时上动手。
+    """
     parsed = mp_version_tuple(value)
     if not parsed:
-        return True
+        return False
     return parsed >= MP_MIN_VERSION
+
+
+def _standalone_runtime() -> bool:
+    """是不是**独立版服务**入口（不是 MoviePilot）。
+
+    两道同时成立才算：`MP_RUNTIME == "standalone"` **且** `app` 模块带着
+    `__colaseedbox_standalone__` 桩标记（由 app/mp_stub.py 在独立入口注入）。
+    为什么必须两道：`MP_RUNTIME` 只是一个模块常量，打包脚本/镜像里误设或残留，
+    单看它就能绕过 fail-closed；而 MP 的 `app` 包里没有那个桩标记 —— 于是
+    MoviePilot 路径永远拿不到这道豁免，版本未知时无条件停。
+    """
+    if MP_RUNTIME != "standalone":
+        return False
+    try:
+        import app
+    except Exception:
+        return False
+    return bool(getattr(app, STANDALONE_MARKER, False))
+
+
+def mp_runtime_gate() -> Tuple[bool, str]:
+    """运行时闸门：返回 (能不能跑, 不能跑的原因)。
+
+    三条分支，全部集中在这一处 —— cron 注册、面板警告、任务单执行都问它：
+      · 版本 >= 3.0.0          → 能跑；
+      · 探测不到版本（空串）    → 不能跑（fail-closed）；仅独立版入口（`_standalone_runtime`）放行；
+      · 版本 < 3.0.0（v2）      → 不能跑。
+    """
+    version = _mp_version()
+    if not mp_version_tuple(version):
+        if _standalone_runtime():
+            return True, ""
+        return False, "无法判定 MoviePilot 版本，已暂停自动任务"
+    if mp_version_supported(version):
+        return True, ""
+    need = ".".join(str(part) for part in MP_MIN_VERSION)
+    return False, f"MoviePilot {version} 不支持：本插件只支持 v3（>={need}）"
 
 
 SEED_GROUP_CUSTOM_TIER = "custom"
@@ -262,6 +314,65 @@ def _reason_summary(items: List[Dict[str, Any]]) -> str:
         if reason:
             counts[reason] = counts.get(reason, 0) + 1
     return "、".join(f"{name}×{count}" for name, count in sorted(counts.items()))
+
+
+def _error_field(body: Any, name: str) -> str:
+    """从站点错误体里取 `error.fields.<name>` 的首个可读值，取不到再回退顶层 `<name>`。
+
+    站点把明细放在 `error.fields`（值可能是 list / dict / str）：409 的最新 revision 在
+    `error.fields.revision[0]`、401 的票据原因在 `error.fields.plugin[0]`。0.6.0 只读顶层，
+    于是这两个值恒为空串（「revision 不一致（站点最新 未知）」）。
+    """
+
+    def first(value: Any) -> str:
+        if isinstance(value, Mapping):
+            for key in ("reason", "detail", "message"):
+                if value.get(key):
+                    return str(value[key])
+            for item in value.values():
+                text = first(item)
+                if text:
+                    return text
+            return ""
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for item in value:
+                text = first(item)
+                if text:
+                    return text
+            return ""
+        return str(value).strip() if value is not None else ""
+
+    if not isinstance(body, Mapping):
+        return ""
+    error = body.get("error")
+    fields = error.get("fields") if isinstance(error, Mapping) else None
+    if isinstance(fields, Mapping) and name in fields:
+        return first(fields.get(name))[:200]
+    if name in body:
+        return first(body.get(name))[:200]
+    return ""
+
+
+def _tasks_error_code(status: int) -> str:
+    """任务单失败的原因码：401/403 是凭据问题，0 是超时/连不上，其余按状态码。
+
+    码直接进 state 与面板（`tasks_error=http_500` / `auth_failed` / `timeout`），
+    运维一眼能分清「站点挂了」「票据废了」「只是网抖」——而不是笼统的「退回了本地轮换」。
+    """
+    if status in (401, 403):
+        return "auth_failed"
+    if status == 0:
+        return "timeout"
+    return f"http_{int(status)}"
+
+
+def _tasks_exception_code(err: BaseException) -> str:
+    """请求异常 → 原因码：超时单独一类（下一轮值得原样重试），其余算网络类。"""
+    name = type(err).__name__.lower()
+    text = str(err).lower()
+    if "timeout" in name or "timed out" in text or "timeout" in text:
+        return "timeout"
+    return "network"
 
 
 def _as_float(value: Any) -> float:
@@ -728,6 +839,14 @@ def _qb_speed_limits(info: Any) -> Dict[str, Any]:
 
 
 def _tr_speed_limits(session: Any) -> Dict[str, Any]:
+    """Transmission `session-get` 的限速读数（0 = 不限速，与 qB `transfer/info` 同义）。
+
+    坑在 TR 的语义：`speed-limit-up` 只是「限速值」，真正生效要看 `speed-limit-up-enabled`。
+    一台**没开限速**的默认 TR，`speed-limit-up` 里往往还留着 GUI 上次填的 100 —— 0.6.0
+    只校验启用位是 bool、照旧把 100 当读数，于是一台默认 TR 就把整个实例报成「被限速
+    100 KiB/s」（站点 `Throttled()` = `0 < up < 1024` 直接命中）。现在启用位为 false 的
+    方向读数一律记 0；原始值另存 `*_kib_raw`，只用于排查，不进上报行。
+    """
     dl = _read_field(session, "speed_limit_down", "speed-limit-down")
     up = _read_field(session, "speed_limit_up", "speed-limit-up")
     dl_enabled = _read_field(session, "speed_limit_down_enabled", "speed-limit-down-enabled")
@@ -735,7 +854,10 @@ def _tr_speed_limits(session: Any) -> Dict[str, Any]:
     if (type(dl) is not int or type(up) is not int or min(dl, up) < 0
             or not isinstance(dl_enabled, bool) or not isinstance(up_enabled, bool)):
         return {}
-    return {"dl_kib": dl, "up_kib": up, "dl_enabled": dl_enabled, "up_enabled": up_enabled}
+    return {"dl_kib": dl if dl_enabled else 0,
+            "up_kib": up if up_enabled else 0,
+            "dl_enabled": dl_enabled, "up_enabled": up_enabled,
+            "dl_kib_raw": dl, "up_kib_raw": up}
 
 
 class _Client:
@@ -1259,6 +1381,27 @@ class TransmissionClient(_Client):
             return False
         return bool(((rsp.get("arguments") or {}).get("torrents")) or [])
 
+    def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
+        """TR `torrent-remove`：删种，`delete-local-data=true` 时连本地文件一起删。
+
+        0.6.0 整个类没有 delete()，一路落到基类恒 False —— remove 在 TR 上永远 no-op，
+        而且每轮都会重试一遍（映射删不掉，下一轮任务单还会点名）。ids 用 hashString，
+        TR 认得出 hex/基数32；这里统一小写 hex，和 `list_completed` 给的 hash 一致。
+        """
+        ids = [str(item).strip().lower() for item in (hashes or []) if str(item or "").strip()]
+        if not ids:
+            return False
+        rsp = self._rpc({"method": "torrent-remove",
+                         "arguments": {"ids": ids, "delete-local-data": bool(delete_files)}})
+        if not rsp:
+            logger.warn(f"Transmission ({self.name}) 删除种子失败：没有响应")
+            return False
+        result = str(rsp.get("result") or "")
+        if result != "success":
+            logger.warn(f"Transmission ({self.name}) 删除种子返回 {result or '?'}")
+            return False
+        return True
+
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
             hash_hint: str = "", category: str = "", auto_tmm: bool = False) -> str:
         # Transmission 没有「跳过校验」参数：torrent-add 后由客户端自己校验，
@@ -1322,7 +1465,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_desc = ("可乐PT 保种组（只执行）：每轮拉站点任务单加种/删种，"
                    "目标体积与达标判定全在站点侧；客户端限速只读上报，不改设置。")
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.6.0"
+    plugin_version = "0.6.1"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1393,6 +1536,9 @@ class ColaSeedGroup(_PluginBase):
     _seedgroup_prune_files = False
     # 任务单里 remove 的删法：keep / torrent_only（默认）/ torrent_and_files
     _seedgroup_delete_mode = "torrent_only"
+    # 本轮任务单失败原因码（`_seed_group_tasks` 写，cycle 抄进 state / 面板）；每次拉单先清空
+    _sg_tasks_error = ""
+    _sg_tasks_error_detail = ""
     # 配置重载不替换运行锁，手动同步可把已取得的锁交给后台线程释放。
     _seedgroup_run_lock = Lock()
     _event = Event()
@@ -1448,6 +1594,8 @@ class ColaSeedGroup(_PluginBase):
                 self._seedgroup_rotate_count = self.SG_ROTATE_PER_DAY
             except Exception:
                 self._seedgroup_rotate_count = self.SG_ROTATE_PER_DAY
+            # 老配置项：只为兼容读取保留 —— 文件删除统一由 _sg_delete_allowed()（删种三档）决定，
+            # 这里存下来只给面板/排查看，不再参与任何删除判断（否则 keep 又被它绕过去）。
             self._seedgroup_rotate_files = bool(config.get("seedgroup_rotate_files", True))
             prune_mode = str(config.get("seedgroup_prune_mode") or "").strip().lower()
             if prune_mode not in ("off", "seed", "files"):
@@ -1459,6 +1607,7 @@ class ColaSeedGroup(_PluginBase):
                     prune_mode = "seed"
             self._seedgroup_prune_mode = prune_mode
             self._seedgroup_prune = prune_mode != "off"
+            # 同上：`files` 只在面板上留痕，真正删不删文件看删种三档（_sg_delete_allowed）。
             self._seedgroup_prune_files = prune_mode == "files"
             delete_mode = str(config.get("seedgroup_delete_mode") or "").strip().lower()
             self._seedgroup_delete_mode = (delete_mode if delete_mode in SEED_GROUP_DELETE_MODES
@@ -1953,10 +2102,20 @@ class ColaSeedGroup(_PluginBase):
         return rows
 
     def seed_group_rotate(self, **kwargs) -> Dict[str, Any]:
-        """手动触发一次动态轮换（体积达标后才有效）。"""
-        clients = self._sg_clients()
-        state = self.seed_group_status()
-        return self._sg_rotate(clients, state, self._sg_candidates())
+        """手动触发一次动态轮换（体积达标后才有效）。
+
+        和 cron 的 `seed_group_tasks_cycle` 抢**同一把** `_seedgroup_run_lock`：
+        0.6.0 这里没取锁，手动点一下能和 cron 的 tasks 轮同时跑 —— 两边都读同一份
+        `seedgroup_items` / 跳过表，会互相覆盖状态，甚至同一颗种子被删两次。
+        """
+        if not self._seedgroup_run_lock.acquire(blocking=False):
+            return self._sg_busy()
+        try:
+            clients = self._sg_clients()
+            state = self.seed_group_status()
+            return self._sg_rotate(clients, state, self._sg_candidates())
+        finally:
+            self._seedgroup_run_lock.release()
 
     def _sg_rotate(self, clients: List[_Client], state: Dict[str, Any],
                    pool_all: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2043,13 +2202,25 @@ class ColaSeedGroup(_PluginBase):
         droppable.sort(key=lambda item: (-item[0], item[1]))
         drops = droppable[:self.SG_ROTATE_PER_DAY]
 
+        # ── ③.5 删除闸门：keep 一个 delete 都不发（但候选照算、日志照记）──
+        allowed, delete_files = self._sg_delete_allowed()
+        if not allowed:
+            names = "、".join(str((record or {}).get("name") or info_hash[:12])[:40]
+                             for _seeders, info_hash, record in drops)
+            out["skipped_delete"] = len(drops)
+            out["reason"] = (f"删除模式 keep：本可轮换 {len(drops)} 颗（{names}），"
+                             f"只记日志，不删种也不补种")
+            self.save_data("seedgroup_rotate", out)
+            logger.info(f"动态保种：{out['reason']}")
+            return out
+
         # ── ④ 删（一天最多 SG_ROTATE_PER_DAY 颗）──
         client = clients[0]
         dropped_gib = 0.0
         for seeders, info_hash, record in drops:
             name = str((record or {}).get("name") or info_hash[:12])
             try:
-                deleted = client.delete([info_hash], delete_files=self._seedgroup_rotate_files)
+                deleted = client.delete([info_hash], delete_files=delete_files)
             except Exception as err:
                 logger.warn(f"动态保种：删除 {name} 异常：{err}")
                 deleted = False
@@ -2065,6 +2236,7 @@ class ColaSeedGroup(_PluginBase):
             # 刚被轮换删掉的种子 7 天内不再回来 —— 否则池子贴着目标时，
             # 删掉 2 颗、下一轮又把同样 2 颗加回去，天天来回折腾（评审第 6 条）。
             self._sg_unmark_skip(record)
+            self._sg_task_backoff_clear(record)
             self._sg_mark_skip(record, "rotated")
             time.sleep(1.0)          # 别把删除请求打成一串，qB 在慢链路上会 403
         self.save_data("seedgroup_items", items)
@@ -2335,13 +2507,22 @@ class ColaSeedGroup(_PluginBase):
 
     # ==================== 站点任务单（v2：插件只执行） ====================
 
-    def _seed_group_tasks(self, tier: str, custom_gib: Any = None) -> Optional[Dict[str, Any]]:
-        """`GET /api/v1/plugin/seed-group/tasks`：站点算好的加/删单。
+    def _seed_group_tasks(self, tier: str, custom_gib: Any = None) -> Any:
+        """`GET /api/v1/plugin/seed-group/tasks`：站点算好的加/删单。返回**三态**：
 
-        站点是唯一裁判：target/covered/shortfall、add、remove 全部由它从 tracker 内核库算。
-        **任何失败都返回 None**（404/405 = 老站点，调用方据此退回本地轮换）；失败原因只进日志，
-        不抛 —— 这条链路每轮都跑，抛出去会把整轮连同限速上报一起打断。
+          · `dict`          —— 200 且解析成功，照任务单执行；
+          · `"unsupported"` —— 站点没有这个端点（404 / 405 / 501），调用方退回本地轮换；
+          · `None`          —— 其它一切失败（401/403/5xx/超时/坏 JSON/没票据），
+                               **本轮不动**：不加种、不删种、**也不降级成本地轮换**。
+
+        为什么必须分开：0.6.0 把 401/500/超时/JSON 漂移全塞进 None，调用方一见 None 就走
+        `_sg_local_fallback` → `_sg_rotate`，而那条路按 `_seedgroup_rotate_files`（默认 True）
+        **连文件一起删**。实测 `delete_mode=keep` + 站点 404 也会走进去；站点 500 时同样删。
+        失败原因码写进 `self._sg_tasks_error`（cycle 会抄进 state 与面板），不抛 —— 这条链路
+        每轮都跑，抛出去会把整轮连同限速上报一起打断。
         """
+        self._sg_tasks_error = ""
+        self._sg_tasks_error_detail = ""
         params: Dict[str, Any] = {
             "tier": seed_group_tier_key(tier),
             "custom_gib": max(0, int(round(_as_float(custom_gib)))),
@@ -2355,32 +2536,45 @@ class ColaSeedGroup(_PluginBase):
         if not self._plugin_credentials()[0] and self._api_key:
             self._plugin_enroll()
         if not self._plugin_credentials()[0]:
-            logger.warn("保种组任务单：还没有插件票据（先填 API Key 领票据），本轮按老站点处理")
+            self._sg_tasks_error = "no_ticket"
+            logger.warn("保种组任务单：还没有插件票据（先填 API Key 领票据），本轮不动")
             return None
         headers_out: Dict[str, str] = {}
         try:
             rsp = _curl("GET", url, headers=self._plugin_headers("GET", url, body),
                         timeout=REQUEST_TIMEOUT, headers_out=headers_out)
             status = 0 if rsp is None else rsp.status_code
+            if status == 401:
+                # 先记站点说的原因（`error.fields.plugin[0]`），换票/重领失败时它就是原因码的明细
+                self._sg_tasks_error_detail = _error_field(rsp.json({}) if rsp is not None else {}, "plugin")
             # 票据过期就换一张；换不了（被撤销）就用 API Key 重领一把，再试一次。
             if (status == 401 and self._plugin_credentials()[0]
                     and (self._plugin_renew() or self._plugin_enroll())):
                 rsp = _curl("GET", url, headers=self._plugin_headers("GET", url, body),
                             timeout=REQUEST_TIMEOUT, headers_out=headers_out)
                 status = 0 if rsp is None else rsp.status_code
+                if status == 401:
+                    detail = _error_field(rsp.json({}) if rsp is not None else {}, "plugin")
+                    self._sg_tasks_error_detail = detail or self._sg_tasks_error_detail
         except Exception as err:
-            logger.warn(f"保种组任务单：请求异常 {type(err).__name__}: {err}")
+            code = _tasks_exception_code(err)
+            self._sg_tasks_error = code
+            self._sg_tasks_error_detail = f"{type(err).__name__}: {err}"[:200]
+            logger.warn(f"保种组任务单：请求异常（{code}）{type(err).__name__}: {err}")
             return None
-        if status in (404, 405):
+        if status in (404, 405, 501):
             logger.info(f"保种组任务单：站点没有这个端点（HTTP {status}），退回本地轮换")
-            return None
+            return "unsupported"
         if status != 200 or rsp is None:
-            logger.warn(f"保种组任务单：站点返回 HTTP {status}（接口未上线/地址不对/网络故障），退回本地轮换")
+            self._sg_tasks_error = _tasks_error_code(status)
+            logger.warn(f"保种组任务单：站点返回 HTTP {status}（{self._sg_tasks_error}），"
+                        f"本轮不动（不删种、不加种、也不退回本地轮换）")
             return None
         self._plugin_touch(headers_out)
         data = rsp.json(None)
         if not isinstance(data, dict):
-            logger.warn("保种组任务单：响应不是 JSON 对象，退回本地轮换")
+            self._sg_tasks_error = "bad_json"
+            logger.warn("保种组任务单：响应不是 JSON 对象，本轮不动（不删种、不加种）")
             return None
         tasks = dict(data)
         for key in ("add", "remove"):
@@ -2414,6 +2608,23 @@ class ColaSeedGroup(_PluginBase):
         rows = self._collect_speed_limits(clients)
         out["clients"] = rows
         readable = [row for row in rows if row.get("readable")]
+        # 「0/3 台读得到」要能看出来：readable 是逐台标记，这里是本轮汇总（面板与状态都用它）。
+        out["limits_readable"] = f"{len(readable)}/{len(rows)}"
+        if not self._plugin_credentials()[0] and self._api_key:
+            self._plugin_enroll()
+        if not self._plugin_credentials()[0]:
+            out["reason"] = "还没有插件票据：先填 API Key（领票据要「读取」范围）"
+            self._save_limits_snapshot(out)
+            return out
+        if not readable:
+            # 全部读不到时**不发**：顶层 0 是契约里「不限速」的意思，发出去等于撒谎
+            # （站点会把这台实例当全速保种）。宁可不报，也不报假读数。
+            out["skipped"] = "no_readings"
+            out["reason"] = (f"没有可读的限速读数（{out['limits_readable']} 台），本轮不上报 —— "
+                             f"不把「读不到」伪装成「不限速」")
+            self._save_limits_snapshot(out)
+            logger.warn(f"保种组限速上报：{out['reason']}")
+            return out
         payload: Dict[str, Any] = {
             "instance_id": self._plugin_instance_id()[:64],
             "upload_limit_kib": self._tightest([int(row.get("up_kib") or 0) for row in readable]),
@@ -2429,12 +2640,6 @@ class ColaSeedGroup(_PluginBase):
         out["upload_limit_kib"] = payload["upload_limit_kib"]
         out["download_limit_kib"] = payload["download_limit_kib"]
         url = f"{COLA_BASE}{SEED_GROUP_LIMITS_API}"
-        if not self._plugin_credentials()[0] and self._api_key:
-            self._plugin_enroll()
-        if not self._plugin_credentials()[0]:
-            out["reason"] = "还没有插件票据：先填 API Key（领票据要「读取」范围）"
-            self._save_limits_snapshot(out)
-            return out
         body_text = json.dumps(payload)
         headers_out: Dict[str, str] = {}
         rsp: Optional[_HttpResult] = None
@@ -2454,9 +2659,10 @@ class ColaSeedGroup(_PluginBase):
         out["status"] = status
         out["ok"] = status == 200
         if status == 409:
-            # revision 过期：站点把最新 revision 放在响应体里，下一轮 GET 自己会拿到新的
+            # revision 过期：站点把最新 revision 放在 `error.fields.revision[0]`（也兼容顶层），
+            # 0.6.0 只读顶层，于是恒拿空串；下一轮 GET 自己会拿到新的。
             body = rsp.json({}) if rsp is not None else {}
-            out["conflict"] = str((body or {}).get("revision") or "") if isinstance(body, dict) else ""
+            out["conflict"] = _error_field(body, "revision")
             out["reason"] = f"revision 不一致（站点最新 {out['conflict'] or '未知'}），下一轮重拉任务单"
         elif not out["ok"] and not out["reason"]:
             out["reason"] = f"站点返回 HTTP {status}（接口未上线或地址不对）"
@@ -2478,6 +2684,9 @@ class ColaSeedGroup(_PluginBase):
             "ok": bool(out.get("ok")), "status": out.get("status"),
             "reason": out.get("reason"), "conflict": out.get("conflict"),
             "throttled": out.get("throttled"),
+            # 本轮「几台读得到 / 几台」：0/2 表示全部读不到，此时**没有**上报
+            "limits_readable": out.get("limits_readable", ""),
+            "skipped": out.get("skipped", ""),
             "upload_limit_kib": out.get("upload_limit_kib"),
             "download_limit_kib": out.get("download_limit_kib"),
             "clients": out.get("clients") or [],
@@ -2916,6 +3125,11 @@ class ColaSeedGroup(_PluginBase):
         lines: List[str] = [f"档位：{SEED_GROUP_TIER_LABELS.get(tier, tier)}"]
         if mode == "fallback":
             lines.append("模式：老站点（没有任务单端点）→ 本地轮换兜底，不上报自算体积")
+        elif mode == "skip":
+            # 任务单失败：本轮什么都没动，原因码要看得到（http_500 / auth_failed / timeout / bad_json）
+            lines.append(f"模式：任务单失败 → 本轮不动（原因 {state.get('tasks_error') or 'unknown'}）")
+            if state.get("tasks_error_detail"):
+                lines.append(f"失败明细：{state['tasks_error_detail']}")
         else:
             lines.append(f"任务单 revision：{revision or '（站点还没给）'}")
             lines.append(f"站点给的数字：目标 {self._gib_text(target)} / 覆盖 {self._gib_text(covered)}"
@@ -2929,9 +3143,16 @@ class ColaSeedGroup(_PluginBase):
         if limits:
             ok = "成功" if limits.get("ok") else f"失败（{limits.get('reason') or limits.get('status')}）"
             throttled = "，站点判定：被限速" if limits.get("throttled") else ""
-            lines.append(f"限速读数（{limits.get('at', '')}）：上传 {limits.get('upload_limit_kib', 0)} / "
-                         f"下载 {limits.get('download_limit_kib', 0)} KiB/s（0 = 不限速），"
-                         f"{len(limits.get('clients') or [])} 台；上报 {ok}{throttled}")
+            readable = str(limits.get("limits_readable") or "")
+            if limits.get("skipped") == "no_readings":
+                # 全部读不到时**没有**上报：0 是「不限速」的意思，这里不能显示成 0/0
+                lines.append(f"限速读数（{limits.get('at', '')}）：本轮无读数"
+                             f"（{readable or '0/? 台'} 读得到），未上报 —— 不把「读不到」当「不限速」")
+            else:
+                lines.append(f"限速读数（{limits.get('at', '')}）：上传 {limits.get('upload_limit_kib', 0)} / "
+                             f"下载 {limits.get('download_limit_kib', 0)} KiB/s（0 = 不限速）"
+                             f"（{readable or len(limits.get('clients') or [])} 台读得到），"
+                             f"上报 {ok}{throttled}")
         if state.get("at"):
             lines.append(f"上次同步 {state['at']}"
                          + (f"：{state['reason']}" if state.get("reason") else ""))
@@ -2949,6 +3170,8 @@ class ColaSeedGroup(_PluginBase):
             lines.append("状态：未启用 —— 勾选顶部「启用保种组」并保存")
         elif mode == "fallback":
             lines.append("状态：站点未提供任务单端点，插件只做本地轮换")
+        elif mode == "skip":
+            lines.append("状态：本轮跳过 —— 任务单不可用，插件没加种也没删种")
         elif state.get("at"):
             lines.append("状态：按站点任务单执行（体积/达标判定全在站点侧）")
         return {
@@ -3177,6 +3400,8 @@ class ColaSeedGroup(_PluginBase):
     # 删掉 2 颗之后能补的候选就只剩刚删掉的那几颗，每天删了又重下（评审第 6 条）。
     SG_ROTATE_MIN_HEADROOM_GIB = 50.0
     SG_SKIP_TTL_NET = 300
+    # 站点任务单自己的加种失败退避表（与 fallback 的 seedgroup_skip 分开存，互不查询）
+    SG_TASK_BACKOFF_KEY = "seedgroup_task_backoff"
     SG_RATE_LIMIT_STOP = 3       # 连续这么多次被判限流就结束本轮
     # ── 动态轮换（老板 2026-11-22 定的规则，全部强制，不对外暴露数值）──
     # 每天最多删几颗（老板 2026-11-22 定：2 颗）。不是「每轮」，是一天一次：
@@ -3203,12 +3428,15 @@ class ColaSeedGroup(_PluginBase):
             return self.SG_SKIP_TTL_DUP
         return self.SG_SKIP_TTL
 
-    def _sg_skips(self) -> Dict[str, Any]:
-        """读的时候也清一遍过期：没有新写入时，过期条目不能永久生效。
+    def _sg_live_entries(self, store_key: str) -> Dict[str, Any]:
+        """读一张「跳过/退避」表，顺手清过期（每条按自己记下的 `ttl`）。
 
-        每条按自己记下的 `ttl` 判定 —— 网络类失败只关 5 分钟，坏种关 7 天。
+        两张表共用这段过期规则：
+          · `seedgroup_skip`        —— 本地轮换 / fallback 的记账（rotated、dup…）；
+          · `seedgroup_task_backoff` —— 站点任务单路径的加种失败退避。
+        两者**物理分开**：任务单只读后者，fallback 只读前者（路径隔离，见 `_sg_task_backoff`）。
         """
-        data = self.get_data("seedgroup_skip") or {}
+        data = self.get_data(store_key) or {}
         if not isinstance(data, dict):
             return {}
         now = int(time.time())
@@ -3223,24 +3451,60 @@ class ColaSeedGroup(_PluginBase):
             if now - int(v.get("at") or 0) < ttl:
                 fresh[k] = v
         if len(fresh) != len(data):
-            self.save_data("seedgroup_skip", fresh)
+            self.save_data(store_key, fresh)
         return fresh
 
-    def _sg_mark_skip(self, item: Dict[str, Any], reason: str, detail: str = "") -> None:
-        """记一条跳过。带 detail 与失败次数，面板和日志能说清「为什么跳过」。"""
+    def _sg_mark_entry(self, store_key: str, item: Dict[str, Any], reason: str,
+                       detail: str = "") -> None:
+        """往指定表里记一条。带 detail 与失败次数，面板和日志能说清「为什么跳过」。"""
         key = _seed_group_key(item)
         if not key:
             return
         now = int(time.time())
-        skips = self._sg_skips()
-        prev = skips.get(key) or {}
+        entries = self._sg_live_entries(store_key)
+        prev = entries.get(key) or {}
         try:
             fails = int(prev.get("fails") or 0) + 1
         except Exception:
             fails = 1
-        skips[key] = {"at": now, "reason": reason, "ttl": self._sg_skip_ttl(reason),
-                      "detail": str(detail or "")[:120], "fails": fails}
-        self.save_data("seedgroup_skip", skips)
+        entries[key] = {"at": now, "reason": reason, "ttl": self._sg_skip_ttl(reason),
+                        "detail": str(detail or "")[:120], "fails": fails}
+        self.save_data(store_key, entries)
+
+    def _sg_clear_entry(self, store_key: str, record: Dict[str, Any]) -> bool:
+        key = _seed_group_key(record or {})
+        if not key:
+            return False
+        entries = self._sg_live_entries(store_key)
+        if entries.pop(key, None) is None:
+            return False
+        self.save_data(store_key, entries)
+        return True
+
+    def _sg_skips(self) -> Dict[str, Any]:
+        """**本地轮换（fallback）专用**的跳过表：候选过滤只认这张。
+
+        任务单路径**不读它**（`_sg_add_tasks` 只读 `_sg_task_backoff`）：
+        站点点名的种子不能被 fallback 的 rotated/dup 记录挡住。
+        """
+        return self._sg_live_entries("seedgroup_skip")
+
+    def _sg_mark_skip(self, item: Dict[str, Any], reason: str, detail: str = "") -> None:
+        self._sg_mark_entry("seedgroup_skip", item, reason, detail)
+
+    def _sg_task_backoff(self) -> Dict[str, Any]:
+        """**站点任务单专用**的加种失败退避表（规格 §5.2 的「保留退避」）。
+
+        与 `seedgroup_skip` 分开存：任务单不再查询 fallback 的记账表，
+        fallback 也不会被任务单的失败记录影响 —— 这是两条独立路径。
+        """
+        return self._sg_live_entries(self.SG_TASK_BACKOFF_KEY)
+
+    def _sg_task_backoff_mark(self, item: Dict[str, Any], reason: str, detail: str = "") -> None:
+        self._sg_mark_entry(self.SG_TASK_BACKOFF_KEY, item, reason, detail)
+
+    def _sg_task_backoff_clear(self, record: Dict[str, Any]) -> bool:
+        return self._sg_clear_entry(self.SG_TASK_BACKOFF_KEY, record)
 
     def _sg_add_with_retry(self, client: "_Client", data: bytes, info_hash: str) -> Tuple[Optional[str], Optional[Exception]]:
         """加一颗种子，网络类失败就地重试两次。
@@ -3266,7 +3530,7 @@ class ColaSeedGroup(_PluginBase):
         return None, last
 
     def _sg_unmark_skip(self, record: Dict[str, Any]) -> None:
-        """删掉种子之后清掉它的跳过记录。
+        """删掉种子之后清掉它的**本地轮换**跳过记录（任务单退避见 `_sg_task_backoff_clear`）。
 
         为什么必须清：跳过表的 `dup` 表示「客户端里已经有这颗」。会话面的资源池
         **不带 info_hash**（见 `_sg_candidates` 的注释），所以候选过滤里那条
@@ -3310,7 +3574,7 @@ class ColaSeedGroup(_PluginBase):
 
     def _sg_prune(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {"checked": 0, "removed": 0, "kept": 0, "unmapped": 0,
-                               "failed": 0,
+                               "failed": 0, "suppressed": 0,
                                "reason": "", "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
         if not self._seedgroup_enabled:
             out["reason"] = "保种组未启用"
@@ -3324,6 +3588,9 @@ class ColaSeedGroup(_PluginBase):
             out["reason"] = "没有可用的下载器"
             return out
         items = self._sg_items()
+        allowed, delete_files = self._sg_delete_allowed()
+        if not allowed:
+            logger.info("保种组清理：删除模式 keep —— 本轮只核对、不删种（映射全部保留）")
         for client in clients:
             try:
                 # 必须用 list_all：站点撤掉的资源如果本地才下到 30%，它在 filter=completed
@@ -3372,13 +3639,17 @@ class ColaSeedGroup(_PluginBase):
                 if not drop:
                     out["kept"] += 1
                     continue
-                # 已确认下架：按配置删除文件，或在确认未下完时清掉残缺文件。
-                # 进度未知时，seed 模式只删种子任务，保留文件。
+                # 已确认下架，但**能不能删、删不删文件只由 _sg_delete_allowed() 决定**：
+                # keep 时不动手（映射保留，改回三档后下一轮照常处理）。
+                if not allowed:
+                    out["suppressed"] += 1
+                    logger.info(f"保种组清理：{client.name} 删除 {info_hash[:12]}"
+                                f"（torrent_id={torrent_id}）已确认下架，但删除模式 keep —— "
+                                f"只记日志不删，映射保留")
+                    continue
                 progress = _torrent_progress(torrent.get("progress"))
-                incomplete = progress is not None and progress < 0.999
-                drop_files = bool(self._seedgroup_prune_files) or incomplete
                 try:
-                    deleted = client.delete([info_hash], delete_files=drop_files)
+                    deleted = client.delete([info_hash], delete_files=delete_files)
                 except Exception as err:
                     logger.warn(f"保种组清理：删除 {info_hash[:12]} 异常：{err}")
                     deleted = False
@@ -3391,19 +3662,16 @@ class ColaSeedGroup(_PluginBase):
                 items.pop(info_hash, None)
                 # 同上：删了就清跳过记录，否则下架的种子被重新上架后永远加不回来
                 self._sg_unmark_skip(record)
-                if self._seedgroup_prune_files:
-                    why = "按配置连文件删"
-                elif incomplete:
-                    why = "未下完，连残缺文件一起删"
-                else:
-                    why = "保留文件"
+                self._sg_task_backoff_clear(record)
+                why = "连文件一起删" if delete_files else "保留文件"
                 progress_text = "未知" if progress is None else f"{progress:.0%}"
                 logger.info(f"保种组清理：{client.name} 删除 {info_hash[:12]}"
                             f"（torrent_id={torrent_id}，progress={progress_text}，{why}）")
         self.save_data("seedgroup_items", items)
         self.save_data("seedgroup_prune", out)
         logger.info(f"保种组清理完成：检查 {out['checked']}，删除 {out['removed']}，保留 {out['kept']}，"
-                    f"失败 {out['failed']}，无映射跳过 {out['unmapped']}")
+                    f"失败 {out['failed']}，无映射跳过 {out['unmapped']}，"
+                    f"keep 压制 {out['suppressed']}")
         return out
 
     def seed_group_probe(self) -> Dict[str, Any]:
@@ -3476,10 +3744,11 @@ class ColaSeedGroup(_PluginBase):
         """一轮的主流程（cron / 手动同步都走这里）。
 
         ```
-        GET tasks ─ 200 ─→ 执行 add（_download_cola + 客户端 add，带预算与退避）
-                        └→ 执行 remove（按 seed_group_delete_mode 三档，只删任务单里的 hash）
-                    失败 ─→ 退回 _sg_rotate 本地轮换（老站点），且不调已废弃的 report
-        每轮    ─→ POST limits（只读客户端限速，不改）
+        GET tasks ─ 200 ─────────→ 执行 add（_download_cola + 客户端 add，带预算与退避）
+                                └→ 执行 remove（按 seed_group_delete_mode 三档，只删任务单里的 hash）
+                  404/405/501 ──→ 退回 _sg_rotate 本地轮换（老站点），且不调已废弃的 report
+                  其它失败 ─────→ 本轮跳过（mode=skip）：不加种、不删种、原因码进 state/面板
+        每轮    ─────────────────→ POST limits（只读客户端限速，不改）
         ```
 
         v2 起**不**自算目标/覆盖/达标，也**不**上报自算结果：那些数字只有站点能算。
@@ -3493,17 +3762,17 @@ class ColaSeedGroup(_PluginBase):
             "add_count": 0, "remove_count": 0,
             "added": 0, "duplicate": 0, "failed": 0, "removed": 0,
             "delete_mode": self._seedgroup_delete_mode, "reason": "",
+            "tasks_error": "",
         }
         clients: List[_Client] = []
         try:
             if not self._seedgroup_enabled:
                 state["reason"] = "保种组没启用"
                 return state
-            version = _mp_version()
-            if not mp_version_supported(version):
-                # v2 运行时不干活：不注册任务（见 get_service），手动调用也只是说清原因。
-                state["reason"] = (f"MoviePilot {version or '2.x'} 不支持：保种组 0.6.0 只支持 v3"
-                                   f"（>={MP_MIN_VERSION[0]}.{MP_MIN_VERSION[1]}.{MP_MIN_VERSION[2]}）")
+            allowed, blocked = mp_runtime_gate()
+            if not allowed:
+                # 版本不对/版本未知都不干活：不注册任务（见 get_service），手动调用也只说清原因。
+                state["reason"] = blocked
                 self.save_data("seedgroup_state", state)
                 logger.warn(f"保种组：{state['reason']}")
                 return state
@@ -3519,10 +3788,7 @@ class ColaSeedGroup(_PluginBase):
                 logger.warn("保种组：没有可用的下载器")
                 return state
             tasks = self._seed_group_tasks(tier, self._seedgroup_custom_gib)
-            if tasks is None:
-                state["mode"] = "fallback"
-                self._sg_local_fallback(clients, state, tier)
-            else:
+            if isinstance(tasks, Mapping):
                 state.update(target_gib=tasks["target_gib"], covered_gib=tasks["covered_gib"],
                              shortfall_gib=tasks["shortfall_gib"],
                              tasks_revision=tasks["revision"] or state["tasks_revision"])
@@ -3530,8 +3796,24 @@ class ColaSeedGroup(_PluginBase):
                     # revision 落盘：下一轮当 since_revision 带上，站点侧据此对日志/指标
                     self.save_data("tasks_revision", tasks["revision"])
                 self._sg_execute_tasks(clients, tasks, state)
+            elif tasks == "unsupported":
+                # **只有**「站点没有这个端点」（404/405/501）才退回本地轮换
+                state["mode"] = "fallback"
+                self._sg_local_fallback(clients, state, tier)
+            else:
+                # 其它失败（401/403/5xx/超时/坏 JSON/没票据）：本轮不动。
+                # 0.6.0 在这里退回了本地轮换，而 _sg_rotate 会按 seedgroup_rotate_files（默认 True）
+                # 连文件一起删 —— 一次 500 或一次票据过期就能删掉用户的种子。
+                state["mode"] = "skip"
+                state["tasks_error"] = str(self._sg_tasks_error or "failed")
+                detail = str(self._sg_tasks_error_detail or "")
+                if detail:
+                    state["tasks_error_detail"] = detail
+                state["reason"] = (f"任务单失败（{state['tasks_error']}），本轮不动：不加种、不删种，"
+                                   f"也不退回本地轮换" + (f"；{detail}" if detail else ""))
+                logger.warn(f"保种组：{state['reason']}")
             # 丢失文件自检与下架清理跟任务单无关，两种模式都跑（各自有内部闸门：
-            # 前者每轮限 20 颗、后者 6 小时一次）。
+            # 前者每轮限 20 颗、后者 6 小时一次），删除动作统一由 _sg_delete_allowed() 放行。
             self._sg_recheck_missing(clients, state)
             self._sg_prune_if_enabled(state)
             self.save_data("seedgroup_state", state)
@@ -3561,6 +3843,8 @@ class ColaSeedGroup(_PluginBase):
     def _sg_local_fallback(self, clients: List[_Client], state: Dict[str, Any], tier: str) -> None:
         """老站点兜底：只做现有本地轮换，不上报任何自算数字。
 
+        **只有** `_seed_group_tasks` 明确回 `"unsupported"`（404/405/501）才会走到这里；
+        401/500/超时/坏 JSON 一律不进 —— 那条路会按配置删种删文件，不能拿「站点抖了一下」当理由。
         目标体积按本地档位算（`_sg_rotate` 自己要用它判「够不够删」），但**只用于本地决策**，
         既写不进上报、也不当成站点认定的达标结论。
         """
@@ -3597,22 +3881,45 @@ class ColaSeedGroup(_PluginBase):
             state["fail_reasons"] = {seed_group_fetch_label(key): count
                                      for key, count in sorted(reasons.items())}
 
+    def _sg_delete_allowed(self) -> Tuple[bool, bool]:
+        """**唯一**的删除闸门：返回 `(能不能删, 删不删文件)`。
+
+        `seedgroup_delete_mode` 三档一档说清，三条删除路径（任务单 remove / 本地轮换 /
+        下架清理）都只问它，任何一处都不许自己读配置：
+
+          keep              → (False, False) 一个 delete 都不发，只记日志
+          torrent_only      → (True,  False) 只删种、留文件（默认）
+          torrent_and_files → (True,  True ) 连文件一起删
+
+        0.6.0 的坑：`keep` 只约束了 `_sg_remove_tasks`，同轮的 `_sg_rotate`（按
+        `_seedgroup_rotate_files`，默认 True）与 `_sg_prune`（按 `_seedgroup_prune_files`
+        或「未下完就顺手删残缺文件」）各删各的 —— 用户设了 keep 照样被删掉一颗、连文件。
+        老配置项 `seedgroup_rotate_files` / `seedgroup_prune_files` 只为兼容读取保留，
+        文件删除一律以本函数的第二项为准。
+        """
+        mode = str(self._seedgroup_delete_mode or "").strip().lower()
+        if mode not in SEED_GROUP_DELETE_MODES:
+            mode = "torrent_only"
+        if mode == "keep":
+            return False, False
+        if mode == "torrent_only":
+            return True, False
+        return True, True
+
     def _sg_remove_tasks(self, clients: List[_Client],
                          removes: List[Dict[str, Any]]) -> int:
         """按 `seed_group_delete_mode` 删 tasks.remove 里的种子。
 
         **只会删这个列表里的 info hash**：列表之外的种子一律不碰（下架清理是另一个独立功能）。
+        删不删文件、允不允许删，都问 `_sg_delete_allowed()`。
         """
         if not removes:
             return 0
-        mode = self._seedgroup_delete_mode
-        if mode not in SEED_GROUP_DELETE_MODES:
-            mode = "torrent_only"
-        if mode == "keep":
+        allowed, delete_files = self._sg_delete_allowed()
+        if not allowed:
             logger.info(f"保种组删种：模式 keep —— 站点要求删 {len(removes)} 条，只记日志不动手："
                         + "、".join(str(item.get("info_hash") or "")[:12] for item in removes[:10]))
             return 0
-        delete_files = mode == "torrent_and_files"
         removed = 0
         items = self._sg_items()
         for item in removes:
@@ -3638,8 +3945,9 @@ class ColaSeedGroup(_PluginBase):
                 continue
             removed += 1
             items.pop(info_hash, None)
-            # 删了就清跳过记录：否则「客户端已有（dup）」会在 TTL 内挡住它重新加回来
+            # 删了就清干净两张表：否则「客户端已有（dup）」/ 失败退避会在 TTL 内挡住它重新加回来
             self._sg_unmark_skip(record)
+            self._sg_task_backoff_clear(record)
             logger.info(f"保种组删种：{info_hash[:12]} 已删除（{item.get('reason') or 'remove'}，"
                         f"{'连文件一起删' if delete_files else '保留文件'}）")
             time.sleep(1.0)      # 别把删除请求打成一串，qB 在慢链路上会 403
@@ -3668,7 +3976,9 @@ class ColaSeedGroup(_PluginBase):
                                f"等这一批下完再继续补")
             logger.info(f"保种组：{state['reason']}")
             return 0, 0, 0, reasons
-        skips = self._sg_skips()
+        # 只读**任务单自己的**退避表：fallback 的 rotated / dup 记录一律不参与
+        # （站点在这轮任务单里点名要这颗，不能被另一条路径的记账挡住）。
+        backoff = self._sg_task_backoff()
         added = duplicate = failed = picked = rate_limited = 0
         for item in adds:
             if self._event.is_set():
@@ -3678,8 +3988,9 @@ class ColaSeedGroup(_PluginBase):
                 logger.info(f"保种组：本轮进种额度 {quota} 已用满，剩下的 {state['quota_trimmed']} 条下次再说")
                 break
             key = _seed_group_key(item)
-            if key and key in skips:
-                continue          # 还在退避窗口里（网络类 5 分钟、坏种 7 天）
+            if key and key in backoff:
+                # 这颗在任务单路径上自己失败过（网络类 5 分钟 / 坏种 7 天）—— 规格 §5.2 的退避
+                continue
             if added or failed:
                 time.sleep(self.SG_DOWNLOAD_GAP)
             info_hash = str(item.get("info_hash") or "").strip().lower()
@@ -3693,14 +4004,14 @@ class ColaSeedGroup(_PluginBase):
                     tagged = False
                     logger.warn(f"保种组：给已有种子补标签失败（{info_hash[:12]}）：{err}")
                 if tagged:
-                    self._sg_mark_skip(item, "dup")
+                    self._sg_task_backoff_mark(item, "dup")
                 continue
             try:
                 data = self._sg_download(item)
             except _SeedGroupFetchError as err:
                 failed += 1
                 reasons[err.reason] = reasons.get(err.reason, 0) + 1
-                self._sg_mark_skip(item, err.reason, err.detail)
+                self._sg_task_backoff_mark(item, err.reason, err.detail)
                 wait = "下一轮重试" if err.transient else f"{self._sg_skip_ttl(err.reason) // 3600} 小时后重试"
                 logger.warn(f"保种组取种子失败（{item.get('torrent_id')}）："
                             f"{seed_group_fetch_label(err.reason)} {err.detail}；{wait}")
@@ -3708,7 +4019,7 @@ class ColaSeedGroup(_PluginBase):
             if not data:
                 failed += 1
                 reasons["download"] = reasons.get("download", 0) + 1
-                self._sg_mark_skip(item, "download")
+                self._sg_task_backoff_mark(item, "download")
                 continue
             info_hash = _torrent_info_hash(data) or info_hash
             result, err = self._sg_add_with_retry(client, data, info_hash)
@@ -3719,12 +4030,12 @@ class ColaSeedGroup(_PluginBase):
                     logger.warn(f"保种组：连续 {rate_limited} 次被限流，本轮停止加种（已加 {added} 条）")
                     break
                 failed += 1
-                self._sg_mark_skip(item, "net")
+                self._sg_task_backoff_mark(item, "net")
                 continue
             if result is None:
                 logger.warn(f"保种组加种异常（{item.get('torrent_id')}，重试 {self.SG_ADD_RETRY} 次后仍失败）：{err}")
                 failed += 1
-                self._sg_mark_skip(item, "net")
+                self._sg_task_backoff_mark(item, "net")
                 continue
             if result == "ok":
                 added += 1
@@ -3732,11 +4043,11 @@ class ColaSeedGroup(_PluginBase):
                 self._sg_remember_item(info_hash, item)
             elif result == "dup":
                 duplicate += 1
-                self._sg_mark_skip(item, "dup")
+                self._sg_task_backoff_mark(item, "dup")
                 self._sg_remember_item(info_hash, item)
             else:
                 failed += 1
-                self._sg_mark_skip(item, "fail")
+                self._sg_task_backoff_mark(item, "fail")
         return added, duplicate, failed, reasons
 
     def _sg_recheck_missing(self, clients: List[_Client], state: Dict[str, Any]) -> None:
@@ -3771,9 +4082,9 @@ class ColaSeedGroup(_PluginBase):
 
     def get_service(self) -> List[Dict[str, Any]]:
         services: List[Dict[str, Any]] = []
-        # 只支持 MoviePilot v3：v2 运行时**不注册**定时任务（面板给一行警告，不抛异常）。
+        # 只支持 MoviePilot v3：v2 运行时、以及**版本未知**（fail-closed）都不注册定时任务。
         if self._enabled and self._seedgroup_enabled and self._seedgroup_cron \
-                and mp_version_supported(_mp_version()):
+                and mp_runtime_gate()[0]:
             # 保种组是独立任务：MP「任务」页里能单独看它跑没跑、单独设周期
             services.append({
                 "id": "ColaSeedGroup",
@@ -3791,12 +4102,22 @@ class ColaSeedGroup(_PluginBase):
 
     @staticmethod
     def _mp_version_warning() -> str:
-        """v2 运行时的那一行警告；支持 v3 时返回空串。"""
-        version = _mp_version()
-        if mp_version_supported(version):
+        """版本闸门的那一行警告；能跑时返回空串。
+
+        两句话分开说：**版本未知**是「暂停自动任务」（fail-closed，探测不到就不动手），
+        **v2** 是「不支持」。0.6.0 对版本未知放行，于是在 MP v2 容器 / 元数据缺失的镜像里
+        照样注册 cron 并真去执行任务单。
+        """
+        allowed, reason = mp_runtime_gate()
+        if allowed:
             return ""
         need = ".".join(str(part) for part in MP_MIN_VERSION)
-        return (f"⚠️ 检测到 MoviePilot {version or '2.x'}：本插件 0.6.0 只支持 v3（>={need}），"
+        version = _mp_version()
+        if not mp_version_tuple(version):
+            return (f"⚠️ {reason}（探测不到 MoviePilot 运行时版本）。"
+                    f"本插件只支持 v3（>={need}）：确认 MoviePilot 版本正常后重启它，"
+                    f"再保存一次插件配置即可恢复执行站点任务单。")
+        return (f"⚠️ 检测到 MoviePilot {version}：本插件只支持 v3（>={need}），"
                 f"不会注册定时任务；升级 MoviePilot 后自动开始执行站点任务单。")
 
     def get_page(self) -> Optional[List[dict]]:
@@ -3993,14 +4314,15 @@ class ColaSeedGroup(_PluginBase):
                         {"component": "VCol", "props": {"cols": 12, "sm": 12, "md": 6}, "content": [
                             {"component": "VSelect", "props": {"model": "seedgroup_prune_mode",
                                                               "label": "下架清理", "persistent-hint": True,
-                             "hint": "每轮回站点核对 status/official", "items": [
+                             "hint": "每轮回站点核对 status/official；连文件与否由「任务单删种」三档决定", "items": [
                                 {"title": "只删种子，保留文件（默认）", "value": "seed"},
                                 {"title": "种子和文件一起删", "value": "files"},
                                 {"title": "不清理", "value": "off"}]}}]},
                         {"component": "VCol", "props": {"cols": 12, "sm": 12, "md": 6}, "content": [
                             {"component": "VSelect", "props": {"model": "seedgroup_delete_mode",
                                                               "label": "任务单删种", "persistent-hint": True,
-                             "hint": "只删站点任务单 remove 里列出的种子，别的一律不动",
+                             "hint": "唯一删除闸门：同时约束任务单 remove、本地轮换与下架清理"
+                                     "（keep 一律不删，torrent_only 只删种，torrent_and_files 才连文件删）",
                              "items": [{"title": SEED_GROUP_DELETE_LABELS[k], "value": k}
                                        for k in SEED_GROUP_DELETE_MODES]}}]},
                     ]},
@@ -4015,11 +4337,11 @@ class ColaSeedGroup(_PluginBase):
                                         "全站档位要到池子 80% 才轮换；池子已保全时不删。"}}]},
                         {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                             {"component": "VSwitch", "props": {"model": "seedgroup_rotate_files",
-                             "label": "轮换时连文件一起删",
+                             "label": "轮换时连文件一起删（旧开关）",
                              "persistent-hint": True,
-                             "hint": "勾上：删的种子连本地文件一起删，省盘。"
-                                     "不勾：只删种子、保留文件，以后想再做种不用重下。"
-                                     "用于腾出空间给别人补种，不影响你已完成的下载量"}}]},
+                             "hint": "0.6.1 起不参与判断：文件删不删统一由「任务单删种」三档决定"
+                                     "（keep 一律不删、torrent_only 只删种、torrent_and_files 才连文件删）。"
+                                     "留这个开关只为老配置能读回来"}}]},
                     ]},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [

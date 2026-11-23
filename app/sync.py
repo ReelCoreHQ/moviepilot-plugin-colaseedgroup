@@ -28,6 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugins.v2" / "
 
 import __init__ as _plugin
 
+# 独立版不是 MoviePilot：插件探测不到 MP 版本时会 fail-closed（0.6.1 起「版本未知」= 暂停自动任务、
+# 不注册任务），独立版压根没有 MP 版本可探测 —— 这里显式声明运行时形态，别让版本闸门把独立版一起停掉。
+_plugin.MP_RUNTIME = "standalone"
+
 #: 独立版支持的配置键。与插件 get_form 的 model 一一对应，
 #: 去掉辅种专用项（direction / sites_* / iyuu_* / max_per_hour …）。
 CONFIG_KEYS = (
