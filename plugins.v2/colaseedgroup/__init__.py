@@ -1225,6 +1225,45 @@ class TransmissionClient(_Client):
         logger.warn(f"Transmission ({self.name}) 添加种子失败：{rsp}")
         return "fail"
 
+#: 失败原因的中文说法，面板与日志共用（未知码原样显示）。
+SEED_GROUP_FETCH_LABELS = {
+    "net": "网络/超时",
+    "http_5xx": "站点 5xx",
+    "http_4xx": "站点拒绝",
+    "no_url": "无下载地址",
+    "empty_body": "种子内容异常",
+    "no_id": "候选缺 id",
+    "download": "下载失败",
+    "rotated": "轮换冷却",
+    "rotate-fail": "轮换失败",
+}
+
+
+def seed_group_fetch_label(reason: str) -> str:
+    return SEED_GROUP_FETCH_LABELS.get(str(reason or ""), str(reason or "未知"))
+
+
+class _SeedGroupFetchError(RuntimeError):
+    """取种子失败，带一个可判定的原因码。
+
+    为什么要分原因：以前一律 return b""，上层只能记成 "download" —— 那是 7 天退避。
+    于是一次 502、一次超时就把这颗种子锁一个星期，缺口补不回来。
+    现在：网络/站点临时故障只退避几分钟（下一轮正好重试），只有确定的坏种/4xx 才长期跳过。
+    """
+
+    #: 下一轮就该重试的原因（不怪这颗种子）
+    TRANSIENT = ("net", "http_5xx", "no_url", "empty_body")
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = str(reason or "net")
+        self.detail = str(detail or "")[:120]
+
+    @property
+    def transient(self) -> bool:
+        return self.reason in self.TRANSIENT
+
+
 
 class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
@@ -1521,26 +1560,33 @@ class ColaSeedGroup(_PluginBase):
             files.append((path, int(item.get("size") or 0)))
         return _content_key(files)
     def _download_cola(self, torrent_id: int) -> bytes:
-        """取可乐的种子：createDownloadLink 签一条 30 分钟的直链，再不带任何凭据 GET 它。"""
+        """取可乐的种子：createDownloadLink 签一条 30 分钟的直链，再不带任何凭据 GET 它。
+
+        失败一律抛 `_SeedGroupFetchError` 并带上原因码：调用方据此决定「下一轮就重试」
+        还是「这颗确实拿不到，先放几天」。
+        """
         rsp = self._cola("POST", COLA_DOWNLOAD_LINK_API.format(id=int(torrent_id)), json_body={})
-        if rsp is None or rsp.status_code not in (200, 201):
-            status = rsp.status_code if rsp is not None else "无响应"
-            logger.warn(f"可乐PT 申请下载链接失败（种子 {torrent_id}）：{status}")
-            return b""
+        if rsp is None:
+            raise _SeedGroupFetchError("net", "申请下载链接无响应")
+        if rsp.status_code in (429,) or rsp.status_code >= 500:
+            raise _SeedGroupFetchError("http_5xx", f"申请下载链接 HTTP {rsp.status_code}")
+        if rsp.status_code not in (200, 201):
+            raise _SeedGroupFetchError("http_4xx", f"申请下载链接 HTTP {rsp.status_code}")
         url = str((rsp.json({}) or {}).get("download_url") or "")
         if not url.startswith("http"):
-            logger.warn(f"可乐PT 下载地址响应缺少 download_url（种子 {torrent_id}）")
-            return b""
+            raise _SeedGroupFetchError("no_url", "响应缺少 download_url")
         try:
             # 签名直链本身就是凭据：不带 X-API-Key，免得 Key 跟着 30 分钟的链接出现在别处的日志里
             got = _curl("GET", url, timeout=REQUEST_TIMEOUT)
         except Exception as err:
-            logger.error(f"可乐PT 取种子失败（{torrent_id}）：{err}")
-            return b""
+            raise _SeedGroupFetchError("net", f"直链请求异常：{type(err).__name__}") from err
+        if got.status_code == 429 or got.status_code >= 500:
+            raise _SeedGroupFetchError("http_5xx", f"直链 HTTP {got.status_code}")
         if got.status_code != 200:
-            logger.warn(f"可乐PT 取种子返回 {got.status_code}（{torrent_id}）")
-            return b""
-        return got.content if _valid_torrent(got.content) else b""
+            raise _SeedGroupFetchError("http_4xx", f"直链 HTTP {got.status_code}")
+        if not _valid_torrent(got.content):
+            raise _SeedGroupFetchError("empty_body", "直链内容不是合法种子")
+        return got.content
     @staticmethod
     def _split_line(line: str) -> List[str]:
         return [p.strip() for p in re.split(r"[,，]", line.strip()) if p.strip()]
@@ -2994,14 +3040,16 @@ class ColaSeedGroup(_PluginBase):
         return merged, total, source
 
     def _sg_download(self, item: Dict[str, Any]) -> bytes:
-        """拿种子字节：按 torrent_id 走 createDownloadLink。"""
+        """拿种子字节：按 torrent_id 走 createDownloadLink；失败抛带原因码的异常。"""
         torrent_id = item.get("torrent_id") or item.get("id")
-        if torrent_id:
-            try:
-                return self._download_cola(int(torrent_id))
-            except Exception as err:
-                logger.warn(f"保种组按 id 下载失败（{torrent_id}）：{err}")
-        return b""
+        if not torrent_id:
+            raise _SeedGroupFetchError("no_id", "候选缺 torrent_id")
+        try:
+            return self._download_cola(int(torrent_id))
+        except _SeedGroupFetchError:
+            raise
+        except Exception as err:      # 未预期的异常也算网络类：下一轮重试
+            raise _SeedGroupFetchError("net", f"{type(err).__name__}: {err}") from err
 
     # 读不到某台客户端时，最多沿用多久之前的那次读数（秒）。
     #
@@ -3135,7 +3183,7 @@ class ColaSeedGroup(_PluginBase):
           qB 丢种），记录就不成立了，因此只给 1 天，让它自然失效而不是拖 7 天；
         · 其余（坏种）：7 天。
         """
-        if reason in ("net", "error"):
+        if reason in ("net", "error") or reason in _SeedGroupFetchError.TRANSIENT:
             return self.SG_SKIP_TTL_NET
         if reason == "dup":
             return self.SG_SKIP_TTL_DUP
@@ -3164,13 +3212,20 @@ class ColaSeedGroup(_PluginBase):
             self.save_data("seedgroup_skip", fresh)
         return fresh
 
-    def _sg_mark_skip(self, item: Dict[str, Any], reason: str) -> None:
+    def _sg_mark_skip(self, item: Dict[str, Any], reason: str, detail: str = "") -> None:
+        """记一条跳过。带 detail 与失败次数，面板和日志能说清「为什么跳过」。"""
         key = _seed_group_key(item)
         if not key:
             return
         now = int(time.time())
         skips = self._sg_skips()
-        skips[key] = {"at": now, "reason": reason, "ttl": self._sg_skip_ttl(reason)}
+        prev = skips.get(key) or {}
+        try:
+            fails = int(prev.get("fails") or 0) + 1
+        except Exception:
+            fails = 1
+        skips[key] = {"at": now, "reason": reason, "ttl": self._sg_skip_ttl(reason),
+                      "detail": str(detail or "")[:120], "fails": fails}
         self.save_data("seedgroup_skip", skips)
 
     def _sg_add_with_retry(self, client: "_Client", data: bytes, info_hash: str) -> Tuple[Optional[str], Optional[Exception]]:
@@ -3589,14 +3644,26 @@ class ColaSeedGroup(_PluginBase):
         added = duplicate = failed = 0
         rate_limited = 0
         added_gib = 0.0
+        fail_reasons: Dict[str, int] = {}
         for item in picked:
             if self._event.is_set():
                 break
             if added or failed:
                 time.sleep(self.SG_DOWNLOAD_GAP)
-            data = self._sg_download(item)
-            if not data:
+            try:
+                data = self._sg_download(item)
+            except _SeedGroupFetchError as err:
                 failed += 1
+                fail_reasons[err.reason] = fail_reasons.get(err.reason, 0) + 1
+                self._sg_mark_skip(item, err.reason, err.detail)
+                wait = "下一轮重试" if err.transient else f"{self._sg_skip_ttl(err.reason) // 3600} 小时后重试"
+                logger.warn(f"保种组取种子失败（{item.get('torrent_id')}）：{seed_group_fetch_label(err.reason)} "
+                            f"{err.detail}；{wait}")
+                continue
+            if not data:
+                # 兼容旧调用（测试或外部注入）返回空字节的情况：按网络类短退避，下一轮就回来。
+                failed += 1
+                fail_reasons["download"] = fail_reasons.get("download", 0) + 1
                 self._sg_mark_skip(item, "download")
                 continue
             # 两条资源池通道都可能不带 info_hash：以真正拿到的 .torrent 为准算一遍，
@@ -3670,13 +3737,16 @@ class ColaSeedGroup(_PluginBase):
             prev_covered = 0.0
         state.update({"activated": True, "picked": len(picked), "planned_gib": planned_gib,
                       "added": added, "duplicate": duplicate, "failed": failed,
+                      "fail_reasons": {seed_group_fetch_label(k): v for k, v in sorted(fail_reasons.items())},
                       "added_gib": round(added_gib, 3), "covered_gib": covered,
                       "clients_offline": offline_now,
                       "prev_covered_gib": round(prev_covered, 3),
                       "shortfall_gib": max(0.0, round(target - covered, 3))})
         if state["shortfall_gib"] > 0 and not state["reason"]:
+            why = "、".join(f"{seed_group_fetch_label(k)}×{v}" for k, v in sorted(fail_reasons.items()))
             state["reason"] = (f"实际覆盖还差 {state['shortfall_gib']} GiB"
-                               f"（池子可挑 {round(planned_gib, 1)} GiB，失败 {failed} 条）")
+                               f"（池子可挑 {round(planned_gib, 1)} GiB，失败 {failed} 条"
+                               + (f"：{why}" if why else "") + "）")
         if blind:
             state["reason"] = (state["reason"] + "；" if state["reason"] else "") + \
                               f"{blind} 个下载器本轮读不到，体积沿用上次读数"
