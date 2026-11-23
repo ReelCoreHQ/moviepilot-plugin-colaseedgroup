@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import support  # noqa: E402
+import support
 
 SG_MOD = support.load_seedgroup_plugin()  # 本仓库只有保种组一个插件
 # 测试不联网：QBittorrentClient 构造时会去登录配置里的地址（不少用例写的是真实 IP，

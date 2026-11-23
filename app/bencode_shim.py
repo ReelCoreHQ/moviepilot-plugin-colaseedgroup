@@ -40,7 +40,7 @@ def bdecode(data: bytes) -> Any:
     try:
         value, _ = _decode(data, 0)
         return value
-    except Exception as err:  # noqa: BLE001 - 与 bencode 库同样的宽口径
+    except Exception as err:
         raise BencodeError(str(err)) from err
 
 

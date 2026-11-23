@@ -1,3 +1,9 @@
+# ruff: noqa: UP006, UP031, UP035, UP045, RUF012, RUF013, RUF046, B905, SIM105, SIM108, SIM114, PERF401, RUF059, RUF005
+# 整文件豁免以上规则，理由：
+#   UP006/UP035/UP045  保留 typing 别名（旧版 MoviePilot 运行环境与类型注释引用）
+#   UP031                   保留 % 格式化，同上
+#   RUF012                  类属性上的 dict/list 是常量表（插件单例，不跨实例共享）
+#   RUF013/046/B905/SIM105/SIM108/PERF401/RUF059/RUF005 风格偏好，不改逻辑
 """
 可乐保种组（MoviePilot 插件）
 
@@ -891,7 +897,7 @@ class QBittorrentClient(_Client):
     def _list(self, filter_: str) -> List[Dict[str, Any]]:
         try:
             out: List[Dict[str, Any]] = []
-            for page in range(0, 40):           # 40 页 × 500 = 2 万条，够任何人的库
+            for page in range( 40):           # 40 页 × 500 = 2 万条，够任何人的库
                 batch = self._list_page(page, filter_)
                 if not batch:
                     break

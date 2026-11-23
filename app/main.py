@@ -15,10 +15,10 @@ import threading
 import time
 from pathlib import Path
 
+import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-import requests
 
 from .sync import CONFIG_KEYS, DEFAULTS, PLUGIN_VERSION, Syncer
 
@@ -214,7 +214,7 @@ def _scheduler() -> None:
                 res = syncer.run_once()
                 log.info("同步完成 ok=%s %s", res.ok, res.message)
                 next_at = now + interval
-        except Exception as err:  # noqa: BLE001 - 调度线程不能死
+        except Exception as err:
             log.error("调度异常：%s", err)
         time.sleep(30)
 
