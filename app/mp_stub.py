@@ -85,7 +85,7 @@ def install() -> None:
         _module("apscheduler.triggers")
     if "bencode" not in sys.modules:
         try:
-            import bencode  # noqa: F401
+            import bencode  # noqa: F401  # 只为探测依赖是否存在
         except ImportError:
             # 站点镜像里不一定装 bencode：用自带的纯 Python 实现顶上。
             from . import bencode_shim
