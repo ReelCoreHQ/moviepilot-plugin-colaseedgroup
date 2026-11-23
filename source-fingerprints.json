@@ -159,6 +159,15 @@
       "commit": "b42489bdb72ee970185585eaa4ab97c36fb2e179",
       "reports_fingerprint": true,
       "tags": []
+    },
+    {
+      "version": "0.5.5",
+      "source_sha256": "cdc2acfe039530133cbfe38a1aabaf02cdebc0b7e0631b1e736b17ff34dc1698",
+      "commit": "0d4a4090aae437fd1392ff0dea2d8e2949309721",
+      "reports_fingerprint": true,
+      "tags": [
+        "v0.5.5"
+      ]
     }
   ]
 }
