@@ -23,12 +23,13 @@ import json
 import re
 import subprocess
 import time
-from urllib.parse import urlencode, urljoin
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping, Sequence
 from datetime import datetime
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode, urljoin
 
 import requests
 from apscheduler.triggers.cron import CronTrigger
@@ -642,10 +643,52 @@ def _content_key(files: List[Tuple[str, int]]) -> str:
     return hashlib.sha1(raw.encode("utf-8", "surrogateescape")).hexdigest()
 
 
+def _read_field(row: Any, *keys: str) -> Any:
+    """读取字典或 SDK 对象字段，保留合法的 0 和 False。"""
+    for key in keys:
+        value = row.get(key) if isinstance(row, Mapping) else getattr(row, key, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _torrent_progress(value: Any, scale: int = 1) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        progress = float(value) / scale
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return progress if 0 <= progress <= 1 else None
+
+
+def _qb_speed_limits(info: Any) -> Dict[str, Any]:
+    dl = _read_field(info, "dl_rate_limit")
+    up = _read_field(info, "up_rate_limit")
+    if type(dl) is not int or type(up) is not int or min(dl, up) < -1:
+        return {}
+    # 低于 1 KiB/s 的非零限速仍需在整数契约中表示为已限速。
+    return {"dl_kib": max(1, dl // 1024) if dl > 0 else 0,
+            "up_kib": max(1, up // 1024) if up > 0 else 0,
+            "dl_enabled": dl > 0, "up_enabled": up > 0}
+
+
+def _tr_speed_limits(session: Any) -> Dict[str, Any]:
+    dl = _read_field(session, "speed_limit_down", "speed-limit-down")
+    up = _read_field(session, "speed_limit_up", "speed-limit-up")
+    dl_enabled = _read_field(session, "speed_limit_down_enabled", "speed-limit-down-enabled")
+    up_enabled = _read_field(session, "speed_limit_up_enabled", "speed-limit-up-enabled")
+    if (type(dl) is not int or type(up) is not int or min(dl, up) < 0
+            or not isinstance(dl_enabled, bool) or not isinstance(up_enabled, bool)):
+        return {}
+    return {"dl_kib": dl, "up_kib": up, "dl_enabled": dl_enabled, "up_enabled": up_enabled}
+
+
 class _Client:
     """下载器的最小接口：列出已完成种子、添加种子。"""
 
     name = ""
+    kind = "qb"
 
     def list_completed(self) -> List[Dict[str, Any]]:
         raise NotImplementedError
@@ -668,107 +711,13 @@ class _Client:
         """
         raise NotImplementedError
 
-    def inflight(self) -> int:
-        """MP 通道：数进度没满的种子（0.10.57 之前落基类返回 -1，限流完全失效）。"""
-        if self._list_all is None:
-            return -1
-        try:
-            rows = self._list_all() or []
-        except Exception:
-            return -1
-        n = 0
-        for t in rows:
-            try:
-                if float(t.get("progress") or 0) < 1:
-                    n += 1
-            except (TypeError, ValueError):
-                continue
-        return n
-
-    def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
-        """MP 通道删除（0.10.57 之前恒 False，下架清理一直空转）。"""
-        if not self._delete or not hashes:
-            return False
-        ok_all = True
-        for h in hashes:
-            try:
-                try:
-                    self._delete(h, delete_files)
-                except TypeError:
-                    self._delete(h)
-            except Exception as err:
-                logger.warn(f"{self.name} 删除失败 {h[:12]}：{err}")
-                ok_all = False
-        return ok_all
-
-    def inflight(self) -> int:
-        """数「进度没满」的种子。之前落基类返回 -1（=不限制），进种限流对 MP 模式完全失效。"""
-        if self._list_all is None:
-            return -1
-        try:
-            rows = self._list_all() or []
-        except Exception:
-            return -1
-        n = 0
-        for t in rows:
-            try:
-                if float(t.get("progress") or 0) < 1:
-                    n += 1
-            except (TypeError, ValueError):
-                continue
-        return n
-
-    def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
-        """删除。之前落基类恒 False —— 下架清理在 MP 模式下一直空转。"""
-        if not self._delete or not hashes:
-            return False
-        ok_all = True
-        for h in hashes:
-            try:
-                try:
-                    self._delete(h, delete_files)
-                except TypeError:
-                    self._delete(h)
-            except Exception as err:
-                logger.warn(f"{self.name} 删除失败 {h[:12]}：{err}")
-                ok_all = False
-        return ok_all
-
     def list_all(self) -> List[Dict[str, Any]]:
-        """列出全部种子（含未下完）。
-
-        下架清理必须用它。MP 通道注入的是 `_list_all`（返回全部），直接用它；
-        没有就退化为 list_completed（该客户端列不出未完成的种子）。
-        """
-        injected = getattr(self, "_list_all", None)
-        if injected is not None:
-            try:
-                return injected() or []
-            except Exception:
-                pass
+        """没有全量接口的下载器只列出已完成的任务。"""
         return self.list_completed()
 
-    def add_tags(self, hashes: List[str], tags: List[str]) -> bool:
-        """补标签。MP 各版本方法名不统一，只认构造方注入的；没有就降级 False。"""
-        if not hashes or not tags or not self._tag:
-            return False
-        try:
-            self._tag(hashes, ",".join(tags))
-            return True
-        except Exception as err:
-            logger.warn(f"{self.name} 补标签失败：{err}")
-            return False
-
-    def recheck(self, hashes: List[str]) -> int:
-        """重新校验。同上，注入才生效。"""
-        if not hashes or not self._recheck:
-            return 0
-        try:
-            self._recheck(hashes)
-            return len(hashes)
-        except Exception as err:
-            logger.warn(f"{self.name} 重新校验失败：{err}")
-            return 0
+    def get_speed_limits(self) -> Dict[str, Any]:
+        """没有可信的读数时返回空字典。"""
+        return {}
 
     def has(self, info_hash: str) -> bool:
         """客户端里是否已有这个 info_hash；不知道时返回 False。"""
@@ -836,27 +785,10 @@ class QBittorrentClient(_Client):
             logger.error(f"qBittorrent ({self.name}) 连接失败：{err}")
 
     def get_speed_limits(self) -> Dict[str, Any]:
-        """读取客户端当前的限速设置（不管插件有没有配）。
-
-        返回 {dl_kib, up_kib, dl_enabled, up_enabled}；不支持/读不到返回 {}。
-        """
-        return {}
-
-    def get_speed_limits(self) -> Dict[str, Any]:
-        """qB：preferences 里的 dl_limit / up_limit 是字节/秒，0 = 不限。"""
-        try:
-            rsp = self._session.get(f"{self.url}/api/v2/app/preferences", timeout=REQUEST_TIMEOUT)
-            if rsp.status_code != 200:
-                logger.warn(f"qBittorrent ({self.name}) 读限速返回 {rsp.status_code}")
-                return {}
-            prefs = rsp.json() or {}
-            dl = int(prefs.get("dl_limit") or 0)
-            up = int(prefs.get("up_limit") or 0)
-            return {"dl_kib": dl // 1024, "up_kib": up // 1024,
-                    "dl_enabled": dl > 0, "up_enabled": up > 0, "raw": {"dl": dl, "up": up}}
-        except Exception as err:
-            logger.warn(f"qBittorrent ({self.name}) 读限速异常：{err}")
-            return {}
+        """qB transfer/info 给出当前生效的限速（字节/秒），包括备用速度模式。"""
+        rsp = self._session.get(f"{self.url}/api/v2/transfer/info", timeout=REQUEST_TIMEOUT)
+        rsp.raise_for_status()
+        return _qb_speed_limits(rsp.json())
 
     def set_speed_limits(self, dl_kib: int, up_kib: int) -> bool:
         """qB：app/setPreferences 的 dl_limit / up_limit，单位是 **字节/秒**，0 = 不限。"""
@@ -971,6 +903,7 @@ class QBittorrentClient(_Client):
                         # 算「最早那颗做了多久」。以前没带上，于是 seeded_secs 永远是 0，
                         # 站点按 covered>50 判定会一直报 zero_seeded（2026-11-21 查实）。
                         "added_on": item.get("added_on") or 0,
+                        "progress": item.get("progress"),
                         "name": item.get("name") or "",
                         "save_path": item.get("save_path") or item.get("content_path") or "",
                         "category": item.get("category") or "",
@@ -1172,6 +1105,8 @@ class QBittorrentClient(_Client):
 
 
 class TransmissionClient(_Client):
+    kind = "tr"
+
     def __init__(self, name: str, url: str, username: str = "", password: str = ""):
         self.name = name
         self.url = (url or "").rstrip("/")
@@ -1183,16 +1118,11 @@ class TransmissionClient(_Client):
         self._session_id = ""
 
     def get_speed_limits(self) -> Dict[str, Any]:
-        """TR：session-get 的 speed-limit-down/up（KB/s）+ 各自的 enabled。"""
+        """TR session-get 分别返回普通限速的速率和启用状态。"""
         out = self._rpc({"method": "session-get", "arguments": {}})
-        if not out:
+        if not isinstance(out, Mapping) or out.get("result") != "success":
             return {}
-        args = out.get("arguments") or {}
-        dl = int(args.get("speed-limit-down") or 0)
-        up = int(args.get("speed-limit-up") or 0)
-        return {"dl_kib": dl, "up_kib": up,
-                "dl_enabled": bool(args.get("speed-limit-down-enabled")),
-                "up_enabled": bool(args.get("speed-limit-up-enabled"))}
+        return _tr_speed_limits(out.get("arguments"))
 
     def set_speed_limits(self, dl_kib: int, up_kib: int) -> bool:
         """TR：session-set 的 speed-limit-*，单位就是 KB/s，另需 *_enabled=true。"""
@@ -1258,6 +1188,7 @@ class TransmissionClient(_Client):
             out.append({
                 "hash": (item.get("hashString") or "").lower(),
                 "added_on": item.get("addedDate") or 0,
+                "progress": item.get("percentDone"),
                 "name": item.get("name") or "",
                 "save_path": item.get("downloadDir") or "",
                 "category": ",".join(item.get("labels") or []),
@@ -1299,7 +1230,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_name = "可乐保种组"
     plugin_desc = "可乐PT 保种组：把站点官方种按档位搬进下载器长期保种（体积只超不少、达标后动态轮换、下架自动清理、多客户端单独限速），每轮向站点上报。"
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.5.4"
+    plugin_version = "0.5.5"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
@@ -1377,6 +1308,8 @@ class ColaSeedGroup(_PluginBase):
     _seedgroup_report = True
     _seedgroup_report_url = "https://www.colapt.com/api/v1/plugin/seed-group/report"
     _seedgroup_report_token = ""
+    # 配置重载不替换运行锁，手动同步可把已取得的锁交给后台线程释放。
+    _seedgroup_run_lock = Lock()
     _event = Event()
     # host -> 可用的 pieces-hash 路径（憨憨是 /nexusapi/pieces-hash，其余多为 /api/pieces-hash）；"" 表示不支持
     _pieces_paths: Dict[str, str] = {}
@@ -1837,31 +1770,31 @@ class ColaSeedGroup(_PluginBase):
                     preferred[info_hash] = wanted
         return preferred
 
-    def _mp_clients(self) -> List[_Client]:
-        """枚举 MoviePilot「设置 → 下载器」里的**每一个**实例。
-
-        以前只取 `Qbittorrent()` / `Transmission()` 这两个默认实例，多下载器用户
-        只会看到其中一台（issue #7）。MP v3 暴露了 DownloaderHelper，按名字列出
-        所有已启用实例，一台一个适配器。
-        """
-        out: List[_Client] = []
+    def _mp_clients(self) -> Optional[List[_Client]]:
+        """按配置名包装 MoviePilot 已启用的下载器实例。"""
         try:
             from app.application.downloader import DownloaderHelper
+        except ImportError:
+            # 仅没有服务目录的老版本走默认实例兼容分支。
+            return None
+        try:
             services = DownloaderHelper().get_services() or {}
         except Exception as err:
-            logger.info(f"MoviePilot 多下载器接口不可用（{type(err).__name__}: {err}），退回单实例模式")
+            logger.info(f"MoviePilot 下载器目录暂不可用（{type(err).__name__}）")
             return []
+        out: List[_Client] = []
         for name, info in services.items():
+            # v3 的 ServiceInfo.instance 是具体的 Qbittorrent/Transmission，module 才是路由模块。
             instance = getattr(info, "instance", None)
-            if instance is None:
+            kind = getattr(info, "type", None)
+            if not name or kind not in ("qbittorrent", "transmission"):
                 continue
-            if not (hasattr(instance, "get_completed_torrents") and hasattr(instance, "add_torrent")):
+            if not (callable(getattr(instance, "get_completed_torrents", None))
+                    and callable(getattr(instance, "add_torrent", None))):
                 continue
             label = f"MP-{name}"
-            out.append(_MPClient(label, instance.get_completed_torrents, instance.add_torrent,
-                                 getattr(instance, "delete_torrent", None),
-                                 getattr(instance, "get_torrents", None)))
-            logger.info(f"MoviePilot 下载器已接入：{label}（{getattr(info, 'type', '?')}）")
+            out.append(_MPClient.from_instance(label, instance, "tr" if kind == "transmission" else "qb"))
+            logger.info(f"MoviePilot 下载器已接入：{label}（{kind}）")
         return out
 
     def _clients(self, use_mp: Optional[bool] = None, lines: Optional[str] = None) -> List[_Client]:
@@ -1871,19 +1804,17 @@ class ColaSeedGroup(_PluginBase):
         out: List[_Client] = []
         if mp_allowed:
             mp_clients = self._mp_clients()
-            if mp_clients:
+            if mp_clients is not None:
                 out.extend(mp_clients)
             else:
-                # 老版本 MP 或组合根未就绪：退回「默认那个 qB/TR」的老写法
+                # 旧版 MP 没有服务目录时，沿用默认 qB/TR 兼容路径。
                 try:
                     from app.modules.qbittorrent import Qbittorrent
                     qb = Qbittorrent()
                     if qb.is_inactive():
                         logger.info("MoviePilot 的 qBittorrent 未启用")
                     else:
-                        out.append(_MPClient("MP-QB", qb.get_completed_torrents, qb.add_torrent,
-                                             getattr(qb, "delete_torrent", None),
-                                             getattr(qb, "get_torrents", None)))
+                        out.append(_MPClient.from_instance("MP-QB", qb, "qb"))
                 except Exception as err:
                     # 新版 MP 的 Qbittorrent() 写法变过（实例化后没有 _host 等私有属性），
                     # 这条只在「用 MP 下载器」那条路上才有意义。保种组填了自定义下载器时
@@ -1895,8 +1826,7 @@ class ColaSeedGroup(_PluginBase):
                     if tr.is_inactive():
                         logger.info("MoviePilot 的 Transmission 未启用")
                     else:
-                        out.append(_MPClient("MP-TR", tr.get_completed_torrents, tr.add_torrent,
-                                             getattr(tr, "delete_torrent", None)))
+                        out.append(_MPClient.from_instance("MP-TR", tr, "tr"))
                 except Exception as err:
                     logger.info(f"读取 MoviePilot Transmission 失败（仅在用 MP 下载器时需要）：{err}")
         line_clients = self._parse_client_lines(line_text)
@@ -1919,30 +1849,24 @@ class ColaSeedGroup(_PluginBase):
         return out
 
     def _collect_speed_limits(self, clients: List[_Client]) -> List[Dict[str, Any]]:
-        """采集每台客户端**当前**的限速设置（不管插件有没有配、有没有接管）。"""
-        # 站点契约的 SeedGroupClientLimit 是 additionalProperties:false、整数、1–32 条：
-        # 读不到的客户端只把 readable 置 false、数值记 0（「不限速」），**不塞 error 之类的额外字段**，
-        # 否则一台读不到会让整份上报 400 —— 那就成了「没上报」，而不是「照实上报没限速」。
+        """按站点七字段契约采集读数。readable=false 时 0 只是占位。"""
         rows: List[Dict[str, Any]] = []
         for client in clients[:32]:
             row: Dict[str, Any] = {"client": str(client.name)[:128],
-                                   "kind": "tr" if isinstance(client, TransmissionClient) else "qb",
+                                   "kind": getattr(client, "kind", "qb"),
                                    "dl_kib": 0, "up_kib": 0,
                                    "dl_enabled": False, "up_enabled": False, "readable": False}
             try:
-                data = client.get_speed_limits() or {}
+                data = client.get_speed_limits()
             except Exception as err:
-                logger.warn(f"读取限速失败（{client.name}）：{type(err).__name__}: {err}")
+                logger.warn(f"读取限速失败（{client.name}）：{type(err).__name__}")
                 data = {}
-            if data:
-                for key in ("dl_kib", "up_kib"):
-                    try:
-                        row[key] = max(0, int(data.get(key) or 0))
-                    except Exception:
-                        row[key] = 0
-                for key in ("dl_enabled", "up_enabled"):
-                    row[key] = bool(data.get(key))
-                row["readable"] = True
+            if isinstance(data, Mapping):
+                dl, up = data.get("dl_kib"), data.get("up_kib")
+                dl_enabled, up_enabled = data.get("dl_enabled"), data.get("up_enabled")
+                if (type(dl) is int and type(up) is int and min(dl, up) >= 0
+                        and isinstance(dl_enabled, bool) and isinstance(up_enabled, bool)):
+                    row.update(dl_kib=dl, up_kib=up, dl_enabled=dl_enabled, up_enabled=up_enabled, readable=True)
             rows.append(row)
         return rows
 
@@ -2865,7 +2789,7 @@ class ColaSeedGroup(_PluginBase):
           由 MP 自己的规则接管（这就是「默认通过 MP 强制刮削」）；
         - 「保种组自定义下载器」每行一台 qB/TR（地址,用户名,密码；TR 写 tr,…），只作用于
           保种组，辅种那套客户端不受影响；
-        - 两者都空 → 回落辅种的客户端列表，不让人白开一个跑不动的功能。
+        - 没有可用下载器或找不到指定的名称时，本轮不操作下载器。
         """
         lines = (self._seedgroup_clients_lines or "").strip()
         out: List[_Client] = []
@@ -2894,8 +2818,8 @@ class ColaSeedGroup(_PluginBase):
             named = [c for c in out if c.name == target]
             if named:
                 return named
-            logger.warn(f"保种组指定的下载器 `{target}` 不存在，改用第一台")
-            return out[:1]
+            logger.warn(f"保种组指定的下载器 `{target}` 不可用，本轮跳过")
+            return []
         return out
 
 
@@ -3306,9 +3230,14 @@ class ColaSeedGroup(_PluginBase):
             items = dict(sorted(items.items(), key=lambda kv: str((kv[1] or {}).get("at") or ""))[-20000:])
         self.save_data("seedgroup_items", items)
 
-    def seed_group_prune(self, **kwargs) -> Dict[str, Any]:
-        """把「站点已下架 / 撤掉官方标记」的种子从本地删掉（colabot1 的 prune 那一步）。"""
-        return self._sg_prune()
+    def seed_group_prune(self) -> Dict[str, Any]:
+        """手动清理已下架的种子，同步或清理在跑时立即返回。"""
+        if not self._seedgroup_run_lock.acquire(blocking=False):
+            return self._sg_busy()
+        try:
+            return self._sg_prune()
+        finally:
+            self._seedgroup_run_lock.release()
 
     def _sg_oldest_seeded_secs(self, clients: List[_Client]) -> int:
         """保种组这批种子里，最早加进来的那颗在客户端里做了多久（秒）。"""
@@ -3399,16 +3328,10 @@ class ColaSeedGroup(_PluginBase):
                 if not drop:
                     out["kept"] += 1
                     continue
-                # 文件删不删：
-                #   · 配「种子和文件一起删」→ 删；
-                #   · 配「只删种子保留文件」→ 已下完(progress>=99.9%)才留文件；
-                #   · **没下完的一律连文件删**：站点都撤了，本地那点残缺文件既做不了种、
-                #     又永远补不齐，留着只占盘（老板 2026-11-22 明确要求）。
-                try:
-                    progress = float(torrent.get("progress") or 0)
-                except Exception:
-                    progress = 0.0
-                incomplete = progress < 0.999
+                # 已确认下架：按配置删除文件，或在确认未下完时清掉残缺文件。
+                # 进度未知时，seed 模式只删种子任务，保留文件。
+                progress = _torrent_progress(torrent.get("progress"))
+                incomplete = progress is not None and progress < 0.999
                 drop_files = bool(self._seedgroup_prune_files) or incomplete
                 try:
                     deleted = client.delete([info_hash], delete_files=drop_files)
@@ -3424,10 +3347,15 @@ class ColaSeedGroup(_PluginBase):
                 items.pop(info_hash, None)
                 # 同上：删了就清跳过记录，否则下架的种子被重新上架后永远加不回来
                 self._sg_unmark_skip(record)
-                why = ("未下完，连残缺文件一起删" if incomplete and not self._seedgroup_prune_files
-                       else ("已下完，按配置连文件删" if drop_files else "已下完，保留文件"))
+                if self._seedgroup_prune_files:
+                    why = "按配置连文件删"
+                elif incomplete:
+                    why = "未下完，连残缺文件一起删"
+                else:
+                    why = "保留文件"
+                progress_text = "未知" if progress is None else f"{progress:.0%}"
                 logger.info(f"保种组清理：{client.name} 删除 {info_hash[:12]}"
-                            f"（torrent_id={torrent_id}，progress={progress*100:.0f}%，{why}）")
+                            f"（torrent_id={torrent_id}，progress={progress_text}，{why}）")
         self.save_data("seedgroup_items", items)
         self.save_data("seedgroup_prune", out)
         logger.info(f"保种组清理完成：检查 {out['checked']}，删除 {out['removed']}，保留 {out['kept']}，"
@@ -3450,32 +3378,36 @@ class ColaSeedGroup(_PluginBase):
             "api_key": "present" if self._api_key else "missing",
         }
 
-    def seed_group_run_once(self, **kwargs) -> Dict[str, Any]:
-        """立即跑一轮保种组同步 —— 设置页那个「立即运行一次」按钮。
+    @staticmethod
+    def _sg_busy() -> Dict[str, Any]:
+        return {"ok": False, "busy": True, "message": "保种组已有任务正在运行，请稍后再试"}
 
-        # 为什么要后台线程
-
-        MoviePilot 调用 action 时是**同步等返回**的，而一轮保种组同步可能跑几十秒
-        （拉官方池、按 qB 现状比对、加种、上报）。等它跑完再返回，设置页会一直转圈，
-        前端超时后还会显示「执行失败」—— 明明任务在跑。
-
-        所以这里只是**起一个线程**再立刻返回，把真实结果留给面板上的状态区去读
-        （`seed_group_status`）。用户点一下就等到「已开始」，不用盯着转圈。
-
-        # 与定时任务的关系
-
-        它直接调 `seed_group_sync()`，也就是和 cron 走同一条路 —— 不会出现
-        「手动跑的结果和定时跑的不一样」。并发跑两轮的风险由 `_sg_lock` 之类挡住，
-        这里不额外加锁。
-        """
+    def seed_group_run_once(self) -> Dict[str, Any]:
+        """启动后台同步，真实结果由保种组状态接口读取。"""
+        if not self._seedgroup_run_lock.acquire(blocking=False):
+            return self._sg_busy()
         if not self._seedgroup_enabled:
+            self._seedgroup_run_lock.release()
             return {"ok": False, "message": "保种组没启用，先在设置里打开「启用保种组」"}
-        thread = threading.Thread(target=self.seed_group_sync, name="colaseedgroup-manual", daemon=True)
-        thread.start()
+        try:
+            Thread(target=self._sg_run_locked_sync, name="colaseedgroup-manual", daemon=True).start()
+        except Exception as err:
+            self._seedgroup_run_lock.release()
+            logger.error(f"保种组同步线程启动失败：{type(err).__name__}: {err}")
+            return {"ok": False, "message": "保种组同步线程启动失败，请查看日志"}
         return {"ok": True, "message": "已开始，结果见下方「保种组状态」（约 30 秒后刷新）"}
 
-    def seed_group_sync(self):
-        """保种组任务入口：任何异常只记日志 + 通知，不让 MoviePilot 报「执行失败」。"""
+    def seed_group_sync(self) -> Optional[Dict[str, Any]]:
+        """定时同步，占用时跳过本轮。"""
+        if not self._seedgroup_run_lock.acquire(blocking=False):
+            busy = self._sg_busy()
+            logger.info(busy["message"])
+            return busy
+        self._sg_run_locked_sync()
+        return None
+
+    def _sg_run_locked_sync(self) -> None:
+        """执行已取得运行锁的一轮同步，保留原有异常日志、上报和通知。"""
         try:
             self._seed_group_sync()
         except Exception as err:
@@ -3497,6 +3429,8 @@ class ColaSeedGroup(_PluginBase):
                                   text=f"{type(err).__name__}: {err}\n下一轮会重新开始，详细栈见 MoviePilot 日志。")
             except Exception:
                 pass
+        finally:
+            self._seedgroup_run_lock.release()
 
     def _seed_group_sync(self):
         if not self._seedgroup_enabled:
@@ -3835,10 +3769,10 @@ class ColaSeedGroup(_PluginBase):
             },
             {
                 "path": "/seedgroup/sync",
-                "endpoint": self.seed_group_sync,
+                "endpoint": self.seed_group_run_once,
                 "methods": ["POST"],
-                "summary": "立即同步一次保种组",
-                "description": "按当前档位把官方资源池补齐到体积下限（只超不少），缺口会如实报出",
+                "summary": "启动一次保种组同步",
+                "description": "后台按当前档位同步，立即返回启动结果。进度和缺口见 /seedgroup/status。",
             },
                                     {
                 "path": "/seedgroup/rotate",
@@ -4059,50 +3993,111 @@ class ColaSeedGroup(_PluginBase):
 
 
 class _MPClient(_Client):
-    """把 MoviePilot 的下载器模块包成统一接口。"""
+    """归一 MoviePilot 具体下载器的返回值，供保种组各入口共用。"""
 
-    def __init__(self, name: str, list_func, add_func, delete_func=None, list_all_func=None):
+    def __init__(self, name: str, list_func, add_func, delete_func=None, list_all_func=None,
+                 *, kind: str = "qb", speed_func=None):
         self.name = name
+        self.kind = kind
         self._list = list_func
         self._add = add_func
         self._list_all = list_all_func
         self._delete = delete_func
+        self._speed = speed_func
+        self._hash_cache = None
+
+    @classmethod
+    def from_instance(cls, name: str, instance: Any, kind: str) -> "_MPClient":
+        # 保留具体实例的路由和认证。模块级 list_torrents 会把失败的实例跳过，丢失错误标志。
+        return cls(name, instance.get_completed_torrents, instance.add_torrent,
+                   delete_func=getattr(instance, "delete_torrents", None),
+                   list_all_func=getattr(instance, "get_torrents", None), kind=kind,
+                   speed_func=getattr(instance, "get_session" if kind == "tr" else "transfer_info", None))
+
+    def _torrent_rows(self, result: Any) -> List[Dict[str, Any]]:
+        # MP v3 get_torrents() 返回 (TorrentInfoList 或 list[Torrent], error)。
+        # error=True 和 None 都是读取失败，只有实际空列表才是成功读 0 条。
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], bool):
+            result, failed = result
+            if failed:
+                raise RuntimeError(f"MP 下载器 {self.name} 返回种子列表读取失败")
+        if isinstance(result, Mapping):
+            result = result.get("torrents")
+        else:
+            result = getattr(result, "root", result)
+        if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):
+            raise RuntimeError(f"MP 下载器 {self.name} 未返回有效的种子列表")
+        rows: List[Dict[str, Any]] = []
+        for torrent in result:
+            info_hash = str(_read_field(torrent, "hash", "hashString", "hash_string") or "").strip().lower()
+            if not info_hash:
+                continue
+            tags = _read_field(torrent, "tags", "labels", "tag")
+            if isinstance(tags, (list, tuple)):
+                tags = ",".join(str(tag) for tag in tags)
+            added = _read_field(torrent, "added_on", "added_date", "addedDate")
+            if isinstance(added, datetime):
+                added = int(added.timestamp())
+            fields = getattr(torrent, "fields", None) if self.kind == "tr" else None
+            if isinstance(fields, Mapping):
+                # SDK 会把布尔值转成数字或在进度缺失时抛错
+                progress = _torrent_progress(fields.get("percentDone"))
+            else:
+                fraction = _read_field(torrent, "percent_done", "percentDone")
+                if fraction is not None:
+                    progress = _torrent_progress(fraction)
+                else:
+                    # TR 对象的 progress 用百分数表示
+                    tr_object = self.kind == "tr" and not isinstance(torrent, Mapping)
+                    progress = _torrent_progress(
+                        _read_field(torrent, "progress"), 100 if tr_object else 1,
+                    )
+            rows.append({
+                "hash": info_hash, "name": _read_field(torrent, "name", "title") or "",
+                "save_path": _read_field(torrent, "save_path", "download_dir", "downloadDir") or "",
+                "category": _read_field(torrent, "category") or "",
+                "size": _read_field(torrent, "size", "total_size", "totalSize", "size_when_done") or 0,
+                "state": str(_read_field(torrent, "state", "status") or ""), "tags": str(tags or ""),
+                "added_on": added or 0, "progress": progress,
+                "torrent_id": _read_field(torrent, "torrent_id"), "auto_tmm": bool(_read_field(torrent, "auto_tmm")),
+            })
+        return rows
 
     def list_completed(self) -> List[Dict[str, Any]]:
-        out = []
+        return self._torrent_rows(self._list())
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        if self._list_all is None:
+            return self.list_completed()
+        return self._torrent_rows(self._list_all())
+
+    def inflight(self) -> int:
+        if self._list_all is None:
+            return -1
         try:
-            for torrent in self._list() or []:
-                # qBittorrent 模块给的是 dict，Transmission 给的是对象，这里统一。
-                if isinstance(torrent, dict):
-                    hash_str = torrent.get("hash") or torrent.get("hashString") or ""
-                    name = torrent.get("name") or ""
-                    save_path = torrent.get("save_path") or torrent.get("download_dir") or ""
-                    category = torrent.get("category") or ""
-                    size = torrent.get("size") or torrent.get("total_size") or 0
-                    tags = torrent.get("tags") or torrent.get("tag") or ""
-                else:
-                    hash_str = getattr(torrent, "hash", None) or getattr(torrent, "hashString", "") or ""
-                    name = getattr(torrent, "name", "") or ""
-                    save_path = getattr(torrent, "save_path", "") or getattr(torrent, "download_dir", "") or ""
-                    category = getattr(torrent, "category", "") or ""
-                    size = getattr(torrent, "size", 0) or 0
-                    tags = getattr(torrent, "tags", "") or getattr(torrent, "tag", "") or ""
-                state = torrent.get("state", "") if isinstance(torrent, dict) else getattr(torrent, "state", "")
-                if not hash_str:
-                    continue
-                if isinstance(tags, (list, tuple)):
-                    tags = ",".join(str(t) for t in tags)
-                added = (torrent.get("added_on") if isinstance(torrent, dict)
-                         else getattr(torrent, "added_on", 0)) or 0
-                out.append({"hash": str(hash_str).lower(), "name": name,
-                            "added_on": added,
-                            "save_path": save_path, "category": category, "size": size,
-                            "tags": str(tags or ""), "state": str(state or "")})
+            rows = self.list_all()
         except Exception as err:
-            logger.error(f"MP 下载器 {self.name} 读取失败：{err}")
-            # 与其他两条链路一致：读失败就抛，别让上层把它当成「客户端里一颗都没有」。
-            raise
-        return out
+            logger.warn(f"MP 下载器 {self.name} 读取下载队列失败：{type(err).__name__}")
+            return -1
+        # 仅统计进度已确认的未完成任务
+        return sum(
+            1 for row in rows if row["progress"] is not None and row["progress"] < 1
+        )
+
+    def get_speed_limits(self) -> Dict[str, Any]:
+        if self._speed is None:
+            return {}
+        # MP 的 get_speed_limit() 在 RPC 异常时回填 0，不能用来判断真的不限速。
+        result = self._speed()
+        return _tr_speed_limits(result) if self.kind == "tr" else _qb_speed_limits(result)
+
+    def delete(self, hashes: List[str], delete_files: bool = False) -> bool:
+        if self._delete is None or not hashes:
+            return False
+        deleted = self._delete(ids=hashes, delete_file=delete_files) is True
+        if deleted:
+            self._hash_cache = None
+        return deleted
 
     def has(self, info_hash: str) -> bool:
         """MP 客户端没有现成的「有没有这颗」接口，用扫描结果做一次短缓存。
@@ -4117,7 +4112,7 @@ class _MPClient(_Client):
         cached = getattr(self, "_hash_cache", None)
         if cached is None or time.time() - getattr(self, "_hash_cache_at", 0) > 30:
             try:
-                cached = {t.get("hash") for t in self.list_completed() if t.get("hash")}
+                cached = {t["hash"] for t in self.list_all()}
             except Exception as err:
                 logger.warn(f"MP 下载器 {self.name} 读不到种子列表，本轮按「没有」处理：{err}")
                 return False
@@ -4126,18 +4121,17 @@ class _MPClient(_Client):
 
     def add(self, torrent: bytes, save_path: str, skip_check: bool, label: str = "",
             hash_hint: str = "", category: str = "", auto_tmm: bool = False) -> str:
-        """MP 的下载器模块把多余参数透传给 qB/TR，这里必须显式要求「跳过校验」和标签。
-
-        之前只传了 content/download_dir —— 于是「跳过校验」形同虚设（每次都要重校验），
-        标签也全丢（补进来的种子在 qB 里是「无标签」）。
-        """
+        """按 MP 具体客户端的签名添加并保留保种标签。"""
         kwargs: Dict[str, Any] = {"content": torrent, "download_dir": save_path}
-        kwargs["skip_checking"] = bool(skip_check)
-        if label:
-            kwargs["tag"] = label
-        if category:
-            # 分类单独传，别混进标签；qB 开着自动管理时路径由它决定（issue #23）
-            kwargs["category"] = category
+        if self.kind == "tr":
+            if label:
+                kwargs["labels"] = [label]
+        else:
+            kwargs["is_skip_checking"] = bool(skip_check)
+            if label:
+                kwargs["tag"] = label
+            if category:
+                kwargs["category"] = category
         try:
             res = self._add(**kwargs)
         except TypeError:
