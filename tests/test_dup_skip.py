@@ -1,4 +1,7 @@
-import unittest, sys, pathlib
+import pathlib
+import sys
+import unittest
+
 sys.path.insert(0, str(pathlib.Path("tests").resolve()))
 import support
 

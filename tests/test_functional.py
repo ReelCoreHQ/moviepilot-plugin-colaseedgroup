@@ -5,10 +5,8 @@
 分页拉取、列表读失败必须抛出、seeded_secs 计算。
 """
 
-import hashlib
 import json
 import os
-import re
 import sys
 import time
 import unittest
@@ -435,7 +433,6 @@ class SeedGroupDownloadQuotaTest(unittest.TestCase):
     def test_unreadable_inflight_does_not_block(self):
         plugin, client = self._plugin(inflight=-1, limit=5)
         plugin.seed_group_sync()
-        state = plugin.get_data("seedgroup_state") or {}
         self.assertGreater(len(client.added), 0, "读不到队列时不能把保种卡死")
 
 
@@ -699,7 +696,7 @@ class PruneSafetyTest(unittest.TestCase):
         self.assertEqual(out["removed"], 0)
 
     def test_mp_client_without_delete_reports_failure(self):
-        plugin = self._plugin()
+        self._plugin()
         mp = SG_MOD._MPClient("MP-x", lambda: [], lambda **kw: (True, []), None)
         self.assertFalse(mp.delete(["deadbeef"]))
 
@@ -1709,7 +1706,7 @@ class ListFailureMustNotLookEmptyTest(unittest.TestCase):
 
     def test_qb_list_failure_raises_instead_of_returning_empty(self):
         import requests
-        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
 
         class _Boom:
             def get(self, *a, **k):

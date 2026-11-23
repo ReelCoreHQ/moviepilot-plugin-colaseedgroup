@@ -1,7 +1,7 @@
 """拆出来的「可乐保种组」插件：结构与身份。"""
 import json
-from pathlib import Path
 import unittest
+from pathlib import Path
 
 import support
 

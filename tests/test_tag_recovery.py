@@ -1,6 +1,10 @@
-import sys, pathlib, unittest
+import pathlib
+import sys
+import unittest
+
 sys.path.insert(0, str(pathlib.Path("tests").resolve()))
 import support
+
 SG_MOD = support.load_seedgroup_plugin()
 
 
@@ -22,7 +26,6 @@ class MissingFilesBoundaryTest(unittest.TestCase):
             def add_tags(self, h, t): return False      # 补标签失败
         # 直接验证分支语义：tagged=False 时不写 skip
         item = {"torrent_id": 1, "info_hash": "a"*40}
-        tag = getattr(SG_MOD, "SEED_GROUP_TAG", "可乐保种组")
         # 模拟：补标签失败 → 不 mark_skip
         recorded = []
         p._sg_mark_skip = lambda it, r: recorded.append(r)
