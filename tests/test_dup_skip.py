@@ -139,14 +139,14 @@ class MissingFilesIsRecheckedNotDeletedTest(unittest.TestCase):
     真正要删的是「站点已下架」的那些，归 _sg_prune 管。
     """
 
-    def test_sync_rechecks_missing_files(self):
-        import pathlib
-        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
-        idx = src.find("丢失文件自检")
-        self.assertGreater(idx, -1, "必须有丢失文件自检")
-        seg = src[idx:idx + 1200]
-        self.assertIn("tagged_missing", seg)
-        self.assertIn("recheck", seg, "应重新校验让它重下，而不是删种")
+    def test_cycle_rechecks_missing_files(self):
+        """丢失文件自检仍在（0.6.0 从同步主流程改成独立方法，行为不变）。"""
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_recheck_missing)
+        self.assertIn("tagged_missing", src)
+        self.assertIn("recheck", src, "应重新校验让它重下，而不是删种")
+        cycle = inspect.getsource(SG_MOD.ColaSeedGroup.seed_group_tasks_cycle)
+        self.assertIn("_sg_recheck_missing", cycle, "每轮主流程必须调用它")
 
     def test_sync_no_longer_deletes_missing_files(self):
         import pathlib

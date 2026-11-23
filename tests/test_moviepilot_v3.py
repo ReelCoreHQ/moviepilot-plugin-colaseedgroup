@@ -152,7 +152,11 @@ class MoviePilotV3Test(unittest.TestCase):
             SG_MOD, cls_name="ColaSeedGroup", _enabled=True, _notify=False,
             _seedgroup_enabled=True, _seedgroup_use_mp_clients=True,
             _seedgroup_target_client="MP-misc", _seedgroup_prune_mode="seed",
+            _seedgroup_max_downloading=0, _live_report=True,
         )
+        # 插件侧已经有票据：任务单/限速上报都走模块级 _curl（setUp 里已换成「不该发请求」）
+        self.plugin._plugin_credentials = lambda: ("rcapi_ticket", "signing-key")
+        self.plugin.SG_DOWNLOAD_GAP = 0
 
     def _register(self, name, instance, kind="qbittorrent"):
         self.services[name] = SimpleNamespace(
@@ -176,16 +180,17 @@ class MoviePilotV3Test(unittest.TestCase):
             torrent_row("a", progress=1), torrent_row("b", progress=0.5),
         ]))
         p = self.plugin
-        p._api_key = True  # 只过存在性检查。资源池和下载都使用本地夹具。
+        p._api_key = True  # 只过存在性检查。任务单和下载都使用本地夹具。
         p._seedgroup_prune = False
         p._seedgroup_skip_check = True
         data = support.make_torrent()
-        p._sg_candidates = lambda: [
-            {"torrent_id": 1, "info_hash": "a" * 40,
-             "size": SG_MOD.GIB, "size_gib": 1, "official": True},
-            {"torrent_id": 2, "info_hash": support.info_hash_of(data),
-             "size": SG_MOD.GIB, "size_gib": 1, "official": True},
-        ]
+        p._seed_group_tasks = lambda tier, custom=None: {
+            "revision": "9f2c0a7d13be55a1", "target_gib": 2.0, "covered_gib": 2.0,
+            "shortfall_gib": 0.0,
+            "add": [{"torrent_id": 2, "info_hash": support.info_hash_of(data),
+                     "size_gib": 1.0, "reason": "cold"}],
+            "remove": [],
+        }
         p._sg_download = lambda item: data
         connectivity = p._test_clients()
         self.assertEqual(len(connectivity), 1)
@@ -195,12 +200,13 @@ class MoviePilotV3Test(unittest.TestCase):
         p.get_service()[0]["func"]()
 
         state = p.get_data("seedgroup_state") or {}
-        expected = {
-            "current_gib": 1.0, "covered_gib": 2.0, "downloading": 1, "added": 1,
-        }
+        expected = {"mode": "tasks", "add_count": 1, "remove_count": 0,
+                    "added": 1, "failed": 0, "removed": 0,
+                    "target_gib": 2.0, "covered_gib": 2.0, "shortfall_gib": 0.0}
         self.assertEqual({key: state.get(key) for key in expected}, expected)
         self.assertEqual(chosen.added, [(SG_MOD.SEED_GROUP_TAG, True)])
         self.assertEqual(other.added, [])
+        self.assertEqual(p.get_data("tasks_revision"), "9f2c0a7d13be55a1")
 
     def test_missing_progress_keeps_known_downloads_in_sync_quota(self):
         chosen = self._register("misc", FakeQbittorrent([
@@ -213,16 +219,18 @@ class MoviePilotV3Test(unittest.TestCase):
         p._seedgroup_prune = False
         p._seedgroup_max_downloading = 1
         data = support.make_torrent()
-        p._sg_candidates = lambda: [{
-            "torrent_id": 1, "info_hash": support.info_hash_of(data),
-            "size": SG_MOD.GIB, "size_gib": 1, "official": True,
-        }]
+        p._seed_group_tasks = lambda tier, custom=None: {
+            "revision": "r1", "target_gib": 1.0, "covered_gib": 1.0, "shortfall_gib": 0.0,
+            "add": [{"torrent_id": 1, "info_hash": support.info_hash_of(data),
+                     "size_gib": 1.0, "reason": "fill"}],
+            "remove": [],
+        }
         p._sg_download = Mock(return_value=data)
 
         p.get_service()[0]["func"]()
 
         state = p.get_data("seedgroup_state") or {}
-        expected = {"downloading": 1, "download_quota": 0, "added": 0}
+        expected = {"downloading": 1, "download_quota": 0, "added": 0, "add_count": 1}
         self.assertEqual({key: state.get(key) for key in expected}, expected)
         client, = p._sg_clients()
         self.assertEqual(client.inflight(), 1)
@@ -318,7 +326,7 @@ class MoviePilotV3Test(unittest.TestCase):
         ])
         self.assertEqual(self.plugin.get_data("seedgroup_items"), {})
 
-    def test_speed_report_sends_exact_snapshot_rows(self):
+    def test_limits_report_sends_exact_snapshot_rows(self):
         qb_clients = [
             self._register("misc", FakeQbittorrent(transfer={
                 "dl_rate_limit": 524288, "up_rate_limit": 262144,
@@ -343,34 +351,37 @@ class MoviePilotV3Test(unittest.TestCase):
         ), "transmission")
         p = self.plugin
         p._seedgroup_target_client = ""
-        p._seedgroup_report = True
-        p._seedgroup_report_url = "https://report.invalid/snapshot"
-        p._plugin_credentials = lambda: (True, "")
+        p._plugin_credentials = lambda: ("rcapi_ticket", "signing-key")
         p._plugin_headers = lambda *args, **kwargs: {}
 
-        with patch.object(SG_MOD, "_curl", return_value=http_json({})) as send:
-            out = p._report_seedgroup(p._sg_clients(), {})
+        with patch.object(SG_MOD, "_curl", return_value=http_json({
+                "ok": True, "throttled": True, "revision": "9f2c0a7d13be55a1"})) as send:
+            out = p._seed_group_report_limits(p._sg_clients(), "9f2c0a7d13be55a1")
 
-        def row(name, kind, dl, up, dl_enabled, up_enabled, readable):
-            return {
-                "client": f"MP-{name}", "kind": kind, "dl_kib": dl, "up_kib": up,
-                "dl_enabled": dl_enabled, "up_enabled": up_enabled,
-                "readable": readable,
-            }
+        def row(name, kind, dl, up, readable):
+            return {"client": f"MP-{name}", "kind": kind, "dl_kib": dl, "up_kib": up,
+                    "readable": readable}
 
         send.assert_called_once()
-        sent = send.call_args.kwargs["json_body"]["clients"]
+        payload = send.call_args.kwargs["json_body"]
+        sent = payload["clients"]
         self.assertTrue(out["ok"])
+        self.assertTrue(out["throttled"])
         self.assertEqual(sent, out["clients"])
-        self.assertEqual(sent, p.get_data("seedgroup_report_last")["clients"])
+        self.assertEqual(sent, p.get_data("seedgroup_limits_last")["clients"])
         self.assertEqual(sent, [
-            row("misc", "qb", 512, 256, True, True, True),
-            row("offline", "qb", 0, 0, False, False, False),
-            row("timeout", "qb", 0, 0, False, False, False),
-            row("partial", "qb", 0, 0, False, False, False),
-            row("unlimited", "qb", 0, 0, False, False, True),
-            row("tr", "tr", 768, 512, True, False, True),
+            row("misc", "qb", 512, 256, True),
+            row("offline", "qb", 0, 0, False),
+            row("timeout", "qb", 0, 0, False),
+            row("partial", "qb", 0, 0, False),
+            row("unlimited", "qb", 0, 0, True),
+            row("tr", "tr", 768, 512, True),
         ])
+        # 顶层取「读得到的那些里最紧的一台」：上传 256（qb）、下载 512（qb）
+        self.assertEqual(payload["download_limit_kib"], 512)
+        self.assertEqual(payload["upload_limit_kib"], 256)
+        self.assertEqual(payload["revision"], "9f2c0a7d13be55a1")
+        self.assertTrue(payload["instance_id"])
         tr.get_session.assert_called_once()
         for client in [*qb_clients, tr]:
             client.get_speed_limit.assert_not_called()
@@ -563,7 +574,7 @@ class MoviePilotV3Test(unittest.TestCase):
         self._withdrawn_torrents([torrent_row("a")])
         p._api_key = True
         sync = self._post_endpoint("/seedgroup/sync")
-        pause = self._pause_at("_sg_candidates", None, failure=RuntimeError("fixture"))
+        pause = self._pause_at("seed_group_tasks_cycle", None, failure=RuntimeError("fixture"))
         with patch.object(SG_MOD.logger, "error") as error, pause as (entered, _):
             result, _ = self._call_in_thread(sync)
             self.assertIs(result.result(timeout=3)["ok"], True)

@@ -304,11 +304,13 @@ if days == nil || units == nil || *days == 0 || *units == 0 {
 |---|---|---|
 | 站点凭据 | 账号密码 + 图形验证码换会话，Cookie + CSRF + Origin | 会员的开放 API Key（读取 + 下载），只带 `X-API-Key` |
 | `_sg_unlocked()` / `seed_group_identity()` | 读 `/api/v1/me` + `/users/{id}/profile` 的工作组头衔 | **删除**：插件不查头衔，考核资格由站点按上报时的身份判定 |
-| `_maybe_report()` | 检查 `staff`，payload 带 `groups` | 不检查；不再报 `groups` |
+| `_maybe_report()` | 检查 `staff`，payload 带 `groups` | **0.6.0 已删除**：改成 `_seed_group_report_limits()`，只报客户端限速读数 |
 | 领票据 | 会话换（`POST /api/v1/plugin/keys` + Cookie/CSRF） | API Key 换（同一条接口、同样的请求与响应）；票据被撤销时自动重领 |
 | 面板 | 显示"工作组状态" | 写明「考核由站点按上报身份判定」（站点回传考核进度仍待做） |
 
-**插件不改的部分**：上报链路（票据 + 签名）、覆盖统计、掉线判定、加种重试 —— 这些已经稳定。
+**插件不改的部分**：插件票据（+ 实例签名）、加种重试与退避、下架清理 —— 这些已经稳定。
+
+**0.6.0 起的变化**：覆盖统计与达标判定交给站点（`GET /plugin/seed-group/tasks` 直接给数字与加/删单），插件只执行；限速只剩只读上报（`POST /plugin/seed-group/limits`），不再写回客户端。
 
 ---
 

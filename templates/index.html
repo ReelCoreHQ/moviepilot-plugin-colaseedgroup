@@ -66,7 +66,8 @@
       <dt>档位</dt><dd id="st-tier">—</dd>
       <dt>周期</dt><dd id="st-cron">—</dd>
       <dt>最近一轮</dt><dd id="st-last">—</dd>
-      <dt>覆盖 / 目标</dt><dd id="st-cover">—</dd>
+      <dt>任务单 revision</dt><dd id="st-rev">—</dd>
+      <dt>覆盖 / 目标（站点给的）</dt><dd id="st-cover">—</dd>
       <dt>缺口</dt><dd id="st-short">—</dd>
     </dl>
     <div class="row" style="margin-top:12px">
@@ -131,6 +132,12 @@
             <option value="files">种子和文件一起删</option>
             <option value="off">不清理</option>
           </select></div>
+        <div class="field"><label>任务单删种（站点说删谁就删谁）</label>
+          <select name="seedgroup_delete_mode">
+            <option value="torrent_only">只删种子，保留文件（默认）</option>
+            <option value="torrent_and_files">种子和文件一起删</option>
+            <option value="keep">不删（只记日志）</option>
+          </select></div>
         <div class="field"><label>动态轮换：每轮删/补数量</label>
           <input name="seedgroup_rotate_count" type="number" min="1" max="50" placeholder="5"></div>
         <div class="field"><div class="switch"><input type="checkbox" name="seedgroup_skip_check" id="skip"><label for="skip">跳过校验</label></div>
@@ -140,16 +147,11 @@
     </div>
 
     <div class="card">
-      <h2>⑤-2 保种限速</h2>
-      <div class="grid">
-        <div class="field"><label>下载限速（KiB/s）</label><input name="limit_dl_kib" type="number" min="0" placeholder="0">
-          <span class="hint">0 = 不接管</span></div>
-        <div class="field"><label>上传限速（KiB/s）</label><input name="limit_up_kib" type="number" min="0" placeholder="0">
-          <span class="hint">0 = 不接管</span></div>
-        <div class="field wide"><label>每客户端单独限速</label>
-          <textarea name="limit_lines" placeholder="10.0.0.5:8081,1024,2048"></textarea>
-          <span class="hint">每行 <code>客户端名或地址,下载KiB/s,上传KiB/s</code></span></div>
-      </div>
+      <h2>⑤-2 保种限速（只读）</h2>
+      <p class="hint" style="margin:0">
+        0.6.0 起插件每轮只把客户端的限速读数报给站点（上传/下载，取多台里最紧的一台），
+        <strong>不再给客户端写限速</strong>。要限速请在下载器里自己设，站点会按读数判定。
+      </p>
     </div>
 
     <div class="row">
@@ -180,9 +182,11 @@ async function loadStatus(){
   $('#st-tier').textContent = s.tier || '—';
   $('#st-cron').textContent = s.cron || '—';
   const l = s.last;
-  if (!l){ $('#st-last').textContent = '还没跑过'; $('#st-cover').textContent='—'; $('#st-short').textContent='—'; return; }
+  if (!l){ $('#st-last').textContent = '还没跑过'; $('#st-rev').textContent='—';
+           $('#st-cover').textContent='—'; $('#st-short').textContent='—'; return; }
   const t = new Date(l.at*1000).toLocaleString();
   $('#st-last').textContent = `${t} · ${l.ok ? '成功' : '失败'} · ${l.message}`;
+  $('#st-rev').textContent = (l.revision || '—') + (l.mode === 'fallback' ? '（老站点：本地轮换）' : '');
   $('#st-cover').textContent = (l.covered_gib ?? '—') + ' / ' + (l.target_gib ?? '—') + ' GiB';
   $('#st-short').textContent = (l.shortfall_gib ?? '—') + ' GiB';
   $('#st-short').className = (l.shortfall_gib > 0) ? 'warn' : 'ok';

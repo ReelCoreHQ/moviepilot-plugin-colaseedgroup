@@ -65,93 +65,68 @@ class RotateRuleTest(unittest.TestCase):
                       "全站档必须在挑可删种子之前就返回（不轮换）")
 
 
-class RotateNotGatedOnZeroShortfallTest(unittest.TestCase):
-    """轮换与下架清理不能挂在「缺口为零」上。
+class RotateRunsWheneverTasksAreMissingTest(unittest.TestCase):
+    """轮换与下架清理不能挂在「缺口为零」上（0.6.0：压根不再算缺口）。
 
-    2026-11-22 生产实测：全站档 need 是拿 100% 池子算的（2561.325 - 2558.53 = 2.795），
-    永远 > 0，而轮换门槛其实是 80% —— 挂在 need<=0 里等于永远不轮换
-    （rotate_reason 一直是 None、rotate_date 从未写入）。下架清理也被一起关在里面。
+    老站点（没有 tasks 端点）一律走本地轮换分支：站点没给任务单时插件没有任何
+    「缺口」可依据，再拿它当闸门就等于永远不轮换、站点撤了也不清。
     """
 
-    def test_sync_rotate_not_inside_need_branch(self):
+    def _plugin(self, tasks):
+        p = support.make_plugin(SG_MOD, cls_name="ColaSeedGroup")
+        p._api_key = "rcapi_test"
+        p._seedgroup_enabled = True
+        p._seedgroup_tier = "2T"
+        p._seedgroup_custom_gib = 2048
+        p._seedgroup_prune = False
+        p._plugin_credentials = lambda: ("ticket", "secret")
+        p.update_config = lambda cfg: None
+        p.post_message = lambda **k: None
+        p._sg_clients = lambda: [support.FakeClient()]
+        p._sg_candidates = lambda: []
+        p._seed_group_tasks = lambda tier, custom=None: tasks
+        return p
+
+    def test_rotate_called_on_fallback(self):
+        p = self._plugin(None)
+        seen = {}
+
+        def rotate(clients, state, pool):
+            seen.update(target=state.get("target_gib"), pool=pool)
+            return {"dropped": 1, "added": 0, "failed": 0, "reason": "fixture"}
+
+        p._sg_rotate = rotate
+        state = p.seed_group_tasks_cycle()
+        self.assertEqual(state["mode"], "fallback")
+        self.assertEqual(seen["target"], 2048.0, "本地档位只用于本地轮换决策")
+        self.assertEqual(state["rotate_dropped"], 1)
+
+    def test_prune_runs_in_both_modes(self):
+        import inspect
+        src = inspect.getsource(SG_MOD.ColaSeedGroup.seed_group_tasks_cycle)
+        self.assertIn("_sg_prune_if_enabled", src)
+        # 两种模式之后统一调用：不该出现在 if/else 的某一支里
+        self.assertLess(src.index("_sg_local_fallback"), src.index("_sg_prune_if_enabled"))
+        self.assertFalse(hasattr(SG_MOD.ColaSeedGroup, "_report_seedgroup"),
+                         "0.6.0 不再向站点上报自算结果")
+
+
+class ReportAndFingerprintRemovedTest(unittest.TestCase):
+    """0.6.0 瘦身：自算结果上报与源码指纹链路都已删除（档案文件仍保留在仓库根）。"""
+
+    def test_report_chain_is_gone(self):
+        for name in ("_report_seedgroup", "_maybe_report", "_sg_oldest_seeded_secs",
+                     "_source_fingerprint", "_sg_on_target", "seed_group_plan"):
+            self.assertFalse(hasattr(SG_MOD.ColaSeedGroup, name)
+                             or hasattr(SG_MOD, name), f"{name} 应该已经删掉")
+
+    def test_source_has_no_report_endpoint(self):
         import pathlib
         src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
-        idx = src.find("轮换与下架清理**不挂在")
-        self.assertGreater(idx, -1, "必须有这段注释说明修复")
-        seg = src[idx:idx + 1200]
-        self.assertIn("_sg_rotate", seg)
-        self.assertIn("_sg_prune_if_enabled", seg)
-        # 关键：if need <= 0 这一块里不能再有轮换/清理调用。
-        lines = src.splitlines()
-        need_line = next(i for i, l in enumerate(lines) if l.strip() == "if need <= 0:")
-        block = []
-        for l in lines[need_line + 1:]:
-            if not l.strip():
-                continue
-            ind = len(l) - len(l.lstrip())
-            if ind <= 8:
-                break                       # 回到同级，块结束
-            block.append(l)
-        joined = "\n".join(block)
-        self.assertNotIn("_sg_rotate", joined,
-                         "轮换还在 if need<=0 块里 —— 全站档 need 永远 >0，等于永不轮换")
-        self.assertNotIn("_sg_prune_if_enabled", joined,
-                         "下架清理还在 if need<=0 块里 —— 站点撤了也不删")
-
-    def test_all_tier_checked_before_daily_gate(self):
-        """全站档判断必须在「今天已经轮换过」之前。
-
-        否则今天跑过一次（哪怕是旧逻辑跑的），明天之前都只回「今天已经轮换过」，
-        看不出这个档位本来就不该动。
-        """
-        import inspect
-        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
-        dyn_at = src.find("if dynamic:")
-        gate_at = src.find("seedgroup_rotate_date")
-        self.assertGreater(dyn_at, 0)
-        self.assertGreater(gate_at, 0)
-        self.assertLess(dyn_at, gate_at, "全站档阻挡必须在日期闸之前")
-
-    def test_all_tier_never_rotates(self):
-        """「全站官种」不轮换 —— 那个档位要的是全保，删了补不回。
-
-        老板 2026-11-22 纠正：80% 是「开始计考核」的线，不是「开始轮换」的线。
-        """
-        import inspect
-        src = inspect.getsource(SG_MOD.ColaSeedGroup._sg_rotate)
-        idx = src.find("dynamic")
-        self.assertGreater(idx, -1)
-        seg = src[idx:idx + 900]
-        self.assertIn("不做轮换", seg, "全站档必须直接返回、不进删种逻辑")
-        self.assertIn("全保", seg)
-        # 全站档分支里不该再出现 0.8 之类的旋转门槛
-        self.assertNotIn("SG_ALL_ROTATE_RATIO", seg)
-
-
-class SourceFingerprintTest(unittest.TestCase):
-    """上报源码指纹，供站点白名单校验。
-
-    2026-11-22 评审：站点所有核验都建立在插件上报的数据上，改一行代码就能绕过。
-    服务端已改成自己从 tracker 算覆盖，但客户端本身是不是官方代码仍需证据。
-    """
-
-    def test_fingerprint_is_stable_sha256(self):
-        fp = SG_MOD._source_fingerprint()
-        self.assertEqual(len(fp), 64, "应是 sha256 的 hex")
-        self.assertEqual(fp, SG_MOD._source_fingerprint(), "同一份源码多次调用必须一致")
-
-    def test_fingerprint_changes_when_source_changes(self):
-        """不同源码必须算出不同指纹 —— 这是它唯一的用途。"""
-        import hashlib
-        a = hashlib.sha256("def f(): pass".encode()).hexdigest()
-        b = hashlib.sha256("def f(): pass  # 改一行".encode()).hexdigest()
-        self.assertNotEqual(a, b)
-
-    def test_report_payload_carries_fingerprint(self):
-        import pathlib
-        src = pathlib.Path(SG_MOD.__file__).read_text("utf-8")
-        self.assertIn('"source_sha256": _source_fingerprint()', src,
-                      "payload 里必须带上指纹")
+        self.assertNotIn("/plugin/seed-group/report", src, "不再调用 report 端点")
+        self.assertNotIn("source_sha256", src, "不再上报源码指纹")
+        self.assertIn("/plugin/seed-group/tasks", src)
+        self.assertIn("/plugin/seed-group/limits", src)
 
 
 class RotateAntiFlapTest(unittest.TestCase):

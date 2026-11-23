@@ -18,9 +18,12 @@ class SplitPluginTest(unittest.TestCase):
     def test_keeps_seed_group_and_drops_crossseed(self):
         mod = support.load_seedgroup_plugin()
         cls = mod.ColaSeedGroup
-        for name in ("seed_group_sync", "_seed_group_sync", "_sg_clients", "_maybe_report"):
+        # 0.6.0：主流程换成分任务单执行，限速上报换成只统计的 limits 端点
+        for name in ("seed_group_sync", "seed_group_tasks_cycle", "_seed_group_tasks",
+                     "_seed_group_report_limits", "_sg_clients"):
             self.assertTrue(hasattr(cls, name), name)
-        for name in ("auto_seed", "_auto_seed", "_match", "_iyuu_reseed"):
+        for name in ("_seed_group_sync", "_maybe_report", "_report_seedgroup",
+                     "auto_seed", "_auto_seed", "_match", "_iyuu_reseed"):
             self.assertFalse(hasattr(cls, name), name)
 
     def test_registers_only_the_seedgroup_job(self):
