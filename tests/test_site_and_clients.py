@@ -125,13 +125,15 @@ class SiteTests(unittest.TestCase):
             with self.assertRaises(SiteError):
                 parse_assignment(body)
 
-    def test_key_not_sent_cross_origin(self):
+    def test_download_never_sends_key(self):
+        # 签名短链自带授权；Key 只有 seedgroup 范围，站点下载接口见到 Key 会按范围拒绝（403 api_key_scope_denied）
         data, _ = make_torrent("X")
         c, s = client(FakeResponse(302, headers={"Location": "https://cdn.other.example/t.torrent"}),
                       FakeResponse(200, content=data))
         self.assertEqual(c.download("/dl/x"), data)
-        self.assertIn("X-API-Key", s.calls[0][2])
+        self.assertNotIn("X-API-Key", s.calls[0][2])
         self.assertNotIn("X-API-Key", s.calls[1][2])
+        self.assertIn("X-Plugin-Instance", s.calls[0][2])
 
     def test_plain_http_cross_origin_refused(self):
         c, _ = client()

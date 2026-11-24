@@ -161,13 +161,14 @@ class SiteClient:
             headers["X-API-Key"] = self._key
         return headers
 
-    def _send(self, method: str, url: str, follow: int = 0, **kwargs) -> requests.Response:
+    def _send(self, method: str, url: str, follow: int = 0, with_key: bool = True, **kwargs) -> requests.Response:
         """发请求。重定向手动跟（最多 follow 跳），每一跳重新判断是否同源：
         X-API-Key 是自定义头，requests 跨域重定向时不会替我们去掉它。"""
         for _ in range(follow + 1):
             same_origin = _origin(url) == self._origin
             try:
-                rsp = self._http.request(method, url, headers=self._headers(same_origin), timeout=self._timeout,
+                rsp = self._http.request(method, url, headers=self._headers(with_key and same_origin),
+                                         timeout=self._timeout,
                                          allow_redirects=False, **kwargs)
             except requests.Timeout as err:
                 raise SiteError("timeout") from err
@@ -215,7 +216,8 @@ class SiteClient:
         parts = urlsplit(full)
         if _origin(full) != self._origin and parts.scheme != "https":
             raise SiteError("bad_download_url")
-        rsp = self._send("GET", full, follow=3, stream=True)
+        # 签名短链自带授权：不带 X-API-Key（Key 只有 seedgroup 范围，带上反而被下载接口按范围拒绝 403）
+        rsp = self._send("GET", full, follow=3, with_key=False, stream=True)
         try:
             self._check(rsp)
             chunks, total = [], 0
