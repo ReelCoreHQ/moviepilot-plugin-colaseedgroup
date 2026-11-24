@@ -7,7 +7,7 @@ from support import LOG, import_plugin, make_torrent
 
 pkg = import_plugin()
 from colaseedgroup.clients import AddResult, ClientError, ClientTorrent, Downloader  # noqa: E402
-from colaseedgroup.engine import Engine, Settings  # noqa: E402
+from colaseedgroup.engine import MAX_SNAPSHOT_ROWS, Engine, Settings, local_text, sort_key, summary_text  # noqa: E402
 from colaseedgroup.site import Assignment, AssignmentItem, SiteError  # noqa: E402
 
 SAVE = "/downloads/colaseedgroup"
@@ -73,8 +73,9 @@ class FakeDownloader(Downloader):
         return {"up_kib": 0, "dl_kib": 0, "alt_mode": False}
 
 
-def item(h, action, tid=1, url=None):
-    return AssignmentItem(info_hash=h, torrent_id=tid, size=1024, action=action, download_url=url or f"/d/{tid}")
+def item(h, action, tid=1, url=None, name="", reason=""):
+    return AssignmentItem(info_hash=h, torrent_id=tid, size=1024, action=action, download_url=url or f"/d/{tid}",
+                          name=name, reason=reason)
 
 
 def owned_torrent(h, name="Movie", save=SAVE, tags=(TAG,)):
@@ -354,6 +355,140 @@ class GateAndStopTests(unittest.TestCase):
         site = FakeSite(Assignment(1, "", 2048, []))
         r = engine(site, [FakeDownloader()], {}, stop=stop).run()
         self.assertEqual(r.status, "stopped")
+
+
+
+def hx(n):
+    return f"{n:040x}"
+
+
+class SnapshotTests(unittest.TestCase):
+    """每轮把全部派单逐条的本地情况写进 report.assignments（面板用）。"""
+
+    @staticmethod
+    def by_hash(report):
+        return {r["info_hash"]: r for r in report.assignments}
+
+    def test_every_local_state(self):
+        data, h_add = make_torrent("Added.Film")
+        h_own, h_dl, h_ext, h_cap, h_back, h_rm, h_rmext, h_gone = (hx(i) for i in range(1, 9))
+        dling = owned_torrent(h_dl, name="Dl.Film")
+        dling.state, dling.progress = "downloading", 0.426
+        ext = ClientTorrent(h_ext, "Ext.Film", "/elsewhere", "/elsewhere/Ext.Film", set(), 1.0, "paused")
+        rmext = ClientTorrent(h_rmext, "Mine.Film", "/elsewhere", "/elsewhere/Mine.Film", set(), 1.0, "seeding")
+        dl = FakeDownloader(torrents=[owned_torrent(h_own, "Own.Film"), dling, ext,
+                                      owned_torrent(h_rm, "Rm.Film"), rmext])
+        state = {"owned": {h: {"downloader": "qb"} for h in (h_own, h_dl, h_rm)},
+                 "backoff": {h_back: {"fails": 1, "until": 4_000_000_000, "reason": "http_404"}}}
+        items = [item(h_own, "keep", 1), item(h_dl, "keep", 2), item(h_ext, "keep", 3),
+                 item(h_add, "add", 4, "/d/4"), item(h_cap, "add", 5), item(h_back, "add", 6),
+                 item(h_rm, "remove", 7, reason="surplus"), item(h_rmext, "remove", 8), item(h_gone, "remove", 9)]
+        r = engine(FakeSite(Assignment(1, "", 2048, items), torrents={"/d/4": data}), [dl], state, max_adds=1).run()
+        rows = self.by_hash(r)
+        got = {h: (rows[h]["local"], rows[h]["detail"]) for h in rows}
+        self.assertEqual(got, {
+            h_own: ("owned", ""), h_dl: ("owned", ""), h_ext: ("external", ""), h_add: ("added", ""),
+            h_cap: ("pending", "add_cap"), h_back: ("backoff", "http_404"), h_rm: ("removed", ""),
+            h_rmext: ("not_owned", ""), h_gone: ("gone", ""),
+        })
+        clock = lambda t: "CLOCK"  # noqa: E731
+        texts = {h: local_text(rows[h], clock) for h in rows}
+        self.assertEqual(texts[h_own], "插件管理·做种中")
+        self.assertEqual(texts[h_dl], "插件管理·下载中 42%")
+        self.assertEqual(texts[h_ext], "已在下载器（非插件管理）·已暂停")
+        self.assertEqual(texts[h_add], "本轮已加")
+        self.assertEqual(texts[h_cap], "待加种（本轮已达加种上限）")
+        self.assertEqual(texts[h_back], "加种失败退避到 CLOCK")
+        self.assertEqual(texts[h_rm], "本轮已删除")
+        self.assertEqual(texts[h_rmext], "收回但不是插件加的（不删）")
+        self.assertEqual(texts[h_gone], "收回且下载器里已没有")
+        self.assertEqual((rows[h_rm]["downloader"], rows[h_rm]["reason"]), ("qb", "surplus"))
+        self.assertEqual(rows[h_ext]["downloader"], "qb")
+        self.assertEqual(rows[h_cap]["downloader"], "")
+        self.assertEqual(r.assignment_summary, {"total": 9, "managed": 3, "external": 1, "pending": 1, "backoff": 1,
+                                                "removing": 3})
+        self.assertEqual(summary_text(r.assignment_summary), "派单 9 · 插件管理 3 · 非插件管理 1 · 待加种 1 · 退避 1 · 收回 3")
+        # 可 JSON 序列化，不含下载链接
+        import json
+        blob = json.dumps(r.to_dict(), ensure_ascii=False)
+        self.assertNotIn("/d/", blob)
+
+    def test_add_failure_shows_backoff(self):
+        bad, _ = make_torrent("Other")
+        r = engine(FakeSite(Assignment(1, "", 2048, [item(H1, "add")]), torrents={"/d/1": bad}), [FakeDownloader()],
+                   {}).run()
+        row = r.assignments[0]
+        self.assertEqual((row["local"], row["detail"]), ("backoff", "hash_mismatch"))
+        self.assertGreater(row["until"], 0)
+
+    def test_remove_pending_detached_and_unknown(self):
+        mine = owned_torrent(H1, "Mine")
+        moved = owned_torrent(H2, "Moved", tags=())
+        qb = FakeDownloader(torrents=[mine, moved])
+        tr = FakeDownloader("tr", "transmission")
+        tr.fail_list = True
+        state = {"owned": {H1: {"downloader": "qb"}, H2: {"downloader": "qb"}, H3: {"downloader": "tr"}}}
+        items = [item(H1, "remove", 1), item(H2, "remove", 2), item(H3, "keep", 3)]
+        r = engine(FakeSite(Assignment(1, "", 2048, items)), [qb, tr], state).run()
+        rows = self.by_hash(r)
+        self.assertEqual((rows[H1]["local"], rows[H1]["detail"]), ("remove_pending", "remove_blocked"))
+        self.assertEqual(local_text(rows[H1], str), "插件管理·收回待删（删种闸门关闭）")
+        self.assertEqual(rows[H3]["local"], "unknown")
+        # 闸门开时：被挪走标签的视为成员接手
+        r = engine(FakeSite(Assignment(2, "", 2048, items[:2])), [FakeDownloader(torrents=[mine, moved])],
+                   {"owned": {H1: {"downloader": "qb"}, H2: {"downloader": "qb"}}}, max_deletes=0).run()
+        rows = self.by_hash(r)
+        self.assertEqual((rows[H1]["local"], rows[H1]["detail"]), ("remove_pending", "delete_cap"))
+        self.assertEqual(rows[H2]["local"], "detached")
+
+    def test_name_fallback_order(self):
+        h_site, h_client, h_none, h_hashname, h_removed = (hx(i) for i in range(11, 16))
+        dl = FakeDownloader(torrents=[
+            ClientTorrent(h_site, "Client.Name.A", "/x", "/x/a", set(), 1.0, "seeding"),
+            ClientTorrent(h_client, "Client.Name.B", "/x", "/x/b", set(), 1.0, "seeding"),
+            ClientTorrent(h_hashname, h_hashname, "/x", "/x/c", set(), 1.0, "seeding"),
+            owned_torrent(h_removed, "Removed.Name"),
+        ])
+        items = [item(h_site, "keep", 1, name="Site.Name"), item(h_client, "keep", 2),
+                 item(h_none, "keep", 3, url=""), item(h_hashname, "keep", 4, name=h_hashname),
+                 item(h_removed, "remove", 5)]
+        r = engine(FakeSite(Assignment(1, "", 2048, items)), [dl],
+                   {"owned": {h_removed: {"downloader": "qb"}}}).run()
+        names = {row["info_hash"]: row["name"] for row in r.assignments}
+        self.assertEqual(names, {h_site: "Site.Name", h_client: "Client.Name.B", h_none: "#3",
+                                 h_hashname: "#4", h_removed: "Removed.Name"})
+
+    def test_sorted_removes_problems_pending_rest(self):
+        rows = [
+            {"action": "keep", "local": "owned", "name": "a"},
+            {"action": "add", "local": "pending", "name": "b"},
+            {"action": "add", "local": "backoff", "name": "c"},
+            {"action": "remove", "local": "gone", "name": "d"},
+            {"action": "keep", "local": "owned", "status": "error", "name": "e"},
+            {"action": "keep", "local": "external", "name": "A0"},
+        ]
+        self.assertEqual([r["name"] for r in sorted(rows, key=sort_key)], ["d", "c", "e", "b", "a", "A0"])
+        data, h = make_torrent("Z")
+        items = [item(H1, "keep", 1, name="keep"), item(H2, "remove", 2, name="rm"), item(H3, "add", 3, url="", name="p")]
+        r = engine(FakeSite(Assignment(1, "", 2048, items)), [FakeDownloader(torrents=[owned_torrent(H1)])],
+                   {"owned": {H1: {"downloader": "qb"}}}).run()
+        self.assertEqual([x["name"] for x in r.assignments], ["rm", "p", "keep"])
+
+    def test_snapshot_bounded_and_absent_on_site_error(self):
+        items = [item(hx(i), "add", i, url="") for i in range(1, MAX_SNAPSHOT_ROWS + 6)]
+        r = engine(FakeSite(Assignment(1, "", 2048, items)), [FakeDownloader()], {}).run()
+        self.assertEqual(len(r.assignments), MAX_SNAPSHOT_ROWS)
+        self.assertEqual(r.assignments_truncated, 5)
+        self.assertEqual(r.assignment_summary["total"], MAX_SNAPSHOT_ROWS + 5)
+        r = engine(FakeSite(error=SiteError("http_5xx", 500)), [FakeDownloader()], {}).run()
+        self.assertIsNone(r.assignments)
+
+    def test_outdated_still_snapshots(self):
+        r = engine(FakeSite(Assignment(1, "9.9.9", 2048, [item(H1, "add"), item(H2, "remove")])),
+                   [FakeDownloader(torrents=[owned_torrent(H2)])], {"owned": {H2: {"downloader": "qb"}}}).run()
+        rows = self.by_hash(r)
+        self.assertEqual((rows[H1]["local"], rows[H1]["detail"]), ("pending", "outdated"))
+        self.assertEqual((rows[H2]["local"], rows[H2]["detail"]), ("remove_pending", "outdated"))
 
 
 if __name__ == "__main__":

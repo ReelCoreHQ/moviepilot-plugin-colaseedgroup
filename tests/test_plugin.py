@@ -140,11 +140,66 @@ class PluginTests(unittest.TestCase):
         p = make_plugin()
         p.save_data("state", {"owned": {"a" * 40: {"downloader": "qb", "torrent_id": 1, "size": 50331648, "added_at": 1},
                                         "b" * 40: {"downloader": "qb", "torrent_id": 2, "size": 67108864, "added_at": 1}}})
-        p.save_data("last_run", {"status": "ok", "capacity_gib": 2048, "items": 2, "finished_at": 1})
+        rows = [{"info_hash": "a" * 40, "torrent_id": 1, "name": "A", "size": 50331648, "action": "keep",
+                 "local": "owned", "status": "seeding", "downloader": "qb"},
+                {"info_hash": "b" * 40, "torrent_id": 2, "name": "B", "size": 67108864, "action": "keep",
+                 "local": "owned", "status": "seeding", "downloader": "qb"}]
+        p.save_data("last_run", {"status": "ok", "capacity_gib": 2048, "items": 2, "finished_at": 1,
+                                 "assignments": rows, "assignment_summary": {"total": 2, "managed": 2}})
         page = json.dumps(p.get_page(), ensure_ascii=False)
         for text in ("2 个 / 112 MiB", "48.0 MiB", "64.0 MiB", "2.0 TiB"):
             self.assertIn(text, page)
         self.assertNotIn("0.00 TiB", page)
+
+    def test_page_lists_every_assignment_without_hash_or_urls(self):
+        from colaseedgroup.engine import sort_key
+        p = make_plugin()
+        locals_ = ["owned", "added", "external", "pending", "backoff", "removed", "remove_pending", "not_owned",
+                   "detached", "gone", "unknown"]
+        rows = []
+        for i, local in enumerate(locals_, 1):
+            rows.append({"info_hash": f"{i:040x}", "torrent_id": i, "name": f"Film.{i:02d}." + "Long" * 20,
+                         "size": i * 1024 ** 3, "action": "remove" if local in ("removed", "remove_pending", "not_owned",
+                                                                            "detached", "gone") else "keep",
+                         "reason": "surplus", "local": local, "detail": "", "status": "seeding", "progress": 1.0,
+                         "downloader": "qb", "until": 1_800_000_000})
+        rows.sort(key=sort_key)
+        p.save_data("last_run", {"status": "ok", "finished_at": 1, "assignments": rows,
+                                 "assignment_summary": {"total": 11, "managed": 2, "external": 1, "pending": 1,
+                                                        "backoff": 1, "removing": 5}})
+        page = p.get_page()
+        blob = json.dumps(page, ensure_ascii=False)
+        self.assertIn("派单 11 · 插件管理 2 · 非插件管理 1 · 待加种 1 · 退避 1 · 收回 5", blob)
+        table = next(c for c in page if c["component"] == "VTable")
+        body = table["content"][1]["content"]
+        self.assertEqual([tr["content"][0]["text"] for tr in body], [r["name"] for r in rows])
+        self.assertEqual([th["text"] for th in table["content"][0]["content"][0]["content"]],
+                         ["种子名", "体积", "站点要求", "本地情况", "下载器"])
+        for want in ("插件管理·做种中", "本轮已加", "已在下载器（非插件管理）·做种中", "待加种", "加种失败退避到 ",
+                     "本轮已删除", "收回但不是插件加的（不删）", "收回且下载器里已没有", "副本超额，收回", "1.0 GiB"):
+            self.assertIn(want, blob)
+        for r in rows:
+            self.assertNotIn(r["info_hash"], blob)
+        # 唯一的链接是站点保种组页面
+        import re
+        self.assertEqual(re.findall(r"https?://[^\"]+", blob), ["https://c.example.com/account/seed-group"])
+        self.assertIn("overflow-wrap: anywhere", json.dumps(body[0]["content"][0]))
+
+    def test_full_cycle_page_shows_name_not_hash(self):
+        data, h = make_torrent("Cycle.Film")
+        body = {"revision": 1, "min_plugin_version": "0.7.0", "capacity_gib": 2048, "assigned_bytes": "10",
+                "server_time": "2026-11-24T00:00:00Z",
+                "items": [{"info_hash": h, "torrent_id": 3, "size_bytes": "10", "action": "add",
+                           "download_url": "https://c.example.com/api/v1/dl/signed-SECRETTOKEN", "reason": None}]}
+        self._session({"/assignment": Rsp(200, body), "signed-SECRETTOKEN": Rsp(200, content=data),
+                       "/state": Rsp(200, {})})
+        p = make_plugin()
+        self.assertEqual(p.run_cycle()["status"], "ok")
+        page = json.dumps(p.get_page(), ensure_ascii=False)
+        self.assertIn("Cycle.Film", page)          # 站点没给 name：用下载器里的名字
+        self.assertIn("本轮已加", page)
+        self.assertNotIn(h, page)
+        self.assertNotIn("SECRETTOKEN", page)
 
     def test_site_500_then_nothing_deleted(self):
         _, h = make_torrent("Mine")

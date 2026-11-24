@@ -9,6 +9,10 @@
 - **出错不删**：派单拉取失败 / 返回不合规 / revision 倒退或跳号 / 任一下载器列不出种子 → 本轮不删。
 - **每轮删除上限**，加种也有上限与失败退避。
 - **随时可停**：``stop`` 置位后在下一个检查点退出（重载 / 停用插件时由 stop_service 置位）。
+
+每轮结束时把**全部派单**逐条的本地情况写进 ``RunReport.assignments``（快照，面板直接显示）：
+种子名、体积、站点要求、本地情况、下载器。快照有上限、只含可 JSON 序列化的值，不含 Key 与下载链接。
+插件页与 Docker 面板共用这里的文案与排序（``local_text`` / ``action_text`` / ``summary_text``）。
 """
 
 import threading
@@ -17,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .clients import ClientError, ClientTorrent, Downloader, norm_path, path_within
-from .site import Assignment, AssignmentItem, SiteClient, SiteError, version_below
+from .site import MAX_NAME, Assignment, AssignmentItem, SiteClient, SiteError, version_below
 from .torrent import TorrentError, info_hash
 
 HARD_MAX_ADDS = 50
@@ -27,6 +31,104 @@ MAX_KIB = 1048576  # 契约里限速读数的上限
 # 下载器状态 → 契约 SeedGroupStateInput.status
 STATE_TO_CONTRACT = {"seeding": "seeding", "downloading": "downloading", "paused": "paused", "queued": "paused",
                      "checking": "checking", "error": "error", "unknown": "error"}
+
+# ---------------- 派单快照（面板用） ----------------
+MAX_SNAPSHOT_ROWS = 2000
+CLIENT_STATE_TEXT = {"seeding": "做种中", "downloading": "下载中", "paused": "已暂停", "queued": "排队中",
+                     "checking": "校验中", "error": "出错", "unknown": "状态未知"}
+ACTION_TEXT = {"keep": "保持", "add": "新派", "remove": "收回"}
+# 与站点成员页（/account/seed-group）的收回原因同一套说法
+RELEASE_TEXT = {"surplus": "副本超额，收回", "capacity": "空间调低，收回", "delisted": "种子下架",
+                "stale": "长期未做种，改派", "left_group": "已离组"}
+PENDING_TEXT = {"add_cap": "本轮已达加种上限", "no_download_url": "派单没有下载链接",
+                "outdated": "插件版本低于站点要求，本轮不加", "client_unavailable": "有下载器不可用，本轮不加"}
+REMOVE_PENDING_TEXT = {"delete_cap": "本轮已达删除上限", "remove_blocked": "删种闸门关闭", "remove_failed": "删除失败",
+                       "downloader_not_selected": "记录的下载器已不在配置里",
+                       "outdated": "插件版本低于站点要求，本轮不删"}
+# 排序：收回 → 有问题的（退避 / 出错 / 未知）→ 待加种 → 其余
+_PROBLEM = ("backoff", "unknown")
+
+
+def action_text(row: Dict[str, Any]) -> str:
+    if row.get("action") == "remove":
+        return RELEASE_TEXT.get(row.get("reason") or "", "收回")
+    return ACTION_TEXT.get(row.get("action") or "", str(row.get("action") or ""))
+
+
+def _client_state(row: Dict[str, Any]) -> str:
+    text = CLIENT_STATE_TEXT.get(row.get("status") or "", "状态未知")
+    progress = row.get("progress")
+    if row.get("status") == "downloading" and isinstance(progress, (int, float)) and progress < 1:
+        text += f" {int(progress * 100)}%"
+    return text
+
+
+def local_text(row: Dict[str, Any], fmt_time: Callable[[float], str]) -> str:
+    """快照一行的「本地情况」文案。``fmt_time`` 把时间戳格式化成本地时间（插件页与 Docker 面板各自给）。"""
+    local, detail = row.get("local"), row.get("detail") or ""
+    if local == "owned":
+        return f"插件管理·{_client_state(row)}"
+    if local == "added":
+        return "本轮已加"
+    if local == "external":
+        return f"已在下载器（非插件管理）·{_client_state(row)}"
+    if local == "pending":
+        return f"待加种（{PENDING_TEXT[detail]}）" if detail in PENDING_TEXT else "待加种"
+    if local == "backoff":
+        return f"加种失败退避到 {fmt_time(float(row.get('until') or 0))}"
+    if local == "removed":
+        return "本轮已删除"
+    if local == "remove_pending":
+        return f"插件管理·收回待删（{REMOVE_PENDING_TEXT.get(detail, detail or '下轮再删')}）"
+    if local == "not_owned":
+        return "收回但不是插件加的（不删）"
+    if local == "detached":
+        return "收回但已被你接手（不删）"
+    if local == "gone":
+        return "收回且下载器里已没有"
+    if local == "unknown":
+        return "有下载器列不出种子，本轮未知"
+    return str(local or "")
+
+
+def sort_key(row: Dict[str, Any]) -> Tuple[int, str, int]:
+    if row.get("action") == "remove":
+        group = 0
+    elif row.get("local") in _PROBLEM or row.get("status") == "error":
+        group = 1
+    elif row.get("local") == "pending":
+        group = 2
+    else:
+        group = 3
+    return group, str(row.get("name") or "").casefold(), int(row.get("torrent_id") or 0)
+
+
+def summarize(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    locals_ = [r.get("local") for r in rows]
+    return {
+        "total": len(rows),
+        "managed": sum(1 for r in rows if r.get("action") != "remove" and r.get("local") in ("owned", "added")),
+        "external": sum(1 for r in rows if r.get("action") != "remove" and r.get("local") == "external"),
+        "pending": locals_.count("pending"),
+        "backoff": locals_.count("backoff"),
+        "removing": sum(1 for r in rows if r.get("action") == "remove"),
+    }
+
+
+def summary_text(summary: Dict[str, int]) -> str:
+    s = summary or {}
+    return (f"派单 {s.get('total', 0)} · 插件管理 {s.get('managed', 0)} · 非插件管理 {s.get('external', 0)} · "
+            f"待加种 {s.get('pending', 0)} · 退避 {s.get('backoff', 0)} · 收回 {s.get('removing', 0)}")
+
+
+def display_name(item: AssignmentItem, client_names: List[str]) -> str:
+    """种子名：站点给的名字 → 下载器里的名字 → ``#种子ID``。永远不用 info_hash 当名字。"""
+    h = item.info_hash
+    for name in [item.name, *client_names]:
+        name = (name or "").strip()
+        if name and name.lower() != h:
+            return name[:MAX_NAME]
+    return f"#{item.torrent_id}"
 
 
 @dataclass
@@ -63,6 +165,10 @@ class RunReport:
     min_plugin_version: str = ""
     capacity_gib: int = 0
     items: int = 0
+    # 全部派单逐条的本地情况（见 Engine._snapshot）；本轮没拿到派单时为 None
+    assignments: Optional[List[Dict[str, Any]]] = None
+    assignment_summary: Dict[str, int] = field(default_factory=dict)
+    assignments_truncated: int = 0
     started_at: float = 0.0
     finished_at: float = 0.0
 
@@ -97,6 +203,7 @@ class Engine:
         self.stop = stop or threading.Event()
         self.log = log
         self.now = now
+        self._removed_from: Dict[str, str] = {}
 
     # ---------------- 小工具 ----------------
     def _info(self, msg: str) -> None:
@@ -176,6 +283,7 @@ class Engine:
             report.status, report.reason = "outdated", assignment.min_plugin_version
             self._warn(f"站点要求插件 ≥ {assignment.min_plugin_version}，当前 {self.plugin_version}：本轮只上报，不加不删")
             self._report(report, assignment, listings, by_name)
+            self._snapshot(report, assignment, listings, listings, failed, blocked="outdated")
             return
         report.deletes_allowed, report.delete_block = allow_deletes, block
         if not allow_deletes and block != "client_unavailable":
@@ -211,6 +319,7 @@ class Engine:
             except ClientError:
                 fresh[dl.name] = listings.get(dl.name, [])
         self._report(report, assignment, fresh, by_name)
+        self._snapshot(report, assignment, fresh, listings, failed, blocked="" if allow_adds else "client_unavailable")
         self._info(
             f"本轮完成：派单 {len(assignment.items)} 条（revision {assignment.revision}），"
             f"新加 {len(report.added)}，删除 {len(report.removed)}，跳过 {len(report.skipped)}"
@@ -265,6 +374,7 @@ class Engine:
             self._save()
             done += 1
             report.removed.append(h)
+            self._removed_from[h] = dl.name
             self._info(f"站点收回派单：已从 {dl.name} 删除 {short(h)}（种子 {item.torrent_id}，"
                        f"{'连文件' if delete_files else '只删种子'}）")
         if done >= self.settings.max_deletes and any(v == "delete_cap" for v in report.skipped.values()):
@@ -426,3 +536,67 @@ class Engine:
         except SiteError as err:
             report.state_error = err.reason if not err.code else f"{err.reason}:{err.code}"
             self._warn(f"上报下载器状态失败（{report.state_error}）")
+
+    # ---------------- 派单快照 ----------------
+    def _snapshot(self, report: RunReport, assignment: Assignment, fresh: Dict[str, List[ClientTorrent]],
+                  before: Dict[str, List[ClientTorrent]], failed: List[str], blocked: str = "") -> None:
+        """全部派单逐条的本地情况，写进 ``report.assignments``。只放显示要用的东西：
+        不放下载链接、Key、下载器地址；行数与名字长度都有上限。
+
+        ``fresh`` 是本轮对齐之后的列表（判断本地情况），``before`` 是对齐之前的（本轮删掉的种子取名用）；
+        ``blocked`` 是本轮整体不加 / 不删的原因（outdated / client_unavailable）。"""
+        where: Dict[str, List[Tuple[str, ClientTorrent]]] = {}
+        for name in sorted(fresh):
+            for t in fresh[name]:
+                where.setdefault(t.info_hash, []).append((name, t))
+        old_names: Dict[str, List[str]] = {}
+        for name in sorted(before):
+            for t in before[name]:
+                old_names.setdefault(t.info_hash, []).append(t.name)
+        backoff = self.state.get("backoff") or {}
+        rows: List[Dict[str, Any]] = []
+        for item in assignment.items:
+            h = item.info_hash
+            head = (report.skipped.get(h) or "").split(":", 1)[0]
+            rec = self.owned.get(h)
+            present = where.get(h, [])
+            mine = next(((n, t) for n, t in present if rec and n == rec.get("downloader")), None)
+            hit = mine or (present[0] if present else None)
+            row: Dict[str, Any] = {
+                "info_hash": h, "torrent_id": item.torrent_id,
+                "name": display_name(item, [t.name for _, t in present] + old_names.get(h, [])),
+                "size": item.size, "action": item.action, "reason": item.reason[:32],
+                "local": "", "detail": "", "status": "", "progress": None, "downloader": "", "until": 0,
+            }
+            if hit:
+                row.update(status=hit[1].state if hit[1].state in CLIENT_STATE_TEXT else "unknown",
+                           progress=max(0.0, min(1.0, round(float(hit[1].progress), 4))), downloader=hit[0])
+            # 记账的那台（或任一台）列不出来时，没看到 ≠ 没有
+            blind = not present and bool(failed) and (not rec or rec.get("downloader") in failed)
+            if h in report.removed:
+                row.update(local="removed", downloader=self._removed_from.get(h, ""))
+            elif item.action == "remove":
+                if mine:
+                    row.update(local="remove_pending", detail=head or blocked)
+                elif hit:
+                    row["local"] = "detached" if head == "detached" else "not_owned"
+                else:
+                    row["local"] = "unknown" if blind else "gone"
+            elif h in report.added:
+                row["local"] = "added"
+            elif mine:
+                row["local"] = "owned"
+            elif hit:
+                row["local"] = "external"
+            elif head in ("backoff", "add_failed") and h in backoff:
+                row.update(local="backoff", detail=str(backoff[h].get("reason") or "")[:32],
+                           until=int(backoff[h].get("until") or 0))
+            elif blind:
+                row["local"] = "unknown"
+            else:
+                row.update(local="pending", detail=head or blocked)
+            rows.append(row)
+        rows.sort(key=sort_key)
+        report.assignment_summary = summarize(rows)
+        report.assignments_truncated = max(0, len(rows) - MAX_SNAPSHOT_ROWS)
+        report.assignments = rows[:MAX_SNAPSHOT_ROWS]
