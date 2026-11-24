@@ -119,8 +119,11 @@ class OwnershipTests(unittest.TestCase):
         site2 = FakeSite(Assignment(2, "", 2048, [item(h, "remove")]))
         engine(site2, [dl], state).run()
         self.assertEqual(dl.removed, [])
-        # 不是本插件管理的：不报成「持有」
-        self.assertEqual(site.reports[-1]["items"], [])
+        # 不是本插件管理的：报成 external（只报事实），不报成「持有」
+        self.assertEqual(site.reports[-1]["items"],
+                         [{"info_hash": h, "status": "seeding", "progress": 1.0, "external": True}])
+        self.assertEqual(site2.reports[-1]["items"],
+                         [{"info_hash": h, "status": "seeding", "progress": 1.0, "external": True}])
 
     def test_tr_duplicate_add_not_recorded(self):
         data, h = make_torrent("Dup")
@@ -253,7 +256,7 @@ class AddTests(unittest.TestCase):
         self.assertEqual(state["last_revision"], 3)
         rep = site.reports[-1]
         self.assertEqual(set(rep), {"plugin_version", "items", "clients"})
-        self.assertEqual(rep["items"], [{"info_hash": h, "status": "downloading", "progress": 0.0}])
+        self.assertEqual(rep["items"], [{"info_hash": h, "status": "downloading", "progress": 0.0, "external": False}])
         self.assertEqual(rep["plugin_version"], "0.7.0")
         self.assertEqual(rep["clients"], [{"name": "qbittorrent#1", "readable": True, "up_kib": 0, "dl_kib": 0}])
 
@@ -305,10 +308,11 @@ class ReportShapeTests(unittest.TestCase):
         site = FakeSite(Assignment(1, "", 2048, [item(H1, "keep"), item(H2, "remove"), item(H3, "keep")]))
         engine(site, [dl, bad], state, max_deletes=0).run()
         rep = site.reports[-1]
-        self.assertEqual([i["info_hash"] for i in rep["items"]], [H1, H2])
+        # H3 带着专用标签但不在 owned 里：不是本插件加的 → external
+        self.assertEqual([(i["info_hash"], i["external"]) for i in rep["items"]], [(H1, False), (H2, False), (H3, True)])
         self.assertEqual(rep["items"][0]["status"], "paused")
         for i in rep["items"]:
-            self.assertEqual(set(i), {"info_hash", "status", "progress"})
+            self.assertEqual(set(i), {"info_hash", "status", "progress", "external"})
         self.assertEqual(rep["clients"][0], {"name": "qbittorrent#1", "readable": True, "up_kib": 1048576,
                                              "dl_kib": 5})
         self.assertEqual(rep["clients"][1], {"name": "transmission#2", "readable": False, "up_kib": 0, "dl_kib": 0})

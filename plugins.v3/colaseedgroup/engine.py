@@ -377,19 +377,36 @@ class Engine:
         return True, ""
 
     # ---------------- 上报 ----------------
+    @staticmethod
+    def _state_item(h: str, t: ClientTorrent, external: bool) -> Dict[str, Any]:
+        return {"info_hash": h, "status": STATE_TO_CONTRACT.get(t.state, "error"),
+                "progress": max(0.0, min(1.0, round(float(t.progress), 4))), "external": external}
+
     def _report(self, report: RunReport, assignment: Assignment,
                 listings: Dict[str, List[ClientTorrent]], by_name: Dict[str, Downloader]) -> None:
-        """按契约 SeedGroupStateInput 上报：只报本插件管理且仍在下载器里的种子（站点据此确认收回已完成），
-        以及每台下载器的只读限速。下载器里本来就有的同 hash 种子（不是本插件加的）不报。"""
+        """按契约 SeedGroupStateInput 上报下载器事实与每台下载器的只读限速：
+        - 本插件管理、仍在记录的那台下载器里的种子 → ``external: false``（站点据此确认收回是否已删）；
+        - 派单里的 hash 在所选下载器里有、但不是本插件加的（成员自己的同 hash 种子）→ ``external: true``，
+          只报状态与进度，插件从不加、不改标签、不删它；站点据此把它的收回记为「未由插件管理，未删除」。"""
         self._checkpoint()
         items = []
+        reported = set()
         for h, rec in sorted(self.owned.items()):
             rows = listings.get(rec.get("downloader"), [])
             t = next((x for x in rows if x.info_hash == h), None)
             if t is None:
                 continue
-            items.append({"info_hash": h, "status": STATE_TO_CONTRACT.get(t.state, "error"),
-                          "progress": max(0.0, min(1.0, round(float(t.progress), 4)))})
+            items.append(self._state_item(h, t, external=False))
+            reported.add(h)
+        for item in assignment.items:
+            h = item.info_hash
+            if h in reported:
+                continue
+            t = next((x for name in sorted(listings) for x in listings[name] if x.info_hash == h), None)
+            if t is None:
+                continue
+            items.append(self._state_item(h, t, external=True))
+            reported.add(h)
         clients = []
         for i, dl in enumerate(self.downloaders, 1):
             # 名字用「类型#序号」：不把成员给下载器起的名字（可能是内网地址）报出去
