@@ -67,6 +67,25 @@ def _host_version() -> str:
         return ""
 
 
+_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+
+
+def human_size(num: Any) -> str:
+    """字节数自动换算单位（B/KiB/MiB/GiB/TiB/PiB），页面上所有体积都走这里。"""
+    try:
+        value = float(num)
+    except (TypeError, ValueError):
+        return "-"
+    value = max(0.0, value)
+    unit = 0
+    while value >= 1024 and unit < len(_UNITS) - 1:
+        value /= 1024
+        unit += 1
+    if unit == 0:
+        return f"{int(value)} B"
+    return f"{value:.1f} {_UNITS[unit]}" if value < 100 else f"{value:.0f} {_UNITS[unit]}"
+
+
 def _int(value: Any, default: int, low: int, high: int) -> int:
     try:
         number = int(value)
@@ -323,7 +342,7 @@ class ColaSeedGroup(_PluginBase):
             rows.append({"component": "tr", "content": [
                 {"component": "td", "text": h[:12]},
                 {"component": "td", "text": str(rec.get("torrent_id") or "")},
-                {"component": "td", "text": f"{int(rec.get('size') or 0) / 1024 ** 3:.1f} GiB"},
+                {"component": "td", "text": human_size(rec.get("size") or 0)},
                 {"component": "td", "text": str(rec.get("downloader") or "")},
                 {"component": "td", "text": datetime.fromtimestamp(int(rec.get("added_at") or 0)).strftime("%m-%d %H:%M")},
             ]})
@@ -332,9 +351,9 @@ class ColaSeedGroup(_PluginBase):
                                               "class": "mb-3"}},
             {"component": "VRow", "content": [
                 stat("派单条数", last.get("items", "-")),
-                stat("本插件管理", f"{len(owned)} 个 / {total / 1024 ** 4:.2f} TiB"),
+                stat("本插件管理", f"{len(owned)} 个 / {human_size(total)}"),
                 stat("本轮新加 / 删除", f"{len(last.get('added') or [])} / {len(last.get('removed') or [])}"),
-                stat("申报空间", f"{last.get('capacity_gib', '-')} GiB"),
+                stat("申报空间", human_size(int(last["capacity_gib"]) * 1024 ** 3) if last.get("capacity_gib") else "-"),
             ]},
             {"component": "VTable", "props": {"density": "compact", "class": "mt-3"}, "content": [
                 {"component": "thead", "content": [{"component": "tr", "content": [
