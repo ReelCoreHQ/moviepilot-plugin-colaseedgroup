@@ -318,6 +318,11 @@ class PluginTests(unittest.TestCase):
     def test_form_defaults(self):
         form, defaults = make_plugin().get_form()
         self.assertEqual(defaults["save_path"], pkg.DEFAULT_SAVE_PATH)
+        self.assertEqual((defaults["interval"], defaults["max_adds"], defaults["max_deletes"]), (10, 10, 5))
+        p = make_plugin()                                   # 没填的项用新默认
+        self.assertEqual((p._interval, p._max_adds), (10, 10))
+        p = make_plugin(interval=30, max_adds=5)            # 已保存的配置保持原值
+        self.assertEqual((p._interval, p._max_adds), (30, 5))
         self.assertTrue(defaults["delete_files"])
         self.assertIn("api_key", json.dumps(form))
 

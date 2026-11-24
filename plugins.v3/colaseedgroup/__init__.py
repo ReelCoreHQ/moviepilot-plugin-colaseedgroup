@@ -43,6 +43,8 @@ KEY_PAGE = "https://www.colapt.com/account/tracker?tab=api"
 DEFAULT_TAG = "可乐保种组"
 DEFAULT_SAVE_PATH = "/downloads/colaseedgroup"
 MIN_INTERVAL = 10
+DEFAULT_INTERVAL = MIN_INTERVAL   # 默认就按最短间隔跑（站点每 10 分钟派一次单）
+DEFAULT_MAX_ADDS = 10
 SUPPORTED_TYPES = ("qbittorrent", "transmission")
 
 # 运行锁放在一个跨「插件重载」稳定的地方：重载会重新执行本模块，模块级锁会变成新对象。
@@ -271,8 +273,8 @@ class ColaSeedGroup(_PluginBase):
         self._downloaders: List[str] = []
         self._save_path = DEFAULT_SAVE_PATH
         self._tag = DEFAULT_TAG
-        self._interval = 30
-        self._max_adds = 5
+        self._interval = DEFAULT_INTERVAL
+        self._max_adds = DEFAULT_MAX_ADDS
         self._max_deletes = 5
         self._delete_files = True
         self._stop = threading.Event()
@@ -289,8 +291,8 @@ class ColaSeedGroup(_PluginBase):
         self._downloaders = [str(x) for x in (raw if isinstance(raw, list) else [raw]) if x]
         self._save_path = norm_path(str(config.get("save_path") or "")) or DEFAULT_SAVE_PATH
         self._tag = str(config.get("tag") or "").strip() or DEFAULT_TAG
-        self._interval = _int(config.get("interval"), 30, MIN_INTERVAL, 24 * 60)
-        self._max_adds = _int(config.get("max_adds"), 5, 0, HARD_MAX_ADDS)
+        self._interval = _int(config.get("interval"), DEFAULT_INTERVAL, MIN_INTERVAL, 24 * 60)
+        self._max_adds = _int(config.get("max_adds"), DEFAULT_MAX_ADDS, 0, HARD_MAX_ADDS)
         self._max_deletes = _int(config.get("max_deletes"), 5, 0, HARD_MAX_DELETES)
         self._delete_files = bool(config.get("delete_files", True))
         if not self.get_data("instance_id"):
@@ -528,8 +530,10 @@ class ColaSeedGroup(_PluginBase):
                 ]},
                 {"component": "VRow", "content": [
                     col(3, text("tag", "专用标签")),
-                    col(3, text("interval", "运行间隔（分钟）", f"最少 {MIN_INTERVAL}", type="number")),
-                    col(3, text("max_adds", "每轮最多加种", f"最多 {HARD_MAX_ADDS}", type="number")),
+                    col(3, text("interval", "运行间隔（分钟）", f"默认 {DEFAULT_INTERVAL}，最少 {MIN_INTERVAL}",
+                                    type="number")),
+                    col(3, text("max_adds", "每轮最多加种", f"默认 {DEFAULT_MAX_ADDS}，最多 {HARD_MAX_ADDS}",
+                                    type="number")),
                     col(3, text("max_deletes", "每轮最多删种", f"最多 {HARD_MAX_DELETES}", type="number")),
                 ]},
                 {"component": "VRow", "content": [
@@ -548,8 +552,8 @@ class ColaSeedGroup(_PluginBase):
         }]
         defaults = {
             "enabled": False, "onlyonce": False, "api_key": "", "site_url": DEFAULT_SITE, "downloaders": [],
-            "save_path": DEFAULT_SAVE_PATH, "tag": DEFAULT_TAG, "interval": 30, "max_adds": 5, "max_deletes": 5,
-            "delete_files": True,
+            "save_path": DEFAULT_SAVE_PATH, "tag": DEFAULT_TAG, "interval": DEFAULT_INTERVAL,
+            "max_adds": DEFAULT_MAX_ADDS, "max_deletes": 5, "delete_files": True,
         }
         return form, defaults
 
