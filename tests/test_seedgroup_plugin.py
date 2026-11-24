@@ -2,6 +2,7 @@
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import support
 
@@ -49,7 +50,7 @@ if __name__ == "__main__":
     unittest.main()
 
 class VersionConsistencyTest(unittest.TestCase):
-    """0.6.1 四处版本一致，三份清单 history 都有本批修复说明。"""
+    """四处版本一致，三份清单 history 都有当前这版的说明（跟着 plugin_version 走）。"""
 
     MANIFESTS = ("package.json", "package.v2.json", "package.v3.json")
 
@@ -65,15 +66,15 @@ class VersionConsistencyTest(unittest.TestCase):
                     mod.ColaSeedGroup.plugin_version}
         for name in self.MANIFESTS:
             versions[name] = self._entry(name)["version"]
-        self.assertEqual(set(versions.values()), {"0.6.1"}, versions)
+        self.assertEqual(set(versions.values()), {mod.ColaSeedGroup.plugin_version}, versions)
 
-    def test_three_histories_carry_the_0_6_1_note(self):
+    def test_three_histories_carry_the_current_note(self):
         notes = {}
         for name in self.MANIFESTS:
             with self.subTest(manifest=name):
                 entry = self._entry(name)
                 history = entry["history"]
-                self.assertEqual(list(history)[0], "v0.6.1",
+                self.assertEqual(list(history)[0], "v" + support.load_seedgroup_plugin().ColaSeedGroup.plugin_version,
                                  f"{name} 的 history 最新一条必须是 v0.6.1")
                 note = history["v0.6.1"]
                 for keyword in ("_seed_group_tasks", "_sg_delete_allowed", "Transmission",
@@ -95,3 +96,38 @@ class MarketManifestTest(unittest.TestCase):
         for pid, entry in v2.items():
             for key in ("name", "description", "labels", "version", "icon", "author", "level", "history"):
                 self.assertEqual(v1[pid].get(key), entry.get(key), f"{pid}.{key} 两份清单不一致")
+
+
+class RuntimeFlagGateTest(unittest.TestCase):
+    """v3 镜像不暴露版本号，只能靠 settings.VERSION_FLAG 判形态。
+
+    2026-11-24 实测：jxxghp/moviepilot-v3 上 `moviepilot` 分发不存在、
+    `app.__version__` 为 None、`settings` 没有 `VERSION` —— 0.6.1 因此 fail-closed，
+    装完能连通但 cron 一次都不跑。
+    """
+
+    def _gate(self, flag):
+        mod = support.load_seedgroup_plugin()
+        with mock.patch.object(mod, "_mp_version_flag", return_value=flag), \
+                mock.patch.object(mod, "_mp_version", return_value=""), \
+                mock.patch.object(mod, "_standalone_runtime", return_value=False):
+            return mod.mp_runtime_gate()
+
+    def test_flag_v3_passes_without_any_version_number(self):
+        allowed, reason = self._gate("v3")
+        self.assertTrue(allowed, reason)
+        self.assertEqual(reason, "")
+
+    def test_flag_v2_is_refused_with_a_reason(self):
+        allowed, reason = self._gate("v2")
+        self.assertFalse(allowed)
+        self.assertIn("只支持 v3", reason)
+
+    def test_flag_v1_is_refused(self):
+        allowed, _ = self._gate("v1")
+        self.assertFalse(allowed)
+
+    def test_no_flag_and_no_version_still_fails_closed(self):
+        allowed, reason = self._gate("")
+        self.assertFalse(allowed)
+        self.assertIn("无法判定", reason)

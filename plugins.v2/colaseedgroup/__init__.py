@@ -167,6 +167,23 @@ def _probe_mp_version() -> str:
         return ""
 
 
+def _mp_version_flag() -> str:
+    """MoviePilot 自述的运行时形态：`settings.VERSION_FLAG`（`"v3"` / `"v2"`）。
+
+    为什么需要它：v3 镜像**不暴露任何版本号** —— 没有 `moviepilot` 分发、
+    `app.__version__` 是 None、`settings` 里也没有 `VERSION` 字段（2026-11-24 在
+    jxxghp/moviepilot-v3 上实测三种探测全空）。0.6.1 的 fail-closed 于是把
+    「探测不到版本」判成「不支持」，装完能连通、定时任务却一次都不跑。
+    `VERSION_FLAG` 是这个运行时自己的权威自述，用它判形态，不用它判补丁号。
+    """
+    try:
+        from app.core.config import settings
+
+        return str(getattr(settings, "VERSION_FLAG", "") or "").strip().lower()
+    except Exception:  # 独立版/老运行时没有这个字段，按「不知道」处理
+        return ""
+
+
 def mp_version_tuple(value: Any) -> Tuple[int, ...]:
     """把 `3.1.2-beta` 这类版本串变成 (3, 1, 2)；解析不出返回空元组。"""
     numbers = re.findall(r"\d+", str(value or ""))
@@ -215,6 +232,14 @@ def mp_runtime_gate() -> Tuple[bool, str]:
       · 探测不到版本（空串）    → 不能跑（fail-closed）；仅独立版入口（`_standalone_runtime`）放行；
       · 版本 < 3.0.0（v2）      → 不能跑。
     """
+    need = ".".join(str(part) for part in MP_MIN_VERSION)
+    # 先看运行时自述的形态：v3 镜像不暴露版本号（见 `_mp_version_flag`），
+    # 没有这一步，全部 v3 部署都会因为「探测不到版本」被 fail-closed 停掉。
+    flag = _mp_version_flag()
+    if flag == "v3":
+        return True, ""
+    if flag in ("v1", "v2"):
+        return False, f"MoviePilot {flag} 不支持：本插件只支持 v3（>={need}）"
     version = _mp_version()
     if not mp_version_tuple(version):
         if _standalone_runtime():
@@ -222,7 +247,6 @@ def mp_runtime_gate() -> Tuple[bool, str]:
         return False, "无法判定 MoviePilot 版本，已暂停自动任务"
     if mp_version_supported(version):
         return True, ""
-    need = ".".join(str(part) for part in MP_MIN_VERSION)
     return False, f"MoviePilot {version} 不支持：本插件只支持 v3（>={need}）"
 
 
@@ -1465,7 +1489,7 @@ class ColaSeedGroup(_PluginBase):
     plugin_desc = ("可乐PT 保种组（只执行）：每轮拉站点任务单加种/删种，"
                    "目标体积与达标判定全在站点侧；客户端限速只读上报，不改设置。")
     plugin_icon = "https://www.colapt.com/favicon.ico"
-    plugin_version = "0.6.1"
+    plugin_version = "0.6.2"
     plugin_author = "ColaPT"
     author_url = "https://github.com/ReelCoreHQ"
     plugin_config_prefix = "colacrossseed_"
