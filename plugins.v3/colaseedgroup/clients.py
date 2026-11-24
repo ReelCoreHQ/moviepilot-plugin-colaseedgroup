@@ -1,7 +1,7 @@
 """MoviePilot 下载器实例（qBittorrent / Transmission）之上的薄适配层。
 
 只用 MoviePilot 自己的下载器模块（``DownloaderHelper`` 给出的 instance），不自己连下载器、
-不碰下载器凭据。对外只暴露对齐需要的四件事：列种子、加种、删种、读全局限速。
+不碰下载器凭据。对外只暴露对齐需要的四件事：列种子、加种、删种、读全局限速；外加面板手动操作用的恢复、重新校验、追加专用标签。
 
 **不改任何限速**：这里没有任何写限速的方法（可乐站规与别站（如馒头）规则都要求插件不碰别的种子与全局参数）。
 """
@@ -101,6 +101,17 @@ class Downloader:
     def speed_limits(self) -> Dict[str, Any]:
         raise NotImplementedError
 
+    # 面板上的手动操作：调用方（engine.Actions）已确认这颗种子归插件管理（接管时：已确认在所选下载器里）
+    def resume(self, info_hash: str) -> bool:
+        raise NotImplementedError
+
+    def recheck(self, info_hash: str) -> bool:
+        raise NotImplementedError
+
+    def add_tag(self, info_hash: str, tag: str, current: Set[str]) -> bool:
+        """追加专用标签，保留原有标签。"""
+        raise NotImplementedError
+
 
 _QB_STATES = {
     "uploading": "seeding", "stalledUP": "seeding", "forcedUP": "seeding", "queuedUP": "queued",
@@ -162,6 +173,18 @@ class QbDownloader(Downloader):
     def remove(self, info_hash: str, delete_files: bool) -> bool:
         self._qbc()
         return bool(self._mp.delete_torrents(delete_file=delete_files, ids=info_hash))
+
+    def resume(self, info_hash: str) -> bool:
+        self._qbc()
+        return bool(self._mp.start_torrents(ids=info_hash))
+
+    def recheck(self, info_hash: str) -> bool:
+        self._qbc()
+        return bool(self._mp.recheck_torrents(ids=info_hash))
+
+    def add_tag(self, info_hash: str, tag: str, current: Set[str]) -> bool:
+        self._qbc()
+        return bool(self._mp.set_torrents_tag(ids=info_hash, tags=[tag]))   # qB 的加标签本来就是追加
 
     def speed_limits(self) -> Dict[str, Any]:
         qbc = self._qbc()
@@ -256,6 +279,19 @@ class TrDownloader(Downloader):
     def remove(self, info_hash: str, delete_files: bool) -> bool:
         self._trc()
         return bool(self._mp.delete_torrents(delete_file=delete_files, ids=info_hash))
+
+    def resume(self, info_hash: str) -> bool:
+        self._trc()
+        return bool(self._mp.start_torrents(ids=info_hash))
+
+    def recheck(self, info_hash: str) -> bool:
+        self._trc()
+        return bool(self._mp.recheck_torrents(ids=info_hash))
+
+    def add_tag(self, info_hash: str, tag: str, current: Set[str]) -> bool:
+        self._trc()
+        # TR 的 labels 是整组覆盖：带上原有标签
+        return bool(self._mp.set_torrent_tag(ids=info_hash, tags=[tag], org_tags=sorted(current)))
 
     def speed_limits(self) -> Dict[str, Any]:
         trc = self._trc()

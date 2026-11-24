@@ -4,7 +4,9 @@
 - **只删自己的**：只有本插件加种成功时记进 ``owned`` 的 hash，且此刻仍在记录的那台下载器里、
   仍带专用标签、仍在专用目录下，并且站点在本轮派单里**明确** ``remove`` 的，才会删。
   站点派单之外的种子（成员自己的、别站的、馒头的……）不会出现在任何删除路径上。
-- **同 hash 已存在不接管**：派来的种子在下载器里已经有了（不是本插件加的），只上报 ``external``，不记账、不删。
+  例外只有成员在面板上**明确确认「接管」**的同 hash 种子：记进账本（``taken_over``）、打上专用标签，
+  不挪文件，所以对它只放宽「在专用目录」这一条；标签、账本、同一台下载器照样都要，删文件照样守共用内容规则。
+- **同 hash 已存在不自动接管**：派来的种子在下载器里已经有了（不是本插件加的），只上报 ``external``，不记账、不删（除非成员手动接管）。
 - **共用内容不删文件**：删之前看所选下载器里有没有别的种子用着同一内容路径（辅种），有就只删种子。
 - **出错不删**：派单拉取失败 / 返回不合规 / revision 倒退或跳号 / 任一下载器列不出种子 → 本轮不删。
 - **每轮删除上限**，加种也有上限与失败退避。
@@ -12,7 +14,7 @@
 
 每轮结束时把**全部派单**逐条的本地情况写进 ``RunReport.assignments``（快照，面板直接显示）：
 种子名、体积、站点要求、本地情况、下载器。快照有上限、只含可 JSON 序列化的值，不含 Key 与下载链接。
-插件页与 Docker 面板共用这里的文案与排序（``local_text`` / ``action_text`` / ``summary_text``）。
+插件页与 Docker 面板共用这里的文案、排序与筛选（``local_text`` / ``action_text`` / ``summary_text`` / ``row_filter``）。
 """
 
 import threading
@@ -42,11 +44,8 @@ RELEASE_TEXT = {"surplus": "副本超额，收回", "capacity": "空间调低，
                 "stale": "长期未做种，改派", "left_group": "已离组"}
 PENDING_TEXT = {"add_cap": "本轮已达加种上限", "no_download_url": "派单没有下载链接",
                 "outdated": "插件版本低于站点要求，本轮不加", "client_unavailable": "有下载器不可用，本轮不加"}
-REMOVE_PENDING_TEXT = {"delete_cap": "本轮已达删除上限", "remove_blocked": "删种闸门关闭", "remove_failed": "删除失败",
-                       "downloader_not_selected": "记录的下载器已不在配置里",
-                       "outdated": "插件版本低于站点要求，本轮不删"}
-# 排序：收回 → 有问题的（退避 / 出错 / 未知）→ 待加种 → 其余
-_PROBLEM = ("backoff", "unknown")
+# 排序：异常 → 待加种 → 收回 → 其余
+_PRESENT = ("owned", "added", "external")
 
 
 def action_text(row: Dict[str, Any]) -> str:
@@ -79,28 +78,85 @@ def local_text(row: Dict[str, Any], fmt_time: Callable[[float], str]) -> str:
     if local == "removed":
         return "本轮已删除"
     if local == "remove_pending":
-        return f"插件管理·收回待删（{REMOVE_PENDING_TEXT.get(detail, detail or '下轮再删')}）"
+        # 站点收回的派单由插件自己处理，成员不用管（删种闸门关、到了每轮上限都是下一轮再删）
+        return "站点已收回，下一轮删除" + ("（本轮删除失败）" if detail == "remove_failed" else "")
     if local == "not_owned":
-        return "收回但不是插件加的（不删）"
+        return "不是插件加的，不删"
     if local == "detached":
-        return "收回但已被你接手（不删）"
+        return "已去掉专用标签或移出专用目录，不删"
     if local == "gone":
-        return "收回且下载器里已没有"
+        return "站点已收回，下载器里已没有"
     if local == "unknown":
         return "有下载器列不出种子，本轮未知"
     return str(local or "")
 
 
-def sort_key(row: Dict[str, Any]) -> Tuple[int, str, int]:
+def is_problem(row: Dict[str, Any]) -> bool:
+    """「异常」：只算成员要自己处理的——加种失败退避中；下载器说出错或已暂停（暂停 = 不在线）；
+    所选下载器本轮列不出种子。站点收回的派单由插件自己处理，不算异常。"""
+    if row.get("local") in ("backoff", "unknown"):
+        return True
+    return row.get("action") != "remove" and row.get("local") in _PRESENT and row.get("status") in ("error", "paused")
+
+
+def _rank(row: Dict[str, Any]) -> int:
+    if is_problem(row):
+        return 0
+    if row.get("local") == "pending":
+        return 1
     if row.get("action") == "remove":
-        group = 0
-    elif row.get("local") in _PROBLEM or row.get("status") == "error":
-        group = 1
-    elif row.get("local") == "pending":
-        group = 2
-    else:
-        group = 3
-    return group, str(row.get("name") or "").casefold(), int(row.get("torrent_id") or 0)
+        return 2
+    return 3
+
+
+def sort_key(row: Dict[str, Any]) -> Tuple[int, str, int]:
+    return _rank(row), str(row.get("name") or "").casefold(), int(row.get("torrent_id") or 0)
+
+
+# 面板的筛选：异常 / 待加种 / 全部
+FILTERS = (("problem", "异常"), ("pending", "待加种"), ("all", "全部"))
+
+
+def row_filter(row: Dict[str, Any]) -> str:
+    """一行属于哪个筛选（除了「全部」）：problem / pending / ""。"""
+    rank = _rank(row)
+    return "problem" if rank == 0 else ("pending" if rank == 1 else "")
+
+
+def default_filter(rows: List[Dict[str, Any]]) -> str:
+    """默认筛选：有异常就先看异常，否则看全部。"""
+    return "problem" if any(is_problem(r) for r in rows) else "all"
+
+
+def row_actions(row: Dict[str, Any]) -> List[str]:
+    """这一行能做的手动操作（面板据此显示按钮；真正动手前 Actions 还会按下载器实时情况复核）：
+    retry 重试加种（加种失败退避中）；resume 恢复 / recheck 重新校验（只限插件管理的种子）；
+    takeover 接管（下载器里本来就有、不是插件加的，且站点没有收回）。"""
+    local, status = row.get("local"), row.get("status")
+    if local == "backoff":
+        return ["retry"]
+    if local in ("owned", "added") and row.get("action") != "remove":
+        return ["resume"] if status == "paused" else (["recheck"] if status == "error" else [])
+    if local == "external" and row.get("action") != "remove":
+        return ["takeover"]
+    return []
+
+
+ROW_ACTION_TEXT = {"retry": "重试加种", "resume": "恢复", "recheck": "重新校验", "takeover": "接管"}
+
+
+def takeover_warning(delete_files: bool) -> str:
+    if delete_files:
+        return "接管后，站点收回这条派单时会连同文件一起删除（共用内容时只删种子），确定？"
+    return "接管后，站点收回这条派单时会删除这颗种子（按设置保留文件），确定？"
+
+
+def managed(t: ClientTorrent, record: Dict[str, Any], settings: "Settings") -> bool:
+    """下载器里这颗种子还算不算插件管理：记过账（调用方保证）、带专用标签、在专用目录里。
+    接管来的（``taken_over``）不在专用目录也算——接管时不挪文件；标签、账本、同一台下载器照样都要。"""
+    if settings.tag not in t.tags:
+        return False
+    return bool(record.get("taken_over")) or path_within(t.save_path, settings.save_path)
 
 
 def summarize(rows: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -348,7 +404,7 @@ class Engine:
                 self._save()
                 report.skipped[h] = "already_gone"
                 continue
-            if self.settings.tag not in torrent.tags or not path_within(torrent.save_path, self.settings.save_path):
+            if not managed(torrent, record, self.settings):
                 # 被成员改了标签或挪出专用目录：视为成员接手，销账，不删
                 self.owned.pop(h, None)
                 self._save()
@@ -600,3 +656,161 @@ class Engine:
         report.assignment_summary = summarize(rows)
         report.assignments_truncated = max(0, len(rows) - MAX_SNAPSHOT_ROWS)
         report.assignments = rows[:MAX_SNAPSHOT_ROWS]
+
+
+# ---------------- 面板上的手动操作 ----------------
+ACTION_RESULT_TEXT = {
+    "retried": "已清除这条的加种退避",
+    "retried_all": "已清除全部加种退避",
+    "nothing_to_retry": "没有在退避中的加种",
+    "resumed": "已让下载器恢复这颗种子",
+    "rechecking": "已让下载器重新校验这颗种子",
+    "nothing_to_do": "下载器里它没有暂停也没有出错，不用处理",
+    "taken_over": "已接管：打上专用标签并记入插件账本（文件没动）",
+    "already_owned": "已经是插件管理的种子，不用接管",
+    "not_found": "派单列表里没有这一条（可能已变化），请刷新",
+    "not_owned": "不是插件管理的种子：插件不动它",
+    "downloader_not_selected": "记账的下载器已不在所选下载器里",
+    "not_in_client": "所选下载器里没有这颗种子",
+    "client_unavailable": "下载器暂时连不上",
+    "detached": "种子已去掉专用标签或移出专用目录，插件不再管它",
+    "action_failed": "下载器没有执行成功",
+    "tag_failed": "打专用标签失败，没有接管",
+    "not_confirmed": "接管需要先确认",
+    "busy": "正在同步，稍后再试",
+}
+
+
+class Actions:
+    """面板上的手动操作（重试加种 / 恢复 / 重新校验 / 接管）。
+
+    行按 ``torrent_id`` 指定，从上一轮快照里找到它的 info_hash；动手前一律按账本与下载器的实时情况复核，
+    条件不满足就拒绝。只动所选下载器里的种子；没有就什么都不做。可以重复点（幂等）。"""
+
+    def __init__(self, downloaders: List[Downloader], settings: Settings, state: Dict[str, Any],
+                 persist: Callable[[Dict[str, Any]], None], log: Any = None, now: Callable[[], float] = time.time):
+        self.downloaders = downloaders
+        self.by_name = {d.name: d for d in downloaders}
+        self.settings = settings.capped()
+        self.state = state
+        self.state.setdefault("owned", {})
+        self.state.setdefault("backoff", {})
+        self.persist = persist
+        self.log = log
+        self.now = now
+
+    def _info(self, msg: str) -> None:
+        if self.log:
+            self.log.info(f"[可乐保种组] {msg}")
+
+    @staticmethod
+    def _result(code: str, ok: bool = True, **extra: Any) -> Dict[str, Any]:
+        return {"ok": ok, "code": code, "message": ACTION_RESULT_TEXT.get(code, code), **extra}
+
+    @staticmethod
+    def find(rows: Optional[List[Dict[str, Any]]], torrent_id: Any) -> Optional[Dict[str, Any]]:
+        try:
+            tid = int(torrent_id)
+        except (TypeError, ValueError):
+            return None
+        # 手动操作只针对站点没收回的派单；同一种子 ID 换过 hash 时，收回的旧 hash 与新派的会同时出现，只认没收回的那条
+        return next((r for r in rows or [] if r.get("torrent_id") == tid and r.get("info_hash")
+                     and r.get("action") != "remove"), None)
+
+    def retry(self, rows: Optional[List[Dict[str, Any]]], torrent_id: Any = None) -> Dict[str, Any]:
+        """清掉加种退避（一条或全部）；调用方随后安排一次同步。"""
+        backoff = self.state["backoff"]
+        if torrent_id is None:
+            count = len(backoff)
+            if not count:
+                return self._result("nothing_to_retry")
+            backoff.clear()
+            self.persist(self.state)
+            self._info(f"手动重试：清除全部 {count} 条加种退避")
+            return self._result("retried_all", count=count)
+        row = self.find(rows, torrent_id)
+        if row is None:
+            return self._result("not_found", ok=False)
+        if backoff.pop(row["info_hash"], None) is None:
+            return self._result("nothing_to_retry")
+        self.persist(self.state)
+        self._info(f"手动重试：清除种子 {row['torrent_id']} 的加种退避")
+        return self._result("retried", count=1)
+
+    def _owned_torrent(self, row: Dict[str, Any]) -> Tuple[Optional[Downloader], Optional[ClientTorrent], str]:
+        h = row["info_hash"]
+        record = self.state["owned"].get(h)
+        if not record:
+            return None, None, "not_owned"
+        dl = self.by_name.get(record.get("downloader"))
+        if dl is None:
+            return None, None, "downloader_not_selected"
+        try:
+            rows = dl.list_torrents()
+        except ClientError:
+            return dl, None, "client_unavailable"
+        t = next((x for x in rows if x.info_hash == h), None)
+        if t is None:
+            return dl, None, "not_in_client"
+        if not managed(t, record, self.settings):
+            return dl, None, "detached"
+        return dl, t, ""
+
+    def resume(self, rows: Optional[List[Dict[str, Any]]], torrent_id: Any) -> Dict[str, Any]:
+        """插件管理的种子：已暂停 → 恢复；出错 → 重新校验。别的种子一律拒绝。"""
+        row = self.find(rows, torrent_id)
+        if row is None:
+            return self._result("not_found", ok=False)
+        dl, t, refusal = self._owned_torrent(row)
+        if refusal:
+            return self._result(refusal, ok=False)
+        h = row["info_hash"]
+        try:
+            if t.state == "paused":
+                ok, code = dl.resume(h), "resumed"
+            elif t.state == "error":
+                ok, code = dl.recheck(h), "rechecking"
+            else:
+                return self._result("nothing_to_do")
+        except ClientError:
+            return self._result("client_unavailable", ok=False)
+        if not ok:
+            return self._result("action_failed", ok=False)
+        self._info(f"手动{'恢复' if code == 'resumed' else '重新校验'}：{dl.name} 上的 {short(h)}（种子 {row['torrent_id']}）")
+        return self._result(code)
+
+    def take_over(self, rows: Optional[List[Dict[str, Any]]], torrent_id: Any) -> Dict[str, Any]:
+        """把下载器里本来就有的同一颗种子记进账本、打上专用标签（不挪文件、不改保存路径）。
+        之后站点收回它时按插件管理的种子删除（仍守共用内容只删种子的规则）。"""
+        row = self.find(rows, torrent_id)
+        if row is None:
+            return self._result("not_found", ok=False)
+        h = row["info_hash"]
+        if h in self.state["owned"]:
+            return self._result("already_owned")
+        hit, unavailable = None, False
+        for dl in self.downloaders:
+            try:
+                t = next((x for x in dl.list_torrents() if x.info_hash == h), None)
+            except ClientError:
+                unavailable = True
+                continue
+            if t is not None:
+                hit = (dl, t)
+                break
+        if hit is None:
+            return self._result("client_unavailable" if unavailable else "not_in_client", ok=False)
+        dl, t = hit
+        if self.settings.tag not in t.tags:
+            try:
+                ok = dl.add_tag(h, self.settings.tag, t.tags)
+            except ClientError:
+                ok = False
+            if not ok:
+                return self._result("tag_failed", ok=False)
+        self.state["owned"][h] = {"downloader": dl.name, "torrent_id": row.get("torrent_id"), "size": row.get("size"),
+                                  "added_at": int(self.now()), "taken_over": True}
+        self.state["backoff"].pop(h, None)
+        self.persist(self.state)
+        self._info(f"手动接管：{dl.name} 上的 {short(h)}（种子 {row['torrent_id']}），打上专用标签、记入账本，文件没动")
+        return self._result("taken_over")
