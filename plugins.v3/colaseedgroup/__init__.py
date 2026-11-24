@@ -10,7 +10,7 @@ import time
 import types
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
@@ -18,15 +18,33 @@ from app.sdk.services import DownloaderHelper
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .clients import Downloader, norm_path, wrap
-from .engine import HARD_MAX_ADDS, HARD_MAX_DELETES, Engine, Settings
+from .engine import (
+    ACTION_RESULT_TEXT,
+    FILTERS,
+    HARD_MAX_ADDS,
+    HARD_MAX_DELETES,
+    ROW_ACTION_TEXT,
+    Actions,
+    Engine,
+    Settings,
+    action_text,
+    default_filter,
+    local_text,
+    row_actions,
+    row_filter,
+    summary_text,
+    takeover_warning,
+)
 from .site import SiteClient
 
-PLUGIN_VERSION = "0.7.0"
+PLUGIN_VERSION = "0.7.1"
 DEFAULT_SITE = "https://www.colapt.com"
 KEY_PAGE = "https://www.colapt.com/account/tracker?tab=api"
 DEFAULT_TAG = "可乐保种组"
 DEFAULT_SAVE_PATH = "/downloads/colaseedgroup"
 MIN_INTERVAL = 10
+DEFAULT_INTERVAL = MIN_INTERVAL   # 默认就按最短间隔跑（站点每 10 分钟派一次单）
+DEFAULT_MAX_ADDS = 10
 SUPPORTED_TYPES = ("qbittorrent", "transmission")
 
 # 运行锁放在一个跨「插件重载」稳定的地方：重载会重新执行本模块，模块级锁会变成新对象。
@@ -86,6 +104,148 @@ def human_size(num: Any) -> str:
     return f"{value:.1f} {_UNITS[unit]}" if value < 100 else f"{value:.0f} {_UNITS[unit]}"
 
 
+def _clock(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "-"
+
+
+# 派单表里会换行的格（种子名、站点要求、本地情况）：手机宽度下折行，不把表撑出屏幕
+_WRAP = "white-space: normal; overflow-wrap: anywhere; word-break: break-word;"
+_NOWRAP = "white-space: nowrap;"
+PAGE_SIZE = 50
+_COLUMNS = (("种子名", "name", _WRAP + " min-width: 14em;"), ("体积", "size", _NOWRAP),
+            ("站点要求", "action", _WRAP + " min-width: 5em;"), ("本地情况", "local", _WRAP + " min-width: 8em;"),
+            ("下载器", "downloader", _NOWRAP), ("操作", "ops", _NOWRAP))
+_EMPTY_TEXT = {"problem": "没有异常的派单", "pending": "没有待加种的派单", "all": "站点暂时没有派单"}
+API = "plugin/ColaSeedGroup"
+ARM_SECONDS = 300   # 「接管」第一下之后，确认按钮保留多久
+
+
+def _btn(text: str, path: str, params: Dict[str, Any], color: str = "primary", variant: str = "tonal") -> dict:
+    """点了调插件接口（MoviePilot 渲染器：events.click → POST，完了刷新页面）。"""
+    return {"component": "VBtn", "props": {"size": "small", "variant": variant, "color": color, "class": "mr-1 my-1"},
+            "text": text, "events": {"click": {"api": f"{API}{path}", "method": "post", "params": params}}}
+
+
+_ACTION_PATH = {"retry": "/retry", "resume": "/resume", "recheck": "/resume", "takeover": "/takeover"}
+
+
+def _cells(r: Dict[str, Any]) -> Dict[str, Any]:
+    """表格一行：显示用的文字 + 操作按钮（按钮只带 torrent_id）。没有 info_hash、没有链接。"""
+    tid = r.get("torrent_id")
+    return {"name": str(r.get("name") or ""), "size": human_size(r.get("size") or 0), "action": action_text(r),
+            "local": local_text(r, _clock), "downloader": str(r.get("downloader") or "—"),
+            "ops": [_btn(ROW_ACTION_TEXT[a], _ACTION_PATH[a], {"torrent_id": tid}) for a in row_actions(r)]}
+
+
+def _table(items: List[Dict[str, Any]], empty: str) -> dict:
+    def cell(cells: Dict[str, Any], key: str, style: str) -> dict:
+        if key == "ops":
+            return {"component": "td", "props": {"style": style}, "content": cells["ops"]}
+        return {"component": "td", "props": {"style": style}, "text": cells[key]}
+
+    body = [{"component": "tr", "content": [cell(cells, key, style) for _, key, style in _COLUMNS]}
+            for cells in items] or [{"component": "tr", "content": [
+                {"component": "td", "props": {"colspan": len(_COLUMNS)}, "text": empty}]}]
+    return {"component": "VTable", "props": {"density": "compact"}, "content": [
+        {"component": "thead", "content": [{"component": "tr", "content": [
+            {"component": "th", "props": {"style": _NOWRAP}, "text": title} for title, _, _ in _COLUMNS]}]},
+        {"component": "tbody", "content": body},
+    ]}
+
+
+def _paged(items: List[Dict[str, Any]], empty: str) -> dict:
+    """一页 50 条。超过一页时每页是一个可展开的「第 a–b 条」，第一页默认展开（JSON 页面没有双向绑定，
+    VDataTable 的表体又会被渲染器的默认插槽盖掉，所以分页用手风琴面板做）。"""
+    if len(items) <= PAGE_SIZE:
+        return _table(items, empty)
+    pages = []
+    for i, start in enumerate(range(0, len(items), PAGE_SIZE), 1):
+        chunk = items[start:start + PAGE_SIZE]
+        pages.append({"component": "VExpansionPanel", "props": {"value": f"p{i}"}, "content": [
+            {"component": "VExpansionPanelTitle", "props": {"class": "text-body-2"},
+             "text": f"第 {start + 1}–{start + len(chunk)} 条（共 {len(items)} 条）"},
+            {"component": "VExpansionPanelText", "content": [_table(chunk, empty)]},
+        ]})
+    return {"component": "VExpansionPanels", "props": {"variant": "accordion", "model-value": "p1"},
+            "content": pages}
+
+
+def _confirm_takeover(rows: List[Dict[str, Any]], armed: Dict[str, Any], delete_files: bool, now: float) -> List[dict]:
+    """「接管」的第二步：第一下只是待确认，这里显示警告与「确认接管 / 取消」。"""
+    if not armed or float(armed.get("until") or 0) < now:
+        return []
+    row = Actions.find(rows, armed.get("torrent_id"))
+    if row is None or "takeover" not in row_actions(row):
+        return []
+    tid = row.get("torrent_id")
+    return [{"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "class": "mt-2",
+                                              "title": f"接管「{row.get('name')}」？"}, "content": [
+        {"component": "div", "text": takeover_warning(delete_files)},
+        {"component": "div", "props": {"class": "mt-2"}, "content": [
+            _btn("确认接管", "/takeover", {"torrent_id": tid, "confirm": True}, color="warning", variant="flat"),
+            _btn("取消", "/takeover/cancel", {"torrent_id": tid}, color="secondary", variant="text"),
+        ]},
+    ]}]
+
+
+def assignment_table(last: Dict[str, Any], site_url: str, armed: Optional[Dict[str, Any]] = None,
+                     delete_files: bool = True, now: Optional[float] = None) -> List[dict]:
+    """全部派单：摘要一行 + 三个筛选（异常 / 待加种 / 全部，每页 50 条）+ 说明。
+    行、顺序、筛选与可做的操作都来自执行器（engine._snapshot / row_filter / row_actions），这里只负责排版。
+
+    MoviePilot 的 JSON 页面没有双向绑定，筛选用手风琴面板：初始展开项是默认筛选，之后由面板自己切换。"""
+    rows = last.get("assignments")
+    note = {"component": "div", "props": {"class": "text-caption mt-2"}, "content": [
+        {"component": "span", "text": "这里只是下载器这一侧的情况；tracker 有没有把它算作做种，以站点"},
+        {"component": "a", "props": {"href": f"{site_url.rstrip('/')}/account/seed-group", "target": "_blank",
+                                     "rel": "noopener noreferrer", "class": "text-primary"}, "text": "保种组页面"},
+        {"component": "span", "text": "为准。"},
+    ]}
+    if rows is None:
+        empty = "还没有拿到派单" if last else "还没有运行过"
+        if last and last.get("status") == "ok":
+            empty = "下一轮运行后显示全部派单"
+        return [{"component": "div", "props": {"class": "text-subtitle-2 mt-4 mb-1"}, "text": "全部派单"},
+                {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact",
+                                                  "text": empty}},
+                note]
+    groups: Dict[str, List[Dict[str, Any]]] = {"problem": [], "pending": [], "all": []}
+    for r in rows:
+        cells = _cells(r)
+        groups["all"].append(cells)
+        key = row_filter(r)
+        if key:
+            groups[key].append(cells)
+    panels = []
+    for key, label in FILTERS:
+        items = groups[key]
+        panels.append({"component": "VExpansionPanel", "props": {"value": key}, "content": [
+            {"component": "VExpansionPanelTitle", "text": f"{label}（{len(items)}）"},
+            {"component": "VExpansionPanelText", "content": [_paged(items, _EMPTY_TEXT[key])]},
+        ]})
+    head: List[dict] = [{"component": "span", "props": {"class": "text-subtitle-2 mr-3"},
+                         "text": summary_text(last.get("assignment_summary") or {})}]
+    if any("retry" in row_actions(r) for r in rows):
+        head.append(_btn("全部重试加种", "/retry", {}, variant="outlined"))
+    out = [
+        {"component": "div", "props": {"class": "d-flex flex-wrap align-center mt-4 mb-2"}, "content": head},
+        *_confirm_takeover(rows, armed or {}, delete_files, time.time() if now is None else now),
+        {"component": "VExpansionPanels", "props": {"variant": "accordion", "model-value": default_filter(rows)},
+         "content": panels},
+    ]
+    if last.get("assignments_truncated"):
+        out.append({"component": "div", "props": {"class": "text-caption mt-2"},
+                    "text": f"还有 {last['assignments_truncated']} 条未列出"})
+    out.append(note)
+    return out
+
+
+def _envelope(result: Dict[str, Any]) -> Dict[str, Any]:
+    """MoviePilot 前端认的响应形状 {success, message, data}：成功弹提示并刷新页面，失败弹错误提示。"""
+    return {"success": bool(result.get("ok")), "message": str(result.get("message") or ""),
+            "data": {"code": result.get("code")}}
+
+
 def _int(value: Any, default: int, low: int, high: int) -> int:
     try:
         number = int(value)
@@ -113,8 +273,8 @@ class ColaSeedGroup(_PluginBase):
         self._downloaders: List[str] = []
         self._save_path = DEFAULT_SAVE_PATH
         self._tag = DEFAULT_TAG
-        self._interval = 30
-        self._max_adds = 5
+        self._interval = DEFAULT_INTERVAL
+        self._max_adds = DEFAULT_MAX_ADDS
         self._max_deletes = 5
         self._delete_files = True
         self._stop = threading.Event()
@@ -131,8 +291,8 @@ class ColaSeedGroup(_PluginBase):
         self._downloaders = [str(x) for x in (raw if isinstance(raw, list) else [raw]) if x]
         self._save_path = norm_path(str(config.get("save_path") or "")) or DEFAULT_SAVE_PATH
         self._tag = str(config.get("tag") or "").strip() or DEFAULT_TAG
-        self._interval = _int(config.get("interval"), 30, MIN_INTERVAL, 24 * 60)
-        self._max_adds = _int(config.get("max_adds"), 5, 0, HARD_MAX_ADDS)
+        self._interval = _int(config.get("interval"), DEFAULT_INTERVAL, MIN_INTERVAL, 24 * 60)
+        self._max_adds = _int(config.get("max_adds"), DEFAULT_MAX_ADDS, 0, HARD_MAX_ADDS)
         self._max_deletes = _int(config.get("max_deletes"), 5, 0, HARD_MAX_DELETES)
         self._delete_files = bool(config.get("delete_files", True))
         if not self.get_data("instance_id"):
@@ -172,7 +332,96 @@ class ColaSeedGroup(_PluginBase):
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        """插件页按钮调的接口（MoviePilot 前端带登录令牌，auth=bear）。"""
+        def api(path: str, endpoint: Any, summary: str) -> Dict[str, Any]:
+            return {"path": path, "endpoint": endpoint, "methods": ["POST"], "summary": summary, "auth": "bear"}
+
+        return [
+            api("/sync", self.api_sync, "立即同步"),
+            api("/retry", self.api_retry, "重试加种（torrent_id 为空 = 全部）"),
+            api("/resume", self.api_resume, "恢复 / 重新校验插件管理的种子"),
+            api("/takeover", self.api_takeover, "接管下载器里已有的同一颗种子（需确认）"),
+            api("/takeover/cancel", self.api_takeover_cancel, "取消接管确认"),
+        ]
+
+    # ---------------- 页面上的手动操作 ----------------
+    def _done(self, result: Dict[str, Any], sync: bool = False) -> Dict[str, Any]:
+        """记下结果给页面显示；成功且需要时安排一次立即同步（同步照常遵守加种退避）。"""
+        if sync and result.get("ok") and self.get_state():
+            self._run_once_later()
+            result = {**result, "message": result["message"] + "；马上同步一次"}
+        self.save_data("last_action", {"ok": bool(result.get("ok")), "message": result["message"], "at": time.time()})
+        if not result.get("ok"):
+            logger.info(f"[可乐保种组] 手动操作未执行：{result.get('code')}")
+        return result
+
+    def _actions(self, state: Dict[str, Any]) -> Actions:
+        return Actions(self._selected(), Settings(save_path=self._save_path, tag=self._tag,
+                                                  delete_files=self._delete_files),
+                       state, lambda s: self.save_data("state", s), log=logger)
+
+    def _act(self, func: Callable[[Actions, List[Dict[str, Any]]], Dict[str, Any]], sync: bool) -> Dict[str, Any]:
+        """与定时同步共用运行锁：同步进行中不动账本。"""
+        if not _HOLDER.lock.acquire(blocking=False):
+            return self._done({"ok": False, "code": "busy", "message": ACTION_RESULT_TEXT["busy"]})
+        try:
+            state = self.get_data("state") or {}
+            rows = (self.get_data("last_run") or {}).get("assignments") or []
+            result = func(self._actions(state), rows)
+        finally:
+            _HOLDER.lock.release()
+        changed = result.get("code") in ("retried", "retried_all", "resumed", "rechecking", "taken_over")
+        return self._done(result, sync=sync and changed)
+
+    def api_sync(self, body: dict) -> Dict[str, Any]:
+        return _envelope(self._sync(body))
+
+    def _sync(self, body: dict) -> Dict[str, Any]:
+        if not self.get_state():
+            return self._done({"ok": False, "code": "not_configured", "message": "插件还没配置好或未启用"})
+        self._run_once_later()
+        return self._done({"ok": True, "code": "sync", "message": "已安排立即同步，几秒后刷新本页查看结果"})
+
+    def api_retry(self, body: dict) -> Dict[str, Any]:
+        return _envelope(self._retry(body))
+
+    def _retry(self, body: dict) -> Dict[str, Any]:
+        tid = (body or {}).get("torrent_id")
+        return self._act(lambda a, rows: a.retry(rows, tid), sync=True)
+
+    def api_resume(self, body: dict) -> Dict[str, Any]:
+        return _envelope(self._resume(body))
+
+    def _resume(self, body: dict) -> Dict[str, Any]:
+        tid = (body or {}).get("torrent_id")
+        return self._act(lambda a, rows: a.resume(rows, tid), sync=True)
+
+    def api_takeover(self, body: dict) -> Dict[str, Any]:
+        return _envelope(self._takeover(body))
+
+    def _takeover(self, body: dict) -> Dict[str, Any]:
+        """两步：第一下只记「待确认」（5 分钟内有效），页面显示警告与「确认接管」；带 confirm 的第二下才接管。"""
+        body = body or {}
+        tid = body.get("torrent_id")
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            return self._done({"ok": False, "code": "not_found", "message": ACTION_RESULT_TEXT["not_found"]})
+        if not body.get("confirm"):
+            self.save_data("takeover_armed", {"torrent_id": tid, "until": time.time() + ARM_SECONDS})
+            return {"ok": True, "code": "armed", "message": "请在页面上确认接管"}
+        armed = self.get_data("takeover_armed") or {}
+        if armed.get("torrent_id") != tid or float(armed.get("until") or 0) < time.time():
+            return self._done({"ok": False, "code": "not_confirmed", "message": ACTION_RESULT_TEXT["not_confirmed"]})
+        self.save_data("takeover_armed", {})
+        return self._act(lambda a, rows: a.take_over(rows, tid), sync=True)
+
+    def api_takeover_cancel(self, body: dict) -> Dict[str, Any]:
+        return _envelope(self._takeover_cancel(body))
+
+    def _takeover_cancel(self, body: dict) -> Dict[str, Any]:
+        self.save_data("takeover_armed", {})
+        return {"ok": True, "code": "cancelled", "message": "已取消"}
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self.get_state():
@@ -281,8 +530,10 @@ class ColaSeedGroup(_PluginBase):
                 ]},
                 {"component": "VRow", "content": [
                     col(3, text("tag", "专用标签")),
-                    col(3, text("interval", "运行间隔（分钟）", f"最少 {MIN_INTERVAL}", type="number")),
-                    col(3, text("max_adds", "每轮最多加种", f"最多 {HARD_MAX_ADDS}", type="number")),
+                    col(3, text("interval", "运行间隔（分钟）", f"默认 {DEFAULT_INTERVAL}，最少 {MIN_INTERVAL}",
+                                    type="number")),
+                    col(3, text("max_adds", "每轮最多加种", f"默认 {DEFAULT_MAX_ADDS}，最多 {HARD_MAX_ADDS}",
+                                    type="number")),
                     col(3, text("max_deletes", "每轮最多删种", f"最多 {HARD_MAX_DELETES}", type="number")),
                 ]},
                 {"component": "VRow", "content": [
@@ -291,7 +542,8 @@ class ColaSeedGroup(_PluginBase):
                 {"component": "VRow", "content": [
                     col(12, {"component": "VAlert", "props": {
                         "type": "info", "variant": "tonal",
-                        "text": ("插件只执行站点派单：缺的加、站点明确收回的删。下载器里已有的同一颗种子不会被接管；"
+                        "text": ("插件只执行站点派单：缺的加、站点明确收回的删。"
+                                 "下载器里已有的同一颗种子不会被自动接管（可在插件页手动接管）；"
                                  "你自己的种子、别站的种子永远不会被删除，也不会改动任何限速。"
                                  "奖励由站点按 tracker 实际做种情况计算。"),
                     }}),
@@ -300,8 +552,8 @@ class ColaSeedGroup(_PluginBase):
         }]
         defaults = {
             "enabled": False, "onlyonce": False, "api_key": "", "site_url": DEFAULT_SITE, "downloaders": [],
-            "save_path": DEFAULT_SAVE_PATH, "tag": DEFAULT_TAG, "interval": 30, "max_adds": 5, "max_deletes": 5,
-            "delete_files": True,
+            "save_path": DEFAULT_SAVE_PATH, "tag": DEFAULT_TAG, "interval": DEFAULT_INTERVAL,
+            "max_adds": DEFAULT_MAX_ADDS, "max_deletes": 5, "delete_files": True,
         }
         return form, defaults
 
@@ -337,16 +589,17 @@ class ColaSeedGroup(_PluginBase):
                     ]}]}]}
 
         total = sum(int(r.get("size") or 0) for r in owned.values())
-        rows = []
-        for h, rec in sorted(owned.items(), key=lambda kv: -int(kv[1].get("added_at") or 0)):
-            rows.append({"component": "tr", "content": [
-                {"component": "td", "text": h[:12]},
-                {"component": "td", "text": str(rec.get("torrent_id") or "")},
-                {"component": "td", "text": human_size(rec.get("size") or 0)},
-                {"component": "td", "text": str(rec.get("downloader") or "")},
-                {"component": "td", "text": datetime.fromtimestamp(int(rec.get("added_at") or 0)).strftime("%m-%d %H:%M")},
-            ]})
+        action = self.get_data("last_action") or {}
+        recent = []
+        if action and time.time() - float(action.get("at") or 0) < 600:
+            recent = [{"component": "VAlert", "props": {
+                "type": "success" if action.get("ok") else "warning", "variant": "tonal", "density": "compact",
+                "class": "mb-3", "text": f"{_clock(float(action['at']))} · {action.get('message')}"}}]
+        toolbar = {"component": "div", "props": {"class": "d-flex justify-end mb-2"}, "content": [
+            _btn("立即同步", "/sync", {}, variant="flat")]} if self.get_state() else None
         return [
+            *([toolbar] if toolbar else []),
+            *recent,
             {"component": "VAlert", "props": {"type": alert_type, "variant": "tonal", "text": headline,
                                               "class": "mb-3"}},
             {"component": "VRow", "content": [
@@ -355,10 +608,5 @@ class ColaSeedGroup(_PluginBase):
                 stat("本轮新加 / 删除", f"{len(last.get('added') or [])} / {len(last.get('removed') or [])}"),
                 stat("申报空间", human_size(int(last["capacity_gib"]) * 1024 ** 3) if last.get("capacity_gib") else "-"),
             ]},
-            {"component": "VTable", "props": {"density": "compact", "class": "mt-3"}, "content": [
-                {"component": "thead", "content": [{"component": "tr", "content": [
-                    {"component": "th", "text": t} for t in ("info_hash", "种子", "大小", "下载器", "加入时间")]}]},
-                {"component": "tbody", "content": rows or [{"component": "tr", "content": [
-                    {"component": "td", "props": {"colspan": 5}, "text": "本插件还没有加过种子"}]}]},
-            ]},
+            *assignment_table(last, self._site_url, self.get_data("takeover_armed") or {}, self._delete_files),
         ]

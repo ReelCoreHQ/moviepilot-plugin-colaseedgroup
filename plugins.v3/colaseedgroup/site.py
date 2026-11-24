@@ -21,6 +21,7 @@ ASSIGNMENT_PATH = "/api/v1/plugin/seed-group/assignment"
 STATE_PATH = "/api/v1/plugin/seed-group/state"
 ACTIONS = ("keep", "add", "remove")
 MAX_TORRENT_BYTES = 16 * 1024 * 1024
+MAX_NAME = 300  # 只用于显示：过长的名字截断，面板与持久化数据都有界
 _HASH_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -43,6 +44,7 @@ class AssignmentItem:
     action: str
     download_url: str = ""
     reason: str = ""
+    name: str = ""   # 站点显示的种子名；老站点不给时为空，面板再按下载器里的名字兜底
 
 
 @dataclass
@@ -103,7 +105,8 @@ def parse_assignment(body: Any) -> Assignment:
         seen.add(info_hash)
         url = raw.get("download_url") or ""
         reason = raw.get("reason") or ""
-        if not isinstance(url, str) or not isinstance(reason, str):
+        name = raw.get("name") or ""
+        if not isinstance(url, str) or not isinstance(reason, str) or not isinstance(name, str):
             raise SiteError("bad_shape")
         items.append(AssignmentItem(
             info_hash=info_hash,
@@ -112,6 +115,7 @@ def parse_assignment(body: Any) -> Assignment:
             action=action,
             download_url=url,
             reason=reason,
+            name=name.strip()[:MAX_NAME],
         ))
     minimum = body.get("min_plugin_version")
     if not isinstance(minimum, str):

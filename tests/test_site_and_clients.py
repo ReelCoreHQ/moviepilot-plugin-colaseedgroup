@@ -125,6 +125,17 @@ class SiteTests(unittest.TestCase):
             with self.assertRaises(SiteError):
                 parse_assignment(body)
 
+    def test_name_optional_and_bounded(self):
+        base = {"revision": 1, "min_plugin_version": "", "capacity_gib": 0, "assigned_bytes": "0"}
+        item = {"info_hash": H, "torrent_id": 1, "size_bytes": "1", "action": "keep", "download_url": None,
+                "reason": None}
+        self.assertEqual(parse_assignment({**base, "items": [item]}).items[0].name, "")  # 老站点没有 name
+        a = parse_assignment({**base, "items": [{**item, "name": "  Film.2026  "}]})
+        self.assertEqual(a.items[0].name, "Film.2026")
+        self.assertEqual(len(parse_assignment({**base, "items": [{**item, "name": "x" * 5000}]}).items[0].name), 300)
+        with self.assertRaises(SiteError):
+            parse_assignment({**base, "items": [{**item, "name": 5}]})
+
     def test_download_never_sends_key(self):
         # 签名短链自带授权；Key 只有 seedgroup 范围，站点下载接口见到 Key 会按范围拒绝（403 api_key_scope_denied）
         data, _ = make_torrent("X")
