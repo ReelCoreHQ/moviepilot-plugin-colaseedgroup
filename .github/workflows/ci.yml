@@ -21,43 +21,21 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # MoviePilot V3 标准镜像用 CPython 3.14
+          python-version: "3.14"
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
       - name: 安装依赖
         run: python -m pip install -r requirements-dev.txt
 
-      - name: 插件与清单自检
+      - name: 编译与清单自检
         run: |
-          python -m compileall -q plugins.v2/colaseedgroup/__init__.py
-          python - <<'PY'
-          import json, pathlib, re
-          entry = json.loads(pathlib.Path("package.v2.json").read_text("utf-8"))["ColaSeedGroup"]
-          assert entry.get("v2") is True, "package.v2.json 必须声明 v2"
-          assert re.match(r"^\d+\.\d+\.\d+$", entry["version"]), entry["version"]
-          assert list(entry["history"])[0] == f"v{entry['version']}", "history 最新一条必须是当前版本"
-          print("manifest ok:", entry["version"])
-          PY
+          python -m compileall -q plugins.v3/colaseedgroup
+          python .github/scripts/check_manifest.py
 
-      - name: 功能测试
+      - name: ruff
+        run: ruff check .
+
+      - name: 单元测试
         run: python -m unittest discover -s tests -v
-
-      - name: 独立版自检
-        run: |
-          python -m pip install -q -r requirements.txt
-          python - <<'PY'
-          import sys, pathlib
-          sys.path.insert(0, str(pathlib.Path(".").resolve()))
-          from app.main import app
-          from app.sync import CONFIG_KEYS, PLUGIN_VERSION, _plugin
-          assert len(CONFIG_KEYS) >= 16, CONFIG_KEYS   # 0.6.0 移除了限速接管三项
-          # 版本号只有一处：独立版必须读插件的 plugin_version
-          assert PLUGIN_VERSION == _plugin.ColaSeedGroup.plugin_version, (PLUGIN_VERSION, _plugin.ColaSeedGroup.plugin_version)
-          # 独立版必须直接引用 plugins.v2 的源码，不允许存在第二份副本
-          assert not pathlib.Path("app/vendor").exists(), "app/vendor 不该存在"
-          import json
-          manifest = json.loads(pathlib.Path("package.v2.json").read_text("utf-8"))["ColaSeedGroup"]
-          assert manifest["version"] == PLUGIN_VERSION, (manifest["version"], PLUGIN_VERSION)
-          print("standalone ok:", PLUGIN_VERSION, len(CONFIG_KEYS), "keys")
-          PY

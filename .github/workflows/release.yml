@@ -1,0 +1,38 @@
+# 合并到 main 后：package.v3.json 的版本还没有对应 Release 时，打包并发布。
+# 资产命名按 MoviePilot 的规则：tag = ColaSeedGroup_v<版本>，zip = colaseedgroup_v<版本>.zip，
+# zip 内顶层目录是 colaseedgroup/。
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths: [package.v3.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: 清单自检
+        run: python .github/scripts/check_manifest.py
+      - name: 打包并发布
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(python -c 'import json;print(json.load(open("package.v3.json"))["ColaSeedGroup"]["version"])')
+          tag="ColaSeedGroup_v${version}"
+          asset="colaseedgroup_v${version}.zip"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag 已存在，跳过"; exit 0
+          fi
+          notes=$(python -c 'import json,sys;e=json.load(open("package.v3.json"))["ColaSeedGroup"];print(e["history"]["v"+e["version"]])')
+          (cd plugins.v3 && zip -r "$GITHUB_WORKSPACE/$asset" colaseedgroup -x "*/__pycache__/*" -x "*.pyc")
+          gh release create "$tag" "$asset" --title "$tag" --notes "$notes"
