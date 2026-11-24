@@ -119,7 +119,8 @@ class OwnershipTests(unittest.TestCase):
         site2 = FakeSite(Assignment(2, "", 2048, [item(h, "remove")]))
         engine(site2, [dl], state).run()
         self.assertEqual(dl.removed, [])
-        self.assertEqual(site.reports[-1]["items"][0]["status"], "external")
+        # 不是本插件管理的：不报成「持有」
+        self.assertEqual(site.reports[-1]["items"], [])
 
     def test_tr_duplicate_add_not_recorded(self):
         data, h = make_torrent("Dup")
@@ -251,9 +252,10 @@ class AddTests(unittest.TestCase):
         self.assertEqual(state["owned"][h]["torrent_id"], 7)
         self.assertEqual(state["last_revision"], 3)
         rep = site.reports[-1]
-        self.assertEqual(rep["revision"], 3)
-        self.assertEqual(rep["items"][0]["status"], "downloading")
+        self.assertEqual(set(rep), {"plugin_version", "items", "clients"})
+        self.assertEqual(rep["items"], [{"info_hash": h, "status": "downloading", "progress": 0.0}])
         self.assertEqual(rep["plugin_version"], "0.7.0")
+        self.assertEqual(rep["clients"], [{"name": "qbittorrent#1", "readable": True, "up_kib": 0, "dl_kib": 0}])
 
     def test_hash_mismatch_not_added(self):
         data, _ = make_torrent("Other")
@@ -284,6 +286,33 @@ class AddTests(unittest.TestCase):
         qb, tr = FakeDownloader(), FakeDownloader("tr", "transmission")
         engine(FakeSite(Assignment(1, "", 2048, items), torrents=torrents), [qb, tr], {}).run()
         self.assertEqual((len(qb.added), len(tr.added)), (2, 2))
+
+
+class ReportShapeTests(unittest.TestCase):
+    def test_contract_shape_and_caps(self):
+        mine = owned_torrent(H1)
+        mine.state = "queued"
+        pending = owned_torrent(H2, name="P")      # 被收回但本轮删不了（上限 0）：仍然报持有
+        ext = ClientTorrent(H3, "E", SAVE, f"{SAVE}/E", {TAG}, 1.0, "seeding")
+        dl = FakeDownloader(name="192.168.1.5 家里", torrents=[mine, pending, ext])
+        dl.speed_limits = lambda: {"up_kib": 9_999_999, "dl_kib": 5, "alt_mode": True}
+        bad = FakeDownloader("tr", "transmission")
+
+        def boom():
+            raise ClientError("limits_failed")
+        bad.speed_limits = boom
+        state = {"owned": {H1: {"downloader": dl.name}, H2: {"downloader": dl.name}}}
+        site = FakeSite(Assignment(1, "", 2048, [item(H1, "keep"), item(H2, "remove"), item(H3, "keep")]))
+        engine(site, [dl, bad], state, max_deletes=0).run()
+        rep = site.reports[-1]
+        self.assertEqual([i["info_hash"] for i in rep["items"]], [H1, H2])
+        self.assertEqual(rep["items"][0]["status"], "paused")
+        for i in rep["items"]:
+            self.assertEqual(set(i), {"info_hash", "status", "progress"})
+        self.assertEqual(rep["clients"][0], {"name": "qbittorrent#1", "readable": True, "up_kib": 1048576,
+                                             "dl_kib": 5})
+        self.assertEqual(rep["clients"][1], {"name": "transmission#2", "readable": False, "up_kib": 0, "dl_kib": 0})
+        self.assertNotIn("192.168", str(rep))
 
 
 class GateAndStopTests(unittest.TestCase):

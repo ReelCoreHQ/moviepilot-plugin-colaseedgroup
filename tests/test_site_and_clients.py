@@ -52,23 +52,29 @@ def client(*responses):
     return SiteClient("https://c.example.com", KEY, "inst-1", "UA/1", session=s), s
 
 
-GOOD = {"revision": 4, "min_plugin_version": "0.7.0", "capacity_gib": 2048,
-        "items": [{"info_hash": H, "torrent_id": 9, "size": 100, "action": "add", "download_url": "/dl/x"}]}
+GOOD = {"revision": 4, "min_plugin_version": "0.7.0", "capacity_gib": 2048, "assigned_bytes": "100",
+        "server_time": "2026-11-24T00:00:00Z",
+        "items": [{"info_hash": H, "torrent_id": 9, "size_bytes": "100", "action": "add",
+                   "download_url": "https://c.example.com/dl/x", "reason": None},
+                  {"info_hash": "cd" * 20, "torrent_id": 8, "size_bytes": "5", "action": "remove",
+                   "download_url": None, "reason": "surplus"}]}
 
 
 class SiteTests(unittest.TestCase):
     def test_assignment_headers_and_parse(self):
         c, s = client(FakeResponse(200, GOOD))
         a = c.assignment()
-        self.assertEqual((a.revision, a.items[0].info_hash, a.items[0].action), (4, H, "add"))
+        self.assertEqual((a.revision, a.items[0].info_hash, a.items[0].action, a.items[0].size), (4, H, "add", 100))
+        self.assertEqual((a.items[1].download_url, a.items[1].reason), ("", "surplus"))
         method, url, headers, _ = s.calls[0]
         self.assertEqual(url, "https://c.example.com/api/v1/plugin/seed-group/assignment")
         self.assertEqual(headers["X-API-Key"], KEY)
         self.assertEqual(headers["X-Plugin-Instance"], "inst-1")
 
-    def test_envelope_data_accepted(self):
+    def test_wrapped_body_rejected(self):
         c, _ = client(FakeResponse(200, {"data": GOOD}))
-        self.assertEqual(c.assignment().revision, 4)
+        with self.assertRaises(SiteError):
+            c.assignment()
 
     def test_error_codes(self):
         cases = [(FakeResponse(500, {"code": "internal", "message": "服务器错误"}), "http_5xx"),
@@ -91,14 +97,29 @@ class SiteTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "unauthorized")
 
     def test_bad_shapes_rejected_whole(self):
+        def body(**kw):
+            b = {"revision": 1, "min_plugin_version": "", "capacity_gib": 0, "assigned_bytes": "0", "items": []}
+            b.update(kw)
+            return b
+
+        def it(**kw):
+            i = {"info_hash": H, "torrent_id": 1, "size_bytes": "1", "action": "keep", "download_url": None,
+                 "reason": None}
+            i.update(kw)
+            return i
+        parse_assignment(body(items=[it()]))  # 基线合法
         bad = [
-            {"revision": 1, "items": [{"info_hash": "xyz", "torrent_id": 1, "size": 1, "action": "add"}]},
-            {"revision": 1, "items": [{"info_hash": H, "torrent_id": 1, "size": 1, "action": "nuke"}]},
-            {"revision": -1, "items": []},
-            {"revision": 1},
-            {"revision": "1", "items": []},
-            {"revision": 1, "items": [{"info_hash": H, "torrent_id": 1, "size": 1, "action": "add"},
-                                      {"info_hash": H, "torrent_id": 1, "size": 1, "action": "remove"}]},
+            body(items=[it(info_hash="xyz")]),
+            body(items=[it(info_hash=H.upper())]),
+            body(items=[it(action="nuke")]),
+            body(items=[it(size_bytes=1)]),
+            body(items=[it(size_bytes="-1")]),
+            body(items=[it(), it(action="remove")]),
+            body(revision=-1),
+            body(revision="1"),
+            body(items=None),
+            body(assigned_bytes=5),
+            body(min_plugin_version=None),
         ]
         for body in bad:
             with self.assertRaises(SiteError):
@@ -192,7 +213,6 @@ class ClientTests(unittest.TestCase):
         prefs = {"up_limit": 10240 * 1024, "dl_limit": 0, "alt_up_limit": 512 * 1024, "alt_dl_limit": 1024 * 1024}
         self.assertEqual(QbDownloader("qb", FakeMpQb(FakeQbc(prefs, 1))).speed_limits()["up_kib"], 512)
         self.assertEqual(QbDownloader("qb", FakeMpQb(FakeQbc(prefs, 0))).speed_limits()["up_kib"], 10240)
-        self.assertEqual(QbDownloader("qb", FakeMpQb(FakeQbc(prefs, 0))).torrent_upload_limits([H]), {H: 2048})
 
     def test_tr_turtle_mode(self):
         session = types.SimpleNamespace(speed_limit_up=1000, speed_limit_up_enabled=False, speed_limit_down=50,

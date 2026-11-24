@@ -23,6 +23,10 @@ from .torrent import TorrentError, info_hash
 HARD_MAX_ADDS = 50
 HARD_MAX_DELETES = 20
 BACKOFF_STEPS = (3600, 4 * 3600, 24 * 3600)
+MAX_KIB = 1048576  # 契约里限速读数的上限
+# 下载器状态 → 契约 SeedGroupStateInput.status
+STATE_TO_CONTRACT = {"seeding": "seeding", "downloading": "downloading", "paused": "paused", "queued": "paused",
+                     "checking": "checking", "error": "error", "unknown": "error"}
 
 
 @dataclass
@@ -80,7 +84,7 @@ class Engine:
 
     def __init__(self, site: SiteClient, downloaders: List[Downloader], settings: Settings,
                  state: Dict[str, Any], persist: Callable[[Dict[str, Any]], None],
-                 plugin_version: str, host_version: str = "", stop: Optional[threading.Event] = None,
+                 plugin_version: str, stop: Optional[threading.Event] = None,
                  log: Any = None, now: Callable[[], float] = time.time):
         self.site = site
         self.downloaders = downloaders
@@ -90,7 +94,6 @@ class Engine:
         self.state.setdefault("backoff", {})
         self.persist = persist
         self.plugin_version = plugin_version
-        self.host_version = host_version
         self.stop = stop or threading.Event()
         self.log = log
         self.now = now
@@ -150,10 +153,9 @@ class Engine:
         last = self.state.get("last_revision")
         allow_deletes, block = True, ""
         if isinstance(last, int):
+            # 契约：revision 按成员单调递增（跳号正常：两轮之间站点可能改了好几次）；倒退 = 本轮不删
             if assignment.revision < last:
                 allow_deletes, block = False, "revision_regressed"
-            elif assignment.revision > last + 1 and self.state.get("strict_revision"):
-                allow_deletes, block = False, "revision_gap"
 
         # 列种子：任何一台列不出来，本轮不删也不加（判断不了重复与共用内容）
         listings: Dict[str, List[ClientTorrent]] = {}
@@ -377,55 +379,30 @@ class Engine:
     # ---------------- 上报 ----------------
     def _report(self, report: RunReport, assignment: Assignment,
                 listings: Dict[str, List[ClientTorrent]], by_name: Dict[str, Downloader]) -> None:
+        """按契约 SeedGroupStateInput 上报：只报本插件管理且仍在下载器里的种子（站点据此确认收回已完成），
+        以及每台下载器的只读限速。下载器里本来就有的同 hash 种子（不是本插件加的）不报。"""
         self._checkpoint()
-        found: Dict[str, Tuple[Downloader, ClientTorrent]] = {}
-        for name, rows in listings.items():
-            for t in rows:
-                found.setdefault(t.info_hash, (by_name[name], t))
-        # 单种上传限速（只读）
-        per_limits: Dict[str, int] = {}
-        for name, dl in by_name.items():
-            mine = [h for h, rec in self.owned.items() if rec.get("downloader") == name]
-            try:
-                per_limits.update(dl.torrent_upload_limits(mine))
-            except Exception:  # nosec B110  # 读不到单种限速只是少一项事实，不影响本轮
-                pass
         items = []
-        for item in assignment.items:
-            h = item.info_hash
-            hit = found.get(h)
-            entry: Dict[str, Any] = {"info_hash": h, "torrent_id": item.torrent_id}
-            if hit is None:
-                entry["status"] = "missing"
-            elif h not in self.owned:
-                entry["status"] = "external"
-                entry["client_type"] = hit[0].type
-            else:
-                dl, t = hit
-                entry.update({"status": t.state, "progress": round(t.progress, 4), "client_type": dl.type,
-                              "uploaded": t.uploaded})
-                if h in per_limits:
-                    entry["upload_limit_kib"] = per_limits[h]
-            if h in report.skipped and report.skipped[h].startswith("add_failed"):
-                entry["error"] = report.skipped[h].split(":", 1)[1]
-            items.append(entry)
+        for h, rec in sorted(self.owned.items()):
+            rows = listings.get(rec.get("downloader"), [])
+            t = next((x for x in rows if x.info_hash == h), None)
+            if t is None:
+                continue
+            items.append({"info_hash": h, "status": STATE_TO_CONTRACT.get(t.state, "error"),
+                          "progress": max(0.0, min(1.0, round(float(t.progress), 4)))})
         clients = []
         for i, dl in enumerate(self.downloaders, 1):
-            row: Dict[str, Any] = {"client": f"{dl.type}#{i}", "type": dl.type}
+            # 名字用「类型#序号」：不把成员给下载器起的名字（可能是内网地址）报出去
+            row: Dict[str, Any] = {"name": f"{dl.type}#{i}", "readable": False, "up_kib": 0, "dl_kib": 0}
             try:
-                row.update(dl.speed_limits())
-                row["readable"] = True
+                lim = dl.speed_limits()
+                up, down = lim.get("up_kib"), lim.get("dl_kib")
+                if up is not None and down is not None:
+                    row.update(readable=True, up_kib=min(int(up), MAX_KIB), dl_kib=min(int(down), MAX_KIB))
             except ClientError:
-                row["readable"] = False
+                pass
             clients.append(row)
-        payload = {
-            "revision": assignment.revision,
-            "plugin_version": self.plugin_version,
-            "host": "moviepilot",
-            "host_version": self.host_version,
-            "items": items,
-            "clients": clients,
-        }
+        payload = {"plugin_version": self.plugin_version, "items": items, "clients": clients}
         try:
             self.site.report_state(payload)
             report.state_reported = True

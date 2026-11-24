@@ -42,6 +42,7 @@ class AssignmentItem:
     size: int
     action: str
     download_url: str = ""
+    reason: str = ""
 
 
 @dataclass
@@ -50,7 +51,7 @@ class Assignment:
     min_plugin_version: str
     capacity_gib: int
     items: List[AssignmentItem] = field(default_factory=list)
-    report_interval_minutes: int = 0
+    assigned_bytes: int = 0
 
 
 def parse_version(value: Any) -> tuple:
@@ -69,20 +70,24 @@ def version_below(ours: str, minimum: str) -> bool:
     return mine + (0,) * (width - len(mine)) < low + (0,) * (width - len(low))
 
 
-def _as_int(value: Any, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise SiteError("bad_shape")
-    if value < 0:
+def _as_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise SiteError("bad_shape")
     return value
 
 
+def _as_bytes(value: Any) -> int:
+    """契约里字节数是十进制字符串（UIntDecimal）。"""
+    if isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value):
+        return int(value)
+    raise SiteError("bad_shape")
+
+
 def parse_assignment(body: Any) -> Assignment:
-    """严格校验站点返回；任何一条不合规都整单作废（本轮不加不删）。"""
+    """严格校验站点返回（契约 SeedGroupAssignment）；任何一条不合规都整单作废（本轮不加不删）。"""
     if not isinstance(body, dict):
         raise SiteError("bad_shape")
-    data = body.get("data") if isinstance(body.get("data"), dict) else body
-    items_raw = data.get("items")
+    items_raw = body.get("items")
     if not isinstance(items_raw, list):
         raise SiteError("bad_shape")
     items: List[AssignmentItem] = []
@@ -90,31 +95,33 @@ def parse_assignment(body: Any) -> Assignment:
     for raw in items_raw:
         if not isinstance(raw, dict):
             raise SiteError("bad_shape")
-        info_hash = str(raw.get("info_hash") or "").lower()
+        info_hash = raw.get("info_hash")
         action = raw.get("action")
-        if not _HASH_RE.match(info_hash) or action not in ACTIONS or info_hash in seen:
+        if not isinstance(info_hash, str) or not _HASH_RE.match(info_hash) or action not in ACTIONS \
+                or info_hash in seen:
             raise SiteError("bad_shape")
         seen.add(info_hash)
         url = raw.get("download_url") or ""
-        if not isinstance(url, str):
+        reason = raw.get("reason") or ""
+        if not isinstance(url, str) or not isinstance(reason, str):
             raise SiteError("bad_shape")
         items.append(AssignmentItem(
             info_hash=info_hash,
-            torrent_id=_as_int(raw.get("torrent_id"), "torrent_id"),
-            size=_as_int(raw.get("size"), "size"),
+            torrent_id=_as_int(raw.get("torrent_id")),
+            size=_as_bytes(raw.get("size_bytes")),
             action=action,
             download_url=url,
+            reason=reason,
         ))
-    minimum = data.get("min_plugin_version") or ""
+    minimum = body.get("min_plugin_version")
     if not isinstance(minimum, str):
         raise SiteError("bad_shape")
-    interval = data.get("report_interval_minutes") or 0
     return Assignment(
-        revision=_as_int(data.get("revision"), "revision"),
+        revision=_as_int(body.get("revision")),
         min_plugin_version=minimum,
-        capacity_gib=_as_int(data.get("capacity_gib") or 0, "capacity_gib"),
+        capacity_gib=_as_int(body.get("capacity_gib")),
         items=items,
-        report_interval_minutes=interval if isinstance(interval, int) and interval > 0 else 0,
+        assigned_bytes=_as_bytes(body.get("assigned_bytes")),
     )
 
 

@@ -47,6 +47,7 @@ REASON_TEXT = {
     "http_401": "API Key 无效",
     "http_403": "API Key 没有 seedgroup 权限，或你不在保种组",
     "http_404": "站点没有这个接口",
+    "http_409": "还没在站点申报可提供空间",
     "http_429": "请求太频繁",
     "http_5xx": "站点暂时出错",
     "timeout": "连接站点超时",
@@ -200,7 +201,6 @@ class ColaSeedGroup(_PluginBase):
                 state=state,
                 persist=lambda s: self.save_data("state", s),
                 plugin_version=PLUGIN_VERSION,
-                host_version=_host_version(),
                 stop=stop,
                 log=logger,
             )
@@ -306,7 +306,8 @@ class ColaSeedGroup(_PluginBase):
             if last.get("delete_block") and status == "ok":
                 headline += f" · 本轮未删种：{last['delete_block']}"
             if last.get("state_error"):
-                headline += f" · 状态上报失败：{last['state_error']}"
+                err = str(last["state_error"])
+                headline += f" · 状态上报失败：{REASON_TEXT.get(err.split(':', 1)[0], err)}"
 
         def stat(label: str, value: Any) -> dict:
             return {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [{

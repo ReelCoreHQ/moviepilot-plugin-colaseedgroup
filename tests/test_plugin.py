@@ -110,9 +110,10 @@ class PluginTests(unittest.TestCase):
 
     def test_full_cycle_no_secrets_in_logs_or_data(self):
         data, h = make_torrent("Film")
-        body = {"revision": 1, "min_plugin_version": "0.7.0", "capacity_gib": 2048,
-                "items": [{"info_hash": h, "torrent_id": 3, "size": 10, "action": "add",
-                           "download_url": "/api/v1/dl/signed-SECRETTOKEN"}]}
+        body = {"revision": 1, "min_plugin_version": "0.7.0", "capacity_gib": 2048, "assigned_bytes": "10",
+                "server_time": "2026-11-24T00:00:00Z",
+                "items": [{"info_hash": h, "torrent_id": 3, "size_bytes": "10", "action": "add",
+                           "download_url": "https://c.example.com/api/v1/dl/signed-SECRETTOKEN", "reason": None}]}
         sess = self._session({"/assignment": Rsp(200, body), "signed-SECRETTOKEN": Rsp(200, content=data),
                               "/state": Rsp(200, {})})
         p = make_plugin()

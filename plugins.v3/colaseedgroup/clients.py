@@ -1,14 +1,14 @@
 """MoviePilot 下载器实例（qBittorrent / Transmission）之上的薄适配层。
 
 只用 MoviePilot 自己的下载器模块（``DownloaderHelper`` 给出的 instance），不自己连下载器、
-不碰下载器凭据。对外只暴露对齐需要的五件事：列种子、加种、删种、读限速、读单种限速。
+不碰下载器凭据。对外只暴露对齐需要的四件事：列种子、加种、删种、读全局限速。
 
 **不改任何限速**：这里没有任何写限速的方法（可乐站规与别站（如馒头）规则都要求插件不碰别的种子与全局参数）。
 """
 
 import posixpath
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 
 class ClientError(Exception):
@@ -101,10 +101,6 @@ class Downloader:
     def speed_limits(self) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def torrent_upload_limits(self, hashes: Iterable[str]) -> Dict[str, int]:
-        """单种上传限速（KiB/s，0 = 不限）。读不到的种子不出现在结果里。"""
-        return {}
-
 
 _QB_STATES = {
     "uploading": "seeding", "stalledUP": "seeding", "forcedUP": "seeding", "queuedUP": "queued",
@@ -190,24 +186,6 @@ class QbDownloader(Downloader):
             "alt_up_kib": alt_up,
             "alt_dl_kib": alt_dl,
         }
-
-    def torrent_upload_limits(self, hashes: Iterable[str]) -> Dict[str, int]:
-        wanted = [h for h in hashes]
-        if not wanted:
-            return {}
-        try:
-            rows = self._qbc().torrents_info(torrent_hashes=wanted)
-        except Exception:
-            return {}
-        out = {}
-        for row in rows or []:
-            limit = _get(row, "up_limit", default=0)
-            try:
-                limit = int(limit)
-            except (TypeError, ValueError):
-                continue
-            out[str(_get(row, "hash", default="")).lower()] = max(0, limit) // 1024
-        return out
 
 
 _TR_STATES = {0: "paused", 1: "checking", 2: "checking", 3: "queued", 4: "downloading", 5: "queued", 6: "seeding"}
@@ -305,21 +283,6 @@ class TrDownloader(Downloader):
             "alt_up_kib": alt_up,
             "alt_dl_kib": alt_dl,
         }
-
-    def torrent_upload_limits(self, hashes: Iterable[str]) -> Dict[str, int]:
-        wanted = [h for h in hashes]
-        if not wanted:
-            return {}
-        try:
-            rows = self._trc().get_torrents(ids=wanted, arguments=["hashString", "uploadLimit", "uploadLimited"])
-        except Exception:
-            return {}
-        out = {}
-        for row in rows or []:
-            limited = _get(row, "upload_limited", "uploadLimited", default=False)
-            limit = _kib(_get(row, "upload_limit", "uploadLimit", default=0)) or 0
-            out[str(_get(row, "hashString", "hash_string", default="")).lower()] = limit if limited else 0
-        return out
 
 
 def wrap(name: str, service_type: str, instance: Any) -> Optional[Downloader]:
