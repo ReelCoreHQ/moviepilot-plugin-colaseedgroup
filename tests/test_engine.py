@@ -8,6 +8,7 @@ from support import LOG, import_plugin, make_torrent
 pkg = import_plugin()
 from colaseedgroup.clients import AddResult, ClientError, ClientTorrent, Downloader  # noqa: E402
 from colaseedgroup.engine import (  # noqa: E402
+    MAX_AUTO_TAKEOVERS,
     MAX_SNAPSHOT_ROWS,
     Actions,
     Engine,
@@ -112,7 +113,8 @@ def owned_torrent(h, name="Movie", save=SAVE, tags=(TAG,)):
 
 def engine(site, dls, state=None, **kw):
     settings = Settings(save_path=SAVE, tag=TAG, max_adds=kw.pop("max_adds", 5),
-                        max_deletes=kw.pop("max_deletes", 5), delete_files=kw.pop("delete_files", True))
+                        max_deletes=kw.pop("max_deletes", 5), delete_files=kw.pop("delete_files", True),
+                        auto_takeover=kw.pop("auto_takeover", False))
     saved = []
     e = Engine(site, dls, settings, state if state is not None else {}, lambda s: saved.append(True),
                plugin_version=kw.pop("version", "0.7.0"), stop=kw.pop("stop", None), log=LOG)
@@ -181,6 +183,113 @@ class OwnershipTests(unittest.TestCase):
         engine(FakeSite(Assignment(1, "", 2048, [item(H3, "remove"), item(H1, "keep")])), [dl], state).run()
         self.assertEqual(dl.removed, [])
         self.assertIn(H3, dl.torrents)
+
+
+def hxx(n):
+    return f"{n:040x}"
+
+
+class AutoTakeoverTests(unittest.TestCase):
+    """自动接管（默认关）：只接 keep / add 派单里已下完且在做种的同 hash 种子，做的事与手动接管相同。"""
+
+    def external(self, h, name="Pre", state="seeding", progress=1.0, tags=()):
+        return ClientTorrent(h, name, "/downloads/other", f"/downloads/other/{name}", set(tags), progress, state)
+
+    def test_off_by_default_and_on_takes_over_like_manual(self):
+        dl = FakeDownloader(torrents=[self.external(H1, tags=("IYUU",))])
+        site = FakeSite(Assignment(1, "", 2048, [item(H1, "keep", tid=7, name="Pre.Film")]))
+        state = {}
+        r = engine(site, [dl], state).run()
+        self.assertEqual((r.taken_over, r.skipped[H1], dl.calls), ([], "external", []))
+        self.assertNotIn(H1, state["owned"])
+        r = engine(site, [dl], state, auto_takeover=True).run()
+        self.assertEqual(r.taken_over, [H1])
+        self.assertNotIn(H1, r.skipped)
+        self.assertEqual(dl.calls, [("add_tag", H1, TAG)])
+        self.assertEqual(dl.torrents[H1].tags, {"IYUU", TAG})
+        self.assertEqual(dl.torrents[H1].save_path, "/downloads/other")      # 文件没动
+        rec = state["owned"][H1]
+        self.assertEqual((rec["downloader"], rec["torrent_id"], rec["taken_over"]), ("qb", 7, True))
+        self.assertEqual(dl.added, [])
+        row = next(x for x in r.assignments if x["info_hash"] == H1)
+        self.assertEqual((row["local"], local_text(row, str)), ("taken_over", "本轮自动接管"))
+        # 已接管之后再同步：就是自己的，不再算接管
+        r = engine(site, [dl], state, auto_takeover=True).run()
+        self.assertEqual(r.taken_over, [])
+        self.assertEqual(site.reports[-1]["items"][0]["external"], False)
+
+    def test_log_names_torrent_without_hash_or_path(self):
+        dl = FakeDownloader(torrents=[self.external(H1, name="Client.Name")])
+        before = len(LOG.text())
+        engine(FakeSite(Assignment(1, "", 2048, [item(H1, "add", name="Site.Name")])), [dl], {},
+               auto_takeover=True).run()
+        text = LOG.text()[before:]
+        self.assertIn("自动接管 Site.Name", text)
+        line = next(x for x in text.splitlines() if "自动接管 Site.Name" in x)
+        self.assertNotIn(H1[:8], line)
+        self.assertNotIn("/downloads", line)
+
+    def test_skips_paused_error_checking_and_incomplete(self):
+        cases = {H1: self.external(H1, state="paused"), H2: self.external(H2, state="error"),
+                 H3: self.external(H3, state="checking"), hxx(4): self.external(hxx(4), state="downloading", progress=.5),
+                 hxx(5): self.external(hxx(5), state="seeding", progress=.99), hxx(6): self.external(hxx(6), state="queued")}
+        dl = FakeDownloader(torrents=list(cases.values()))
+        site = FakeSite(Assignment(1, "", 2048, [item(h, "keep", tid=i) for i, h in enumerate(cases, 1)]))
+        state = {}
+        r = engine(site, [dl], state, auto_takeover=True).run()
+        self.assertEqual(r.taken_over, [])
+        self.assertEqual(dl.calls, [])
+        self.assertEqual(state["owned"], {})
+        self.assertTrue(all(r.skipped[h] == "external" for h in cases))
+
+    def test_never_on_remove_items(self):
+        dl = FakeDownloader(torrents=[self.external(H1)])
+        state = {}
+        r = engine(FakeSite(Assignment(1, "", 2048, [item(H1, "remove")])), [dl], state, auto_takeover=True).run()
+        self.assertEqual((r.taken_over, dl.calls, dl.removed), ([], [], []))
+        self.assertEqual(r.skipped[H1], "not_owned")
+        self.assertNotIn(H1, state["owned"])
+
+    def test_cap_per_run_does_not_use_add_quota(self):
+        n = MAX_AUTO_TAKEOVERS + 3
+        hashes = [hxx(100 + i) for i in range(n)]
+        dl = FakeDownloader(torrents=[self.external(h, name=f"P{i}") for i, h in enumerate(hashes)])
+        data, new = make_torrent("Brand.New")
+        site = FakeSite(Assignment(1, "", 2048, [item(h, "keep", tid=i) for i, h in enumerate(hashes, 1)]
+                                   + [item(new, "add", tid=99)]), torrents={"/d/99": data})
+        state = {}
+        r = engine(site, [dl], state, auto_takeover=True, max_adds=1).run()
+        self.assertEqual(len(r.taken_over), MAX_AUTO_TAKEOVERS)
+        self.assertEqual(sum(1 for h in hashes if r.skipped.get(h) == "takeover_cap"), 3)
+        self.assertEqual(r.added, [new])                         # 加种额度没被接管占掉
+        r = engine(site, [dl], state, auto_takeover=True, max_adds=1).run()
+        self.assertEqual(len(r.taken_over), 3)                   # 剩下的下一轮接着接
+
+    def test_tag_failure_leaves_it_external(self):
+        dl = FakeDownloader(torrents=[self.external(H1)])
+        dl.add_tag = lambda *a: False
+        state = {}
+        r = engine(FakeSite(Assignment(1, "", 2048, [item(H1, "keep")])), [dl], state, auto_takeover=True).run()
+        self.assertEqual((r.taken_over, r.skipped[H1]), ([], "takeover_failed"))
+        self.assertNotIn(H1, state["owned"])
+
+    def test_taken_over_then_released_deleted_with_shared_content_rule(self):
+        pre = self.external(H1, name="Movie")
+        cross = ClientTorrent(H2, "Movie", "/downloads/other", "/downloads/other/Movie", {"IYUU"}, 1.0, "seeding")
+        dl = FakeDownloader(torrents=[pre, cross])
+        state = {}
+        engine(FakeSite(Assignment(1, "", 2048, [item(H1, "keep")])), [dl], state, auto_takeover=True).run()
+        self.assertTrue(state["owned"][H1]["taken_over"])
+        r = engine(FakeSite(Assignment(2, "", 2048, [item(H1, "remove")])), [dl], state, auto_takeover=True).run()
+        self.assertEqual(r.removed, [H1])
+        self.assertEqual(dl.removed, [(H1, False)])              # 共用内容：只删种子
+        self.assertNotIn(H2, [h for h, _ in dl.removed])
+        # 不共用时连文件删
+        dl2 = FakeDownloader(torrents=[self.external(H3, name="Solo")])
+        state2 = {}
+        engine(FakeSite(Assignment(1, "", 2048, [item(H3, "add")])), [dl2], state2, auto_takeover=True).run()
+        engine(FakeSite(Assignment(2, "", 2048, [item(H3, "remove")])), [dl2], state2).run()
+        self.assertEqual(dl2.removed, [(H3, True)])
 
 
 class SharedContentTests(unittest.TestCase):

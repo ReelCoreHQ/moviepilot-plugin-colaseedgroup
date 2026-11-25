@@ -23,6 +23,7 @@ from .engine import (
     FILTERS,
     HARD_MAX_ADDS,
     HARD_MAX_DELETES,
+    MAX_AUTO_TAKEOVERS,
     ROW_ACTION_TEXT,
     Actions,
     Engine,
@@ -37,7 +38,7 @@ from .engine import (
 )
 from .site import SiteClient
 
-PLUGIN_VERSION = "0.7.1"
+PLUGIN_VERSION = "0.7.2"
 DEFAULT_SITE = "https://www.colapt.com"
 KEY_PAGE = "https://www.colapt.com/account/tracker?tab=api"
 DEFAULT_TAG = "可乐保种组"
@@ -277,6 +278,7 @@ class ColaSeedGroup(_PluginBase):
         self._max_adds = DEFAULT_MAX_ADDS
         self._max_deletes = 5
         self._delete_files = True
+        self._auto_takeover = False
         self._stop = threading.Event()
 
     # ---------------- 生命周期 ----------------
@@ -295,6 +297,7 @@ class ColaSeedGroup(_PluginBase):
         self._max_adds = _int(config.get("max_adds"), DEFAULT_MAX_ADDS, 0, HARD_MAX_ADDS)
         self._max_deletes = _int(config.get("max_deletes"), 5, 0, HARD_MAX_DELETES)
         self._delete_files = bool(config.get("delete_files", True))
+        self._auto_takeover = bool(config.get("auto_takeover", False))
         if not self.get_data("instance_id"):
             self.save_data("instance_id", uuid.uuid4().hex)
         if config.get("onlyonce"):
@@ -465,7 +468,8 @@ class ColaSeedGroup(_PluginBase):
                 site=site,
                 downloaders=self._selected(),
                 settings=Settings(save_path=self._save_path, tag=self._tag, max_adds=self._max_adds,
-                                  max_deletes=self._max_deletes, delete_files=self._delete_files),
+                                  max_deletes=self._max_deletes, delete_files=self._delete_files,
+                                  auto_takeover=self._auto_takeover),
                 state=state,
                 persist=lambda s: self.save_data("state", s),
                 plugin_version=PLUGIN_VERSION,
@@ -516,6 +520,12 @@ class ColaSeedGroup(_PluginBase):
                                   "只删本插件加的种子；内容被别的种子共用时只删种子")),
                 ]},
                 {"component": "VRow", "content": [
+                    col(12, switch("auto_takeover", "自动接管",
+                                   "默认关。开启后，下载器里已经在做种的同一颗种子会被自动接管；"
+                                   "站点收回这条派单时，它会被删除（共用内容时只删种子）。"
+                                   f"只接已下完且在做种的，每轮最多 {MAX_AUTO_TAKEOVERS} 颗，不挪文件")),
+                ]},
+                {"component": "VRow", "content": [
                     col(12, text("api_key", "可乐PT API Key",
                                  f"在 {KEY_PAGE} 创建，勾选「保种组（seedgroup）」范围", type="password")),
                 ]},
@@ -543,7 +553,7 @@ class ColaSeedGroup(_PluginBase):
                     col(12, {"component": "VAlert", "props": {
                         "type": "info", "variant": "tonal",
                         "text": ("插件只执行站点派单：缺的加、站点明确收回的删。"
-                                 "下载器里已有的同一颗种子不会被自动接管（可在插件页手动接管）；"
+                                 "下载器里已有的同一颗种子默认不接管（可在插件页手动接管，或打开「自动接管」）；"
                                  "你自己的种子、别站的种子永远不会被删除，也不会改动任何限速。"
                                  "奖励由站点按 tracker 实际做种情况计算。"),
                     }}),
@@ -553,7 +563,7 @@ class ColaSeedGroup(_PluginBase):
         defaults = {
             "enabled": False, "onlyonce": False, "api_key": "", "site_url": DEFAULT_SITE, "downloaders": [],
             "save_path": DEFAULT_SAVE_PATH, "tag": DEFAULT_TAG, "interval": DEFAULT_INTERVAL,
-            "max_adds": DEFAULT_MAX_ADDS, "max_deletes": 5, "delete_files": True,
+            "max_adds": DEFAULT_MAX_ADDS, "max_deletes": 5, "delete_files": True, "auto_takeover": False,
         }
         return form, defaults
 

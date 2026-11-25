@@ -325,6 +325,30 @@ class PluginTests(unittest.TestCase):
         self.assertEqual((p._interval, p._max_adds), (30, 5))
         self.assertTrue(defaults["delete_files"])
         self.assertIn("api_key", json.dumps(form))
+        self.assertFalse(defaults["auto_takeover"])          # 自动接管默认关
+        self.assertIn('"model": "auto_takeover"', json.dumps(form))
+        self.assertFalse(make_plugin()._auto_takeover)
+        self.assertTrue(make_plugin(auto_takeover=True)._auto_takeover)
+
+    def test_auto_takeover_full_cycle(self):
+        _, h = make_torrent("Theirs.Film")
+        self.mp_qb.rows = [{"hash": h, "name": "Theirs.Film", "save_path": "/media", "content_path": "/media/Theirs.Film",
+                            "tags": "", "progress": 1, "state": "stalledUP"}]
+        body = {"revision": 1, "min_plugin_version": "0.7.0", "capacity_gib": 2048, "assigned_bytes": "10",
+                "server_time": "2026-11-24T00:00:00Z",
+                "items": [{"info_hash": h, "torrent_id": 3, "size_bytes": "10", "action": "keep",
+                           "download_url": "https://c.example.com/api/v1/dl/signed-SECRETTOKEN", "reason": None}]}
+        self._session({"/assignment": Rsp(200, body), "/state": Rsp(200, {})})
+        p = make_plugin()                                    # 默认关：不动
+        self.assertEqual(p.run_cycle()["taken_over"], [])
+        self.assertEqual(self.mp_qb.rows[0]["tags"], "")
+        p = make_plugin(auto_takeover=True)
+        self.assertEqual(p.run_cycle()["taken_over"], [h])
+        self.assertIn("可乐保种组", self.mp_qb.rows[0]["tags"])
+        self.assertEqual(self.mp_qb.rows[0]["save_path"], "/media")
+        self.assertTrue(p.get_data("state")["owned"][h]["taken_over"])
+        self.assertIn("自动接管 Theirs.Film", LOG.text())
+        self.assertIn("本轮自动接管", json.dumps(p.get_page(), ensure_ascii=False))
 
 
     # ---------------- 页面上的手动操作 ----------------

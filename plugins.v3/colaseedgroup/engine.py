@@ -6,7 +6,10 @@
   站点派单之外的种子（成员自己的、别站的、馒头的……）不会出现在任何删除路径上。
   例外只有成员在面板上**明确确认「接管」**的同 hash 种子：记进账本（``taken_over``）、打上专用标签，
   不挪文件，所以对它只放宽「在专用目录」这一条；标签、账本、同一台下载器照样都要，删文件照样守共用内容规则。
-- **同 hash 已存在不自动接管**：派来的种子在下载器里已经有了（不是本插件加的），只上报 ``external``，不记账、不删（除非成员手动接管）。
+- **同 hash 已存在默认不自动接管**：派来的种子在下载器里已经有了（不是本插件加的），只上报 ``external``，不记账、不删
+  （除非成员手动接管）。成员打开「自动接管」（``Settings.auto_takeover``，默认关）后，同步时对 keep / add 派单里
+  **已下完且在做种**（进度 100%、状态做种中，没暂停、没出错、不在校验）的同 hash 种子自动做一次与手动接管相同的事：
+  打专用标签、记账（``taken_over``），不挪文件。每轮最多 ``MAX_AUTO_TAKEOVERS`` 颗，不占加种额度；收回的派单永远不接管。
 - **共用内容不删文件**：删之前看所选下载器里有没有别的种子用着同一内容路径（辅种），有就只删种子。
 - **出错不删**：派单拉取失败 / 返回不合规 / revision 倒退或跳号 / 任一下载器列不出种子 → 本轮不删。
 - **每轮删除上限**，加种也有上限与失败退避。
@@ -28,6 +31,9 @@ from .torrent import TorrentError, info_hash
 
 HARD_MAX_ADDS = 50
 HARD_MAX_DELETES = 20
+# 自动接管每轮上限：接管不下载、不占盘，所以不占「每轮最多加种」的额度；但它会让一颗原本不归插件管的种子
+# 变成「站点收回时会被删」，所以单独限个小数，首次打开时不会一轮接管几百颗（剩下的下一轮接着接）
+MAX_AUTO_TAKEOVERS = 10
 BACKOFF_STEPS = (3600, 4 * 3600, 24 * 3600)
 MAX_KIB = 1048576  # 契约里限速读数的上限
 # 下载器状态 → 契约 SeedGroupStateInput.status
@@ -45,7 +51,7 @@ RELEASE_TEXT = {"surplus": "副本超额，收回", "capacity": "空间调低，
 PENDING_TEXT = {"add_cap": "本轮已达加种上限", "no_download_url": "派单没有下载链接",
                 "outdated": "插件版本低于站点要求，本轮不加", "client_unavailable": "有下载器不可用，本轮不加"}
 # 排序：异常 → 待加种 → 收回 → 其余
-_PRESENT = ("owned", "added", "external")
+_PRESENT = ("owned", "added", "taken_over", "external")
 
 
 def action_text(row: Dict[str, Any]) -> str:
@@ -69,6 +75,8 @@ def local_text(row: Dict[str, Any], fmt_time: Callable[[float], str]) -> str:
         return f"插件管理·{_client_state(row)}"
     if local == "added":
         return "本轮已加"
+    if local == "taken_over":
+        return "本轮自动接管"
     if local == "external":
         return f"已在下载器（非插件管理）·{_client_state(row)}"
     if local == "pending":
@@ -135,7 +143,7 @@ def row_actions(row: Dict[str, Any]) -> List[str]:
     local, status = row.get("local"), row.get("status")
     if local == "backoff":
         return ["retry"]
-    if local in ("owned", "added") and row.get("action") != "remove":
+    if local in ("owned", "added", "taken_over") and row.get("action") != "remove":
         return ["resume"] if status == "paused" else (["recheck"] if status == "error" else [])
     if local == "external" and row.get("action") != "remove":
         return ["takeover"]
@@ -159,11 +167,36 @@ def managed(t: ClientTorrent, record: Dict[str, Any], settings: "Settings") -> b
     return bool(record.get("taken_over")) or path_within(t.save_path, settings.save_path)
 
 
+def seeding_complete(t: ClientTorrent) -> bool:
+    """自动接管的前提：已下完（进度 100%）且下载器说在做种（qB 的 uploading / stalledUP / forcedUP 等、
+    TR 的 seeding 都归一成 seeding）；暂停、出错、校验中、排队、下载中一律不算。"""
+    return t.state == "seeding" and float(t.progress or 0) >= 1.0
+
+
+def take_over_torrent(dl: Downloader, t: ClientTorrent, settings: "Settings", state: Dict[str, Any],
+                      torrent_id: Any, size: Any, now: float) -> bool:
+    """接管（手动与自动共用）：没有专用标签就打上，记进账本（``taken_over``），清掉它的加种退避。
+    不挪文件、不改保存路径。打标签失败返回 False，账本不动。调用方负责持久化。"""
+    h = t.info_hash
+    if settings.tag not in t.tags:
+        try:
+            ok = dl.add_tag(h, settings.tag, t.tags)
+        except ClientError:
+            ok = False
+        if not ok:
+            return False
+    state["owned"][h] = {"downloader": dl.name, "torrent_id": torrent_id, "size": size,
+                         "added_at": int(now), "taken_over": True}
+    state["backoff"].pop(h, None)
+    return True
+
+
 def summarize(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     locals_ = [r.get("local") for r in rows]
     return {
         "total": len(rows),
-        "managed": sum(1 for r in rows if r.get("action") != "remove" and r.get("local") in ("owned", "added")),
+        "managed": sum(1 for r in rows if r.get("action") != "remove"
+                       and r.get("local") in ("owned", "added", "taken_over")),
         "external": sum(1 for r in rows if r.get("action") != "remove" and r.get("local") == "external"),
         "pending": locals_.count("pending"),
         "backoff": locals_.count("backoff"),
@@ -194,6 +227,7 @@ class Settings:
     max_adds: int = 5
     max_deletes: int = 5
     delete_files: bool = True
+    auto_takeover: bool = False
 
     def capped(self) -> "Settings":
         return Settings(
@@ -202,6 +236,7 @@ class Settings:
             max_adds=max(0, min(int(self.max_adds), HARD_MAX_ADDS)),
             max_deletes=max(0, min(int(self.max_deletes), HARD_MAX_DELETES)),
             delete_files=bool(self.delete_files),
+            auto_takeover=bool(self.auto_takeover),
         )
 
 
@@ -214,6 +249,7 @@ class RunReport:
     delete_block: str = ""
     added: List[str] = field(default_factory=list)
     removed: List[str] = field(default_factory=list)
+    taken_over: List[str] = field(default_factory=list)   # 本轮自动接管的 hash
     skipped: Dict[str, str] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
     state_reported: bool = False
@@ -378,7 +414,9 @@ class Engine:
         self._snapshot(report, assignment, fresh, listings, failed, blocked="" if allow_adds else "client_unavailable")
         self._info(
             f"本轮完成：派单 {len(assignment.items)} 条（revision {assignment.revision}），"
-            f"新加 {len(report.added)}，删除 {len(report.removed)}，跳过 {len(report.skipped)}"
+            f"新加 {len(report.added)}，删除 {len(report.removed)}，"
+            + (f"自动接管 {len(report.taken_over)}，" if report.taken_over else "")
+            + f"跳过 {len(report.skipped)}"
         )
 
     # ---------------- 删种 ----------------
@@ -466,7 +504,9 @@ class Engine:
             if present:
                 if record and any(d.name == record.get("downloader") for d, _ in present):
                     continue  # 自己的，在跑
-                report.skipped[h] = "external"   # 下载器里本来就有：不接管
+                report.skipped[h] = "external"   # 下载器里本来就有：默认不接管
+                if self.settings.auto_takeover and not record:
+                    self._auto_take_over(report, item, present)
                 continue
             if record:
                 # 记过账但下载器里没了（成员手动删了）：销账，按新派单重新加
@@ -494,6 +534,27 @@ class Engine:
                 backoff[h] = {"fails": fails, "until": now + step, "reason": reason}
                 report.skipped[h] = f"add_failed:{reason}"
             self._save()
+
+    def _auto_take_over(self, report: RunReport, item: AssignmentItem,
+                        present: List[Tuple[Downloader, ClientTorrent]]) -> None:
+        """自动接管（成员打开了 auto_takeover）：只接已下完且在做种的那一颗，做的事与手动接管相同。
+        条件不满足就保持 external，什么都不动。"""
+        hit = next(((d, t) for d, t in present if seeding_complete(t)), None)
+        if hit is None:
+            return
+        h = item.info_hash
+        if len(report.taken_over) >= MAX_AUTO_TAKEOVERS:
+            report.skipped[h] = "takeover_cap"
+            return
+        self._checkpoint()
+        dl, t = hit
+        if not take_over_torrent(dl, t, self.settings, self.state, item.torrent_id, item.size, self.now()):
+            report.skipped[h] = "takeover_failed"
+            return
+        self._save()
+        report.skipped.pop(h, None)
+        report.taken_over.append(h)
+        self._info(f"自动接管 {display_name(item, [t.name])}")
 
     def _pick_target(self) -> Downloader:
         """选加种的下载器：本插件在其上管理的种子最少的那台（同数取配置顺序靠前的）。"""
@@ -640,6 +701,8 @@ class Engine:
                     row["local"] = "unknown" if blind else "gone"
             elif h in report.added:
                 row["local"] = "added"
+            elif h in report.taken_over:
+                row["local"] = "taken_over"
             elif mine:
                 row["local"] = "owned"
             elif hit:
@@ -801,16 +864,8 @@ class Actions:
         if hit is None:
             return self._result("client_unavailable" if unavailable else "not_in_client", ok=False)
         dl, t = hit
-        if self.settings.tag not in t.tags:
-            try:
-                ok = dl.add_tag(h, self.settings.tag, t.tags)
-            except ClientError:
-                ok = False
-            if not ok:
-                return self._result("tag_failed", ok=False)
-        self.state["owned"][h] = {"downloader": dl.name, "torrent_id": row.get("torrent_id"), "size": row.get("size"),
-                                  "added_at": int(self.now()), "taken_over": True}
-        self.state["backoff"].pop(h, None)
+        if not take_over_torrent(dl, t, self.settings, self.state, row.get("torrent_id"), row.get("size"), self.now()):
+            return self._result("tag_failed", ok=False)
         self.persist(self.state)
         self._info(f"手动接管：{dl.name} 上的 {short(h)}（种子 {row['torrent_id']}），打上专用标签、记入账本，文件没动")
         return self._result("taken_over")
