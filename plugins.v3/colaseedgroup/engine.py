@@ -1080,3 +1080,15 @@ class Actions:
         self.persist(self.state)
         self._info(f"手动接管：{dl.name} 上的 {short(h)}（种子 {row['torrent_id']}），打上专用标签、记入账本，文件没动")
         return self._result("taken_over")
+
+
+#: 没申报空间时给成员的提示（插件页与 Docker 面板共用；链接与「立即同步」按钮由外壳摆）
+CAPACITY_HINT = "还没在站点申报可提供的空间，站点不会派单。先到站点「我的保种组」填好空间，再点「立即同步」。"
+
+
+def needs_capacity(last: Dict[str, Any]) -> bool:
+    """上一轮看出成员还没申报空间：拉派单成功但申报为 0，或上报状态被站点以 409 拒绝。
+    站点对没申报的成员照常给空派单，所以这时状态是「正常」，必须单独提示，否则成员不知道下一步。"""
+    if not last or last.get("status") != "ok":
+        return False
+    return not last.get("capacity_gib") or str(last.get("state_error") or "").startswith("http_409")

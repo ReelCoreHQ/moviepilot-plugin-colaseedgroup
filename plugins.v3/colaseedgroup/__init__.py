@@ -20,6 +20,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from .clients import Downloader, norm_path, wrap
 from .engine import (
     ACTION_RESULT_TEXT,
+    CAPACITY_HINT,
     HARD_MAX_ADDS,
     HARD_MAX_DELETES,
     MAX_AUTO_TAKEOVERS,
@@ -29,12 +30,13 @@ from .engine import (
     duration_text,
     group_assignments,
     human_size,
+    needs_capacity,
     row_actions,
     takeover_warning,
 )
 from .site import SiteClient
 
-PLUGIN_VERSION = "0.7.2"
+PLUGIN_VERSION = "0.7.3"
 DEFAULT_SITE = "https://www.colapt.com"
 KEY_PAGE = "https://www.colapt.com/account/tracker?tab=api"
 DEFAULT_TAG = "可乐保种组"
@@ -283,7 +285,8 @@ def assignment_table(last: Dict[str, Any], site_url: str, armed: Optional[Dict[s
                         "text": f"全部派单 {groups['count']} 条 · {groups['size_text']}"}]
     if not groups["count"]:
         return out + [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact",
-                                                        "text": "站点暂时没有派单"}}, note]
+                                                        "text": "还没申报空间，所以没有派单" if needs_capacity(last)
+                                                        else "站点暂时没有派单"}}, note]
     out += _status_bar(groups)
     out += _confirm_takeover(rows, armed or {}, delete_files, now)
     panels = [_panel(sec["key"], sec["title"], _section_body(sec, now), count=sec["count"]) for sec in groups["sections"]]
@@ -614,7 +617,8 @@ class ColaSeedGroup(_PluginBase):
                 {"component": "VRow", "content": [
                     col(12, {"component": "VAlert", "props": {
                         "type": "info", "variant": "tonal",
-                        "text": ("插件只执行站点派单：缺的加、站点明确收回的删。"
+                        "text": ("先在站点「我的保种组」申报可提供的空间，否则站点不会派单。"
+                                 "插件只执行站点派单：缺的加、站点明确收回的删。"
                                  "下载器里已有的同一颗种子默认不接管（可在插件页手动接管，或打开「自动接管」）；"
                                  "你自己的种子、别站的种子永远不会被删除，也不会改动任何限速。"
                                  "奖励由站点按 tracker 实际做种情况计算。"),
@@ -669,16 +673,31 @@ class ColaSeedGroup(_PluginBase):
                 "class": "mb-3", "text": f"{_clock(float(action['at']))} · {action.get('message')}"}}]
         toolbar = {"component": "div", "props": {"class": "d-flex justify-end mb-2"}, "content": [
             _btn("立即同步", "/sync", {}, variant="flat")]} if self.get_state() else None
+        if needs_capacity(last):
+            # 站点对没申报的成员照常给空派单，状态是「正常」：不显示绿色的「正常」，直接告诉成员下一步去哪
+            hint, _, tail = CAPACITY_HINT.partition("「我的保种组」")
+            headline_alert = {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "class": "mb-3"},
+                              "content": [
+                                  {"component": "span", "text": hint},
+                                  {"component": "a", "props": {"href": f"{self._site_url}/account/seed-group",
+                                                               "target": "_blank", "rel": "noopener noreferrer",
+                                                               "class": "text-primary font-weight-bold"},
+                                   "text": "「我的保种组」"},
+                                  {"component": "span", "text": tail},
+                              ]}
+        else:
+            headline_alert = {"component": "VAlert", "props": {"type": alert_type, "variant": "tonal", "text": headline,
+                                                               "class": "mb-3"}}
         return [
             *([toolbar] if toolbar else []),
             *recent,
-            {"component": "VAlert", "props": {"type": alert_type, "variant": "tonal", "text": headline,
-                                              "class": "mb-3"}},
+            headline_alert,
             {"component": "VRow", "content": [
                 stat("派单条数", last.get("items", "-")),
                 stat("本插件管理", f"{len(owned)} 个 / {human_size(total)}"),
                 stat("本轮新加 / 删除", f"{len(last.get('added') or [])} / {len(last.get('removed') or [])}"),
-                stat("申报空间", human_size(int(last["capacity_gib"]) * 1024 ** 3) if last.get("capacity_gib") else "-"),
+                stat("申报空间", human_size(int(last["capacity_gib"]) * 1024 ** 3) if last.get("capacity_gib")
+                     else ("未申报" if last else "-")),
             ]},
             *assignment_table(last, self._site_url, self.get_data("takeover_armed") or {}, self._delete_files),
         ]
