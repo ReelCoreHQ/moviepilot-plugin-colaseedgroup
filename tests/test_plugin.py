@@ -213,7 +213,7 @@ class PluginTests(unittest.TestCase):
                          "status": "downloading" if local == "added" else "seeding",
                          "progress": 0.4 if local == "added" else 1.0, "downloader": "qb", "until": 1_800_000_000})
         rows.sort(key=sort_key)
-        p.save_data("last_run", {"status": "ok", "finished_at": 1, "assignments": rows})
+        p.save_data("last_run", {"status": "ok", "capacity_gib": 2048, "finished_at": 1, "assignments": rows})
         page = p.get_page()
         blob = json.dumps(page, ensure_ascii=False)
         self.assertIn("全部派单 11 条 · 66.0 GiB", blob)
