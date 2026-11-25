@@ -17,7 +17,7 @@
 
 每轮结束时把**全部派单**逐条的本地情况写进 ``RunReport.assignments``（快照，面板直接显示）：
 种子名、体积、站点要求、本地情况、下载器。快照有上限、只含可 JSON 序列化的值，不含 Key 与下载链接。
-插件页与 Docker 面板共用这里的文案、排序与筛选（``local_text`` / ``action_text`` / ``summary_text`` / ``row_filter``）。
+插件页与 Docker 面板共用这里的文案与分组（``local_text`` / ``group_assignments``）：同一份快照两边显示得一样。
 """
 
 import threading
@@ -44,20 +44,10 @@ STATE_TO_CONTRACT = {"seeding": "seeding", "downloading": "downloading", "paused
 MAX_SNAPSHOT_ROWS = 2000
 CLIENT_STATE_TEXT = {"seeding": "做种中", "downloading": "下载中", "paused": "已暂停", "queued": "排队中",
                      "checking": "校验中", "error": "出错", "unknown": "状态未知"}
-ACTION_TEXT = {"keep": "保持", "add": "新派", "remove": "收回"}
-# 与站点成员页（/account/seed-group）的收回原因同一套说法
-RELEASE_TEXT = {"surplus": "副本超额，收回", "capacity": "空间调低，收回", "delisted": "种子下架",
-                "stale": "长期未做种，改派", "left_group": "已离组"}
 PENDING_TEXT = {"add_cap": "本轮已达加种上限", "no_download_url": "派单没有下载链接",
                 "outdated": "插件版本低于站点要求，本轮不加", "client_unavailable": "有下载器不可用，本轮不加"}
 # 排序：异常 → 待加种 → 收回 → 其余
 _PRESENT = ("owned", "added", "taken_over", "external")
-
-
-def action_text(row: Dict[str, Any]) -> str:
-    if row.get("action") == "remove":
-        return RELEASE_TEXT.get(row.get("reason") or "", "收回")
-    return ACTION_TEXT.get(row.get("action") or "", str(row.get("action") or ""))
 
 
 def _client_state(row: Dict[str, Any]) -> str:
@@ -119,21 +109,6 @@ def _rank(row: Dict[str, Any]) -> int:
 
 def sort_key(row: Dict[str, Any]) -> Tuple[int, str, int]:
     return _rank(row), str(row.get("name") or "").casefold(), int(row.get("torrent_id") or 0)
-
-
-# 面板的筛选：异常 / 待加种 / 全部
-FILTERS = (("problem", "异常"), ("pending", "待加种"), ("all", "全部"))
-
-
-def row_filter(row: Dict[str, Any]) -> str:
-    """一行属于哪个筛选（除了「全部」）：problem / pending / ""。"""
-    rank = _rank(row)
-    return "problem" if rank == 0 else ("pending" if rank == 1 else "")
-
-
-def default_filter(rows: List[Dict[str, Any]]) -> str:
-    """默认筛选：有异常就先看异常，否则看全部。"""
-    return "problem" if any(is_problem(r) for r in rows) else "all"
 
 
 def row_actions(row: Dict[str, Any]) -> List[str]:
@@ -202,12 +177,6 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         "backoff": locals_.count("backoff"),
         "removing": sum(1 for r in rows if r.get("action") == "remove"),
     }
-
-
-def summary_text(summary: Dict[str, int]) -> str:
-    s = summary or {}
-    return (f"派单 {s.get('total', 0)} · 插件管理 {s.get('managed', 0)} · 非插件管理 {s.get('external', 0)} · "
-            f"待加种 {s.get('pending', 0)} · 退避 {s.get('backoff', 0)} · 收回 {s.get('removing', 0)}")
 
 
 def display_name(item: AssignmentItem, client_names: List[str]) -> str:
@@ -684,10 +653,13 @@ class Engine:
                 "name": display_name(item, [t.name for _, t in present] + old_names.get(h, [])),
                 "size": item.size, "action": item.action, "reason": item.reason[:32],
                 "local": "", "detail": "", "status": "", "progress": None, "downloader": "", "until": 0,
+                "dl_speed": 0, "eta": None, "taken_over": bool(rec and rec.get("taken_over")),
+                "observed": item.observed, "last_seeded_at": item.last_seeded_at,
             }
             if hit:
                 row.update(status=hit[1].state if hit[1].state in CLIENT_STATE_TEXT else "unknown",
-                           progress=max(0.0, min(1.0, round(float(hit[1].progress), 4))), downloader=hit[0])
+                           progress=max(0.0, min(1.0, round(float(hit[1].progress), 4))), downloader=hit[0],
+                           dl_speed=int(hit[1].dl_speed or 0), eta=hit[1].eta)
             # 记账的那台（或任一台）列不出来时，没看到 ≠ 没有
             blind = not present and bool(failed) and (not rec or rec.get("downloader") in failed)
             if h in report.removed:
@@ -719,6 +691,224 @@ class Engine:
         report.assignment_summary = summarize(rows)
         report.assignments_truncated = max(0, len(rows) - MAX_SNAPSHOT_ROWS)
         report.assignments = rows[:MAX_SNAPSHOT_ROWS]
+
+
+# ---------------- 显示用的换算（插件页与 Docker 面板共用） ----------------
+_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+
+
+def human_size(num: Any) -> str:
+    """字节数自动换算单位（B/KiB/MiB/GiB/TiB/PiB），页面上所有体积都走这里。"""
+    try:
+        value = float(num)
+    except (TypeError, ValueError):
+        return "-"
+    value = max(0.0, value)
+    unit = 0
+    while value >= 1024 and unit < len(_UNITS) - 1:
+        value /= 1024
+        unit += 1
+    if unit == 0:
+        return f"{int(value)} B"
+    return f"{value:.1f} {_UNITS[unit]}" if value < 100 else f"{value:.0f} {_UNITS[unit]}"
+
+
+def duration_text(seconds: Any) -> str:
+    """剩余时间 / 多久以前：「3 分钟」「2 小时」「5 天」；不足 1 分钟算「不到 1 分钟」。"""
+    try:
+        sec = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return ""
+    if sec < 60:
+        return "不到 1 分钟"
+    if sec < 3600:
+        return f"{sec // 60} 分钟"
+    if sec < 86400:
+        return f"{sec // 3600} 小时"
+    return f"{sec // 86400} 天"
+
+
+# ---------------- 派单分组（插件页与 Docker 面板共用） ----------------
+# 状态条的五段（按体积），顺序即显示顺序；每段对应下面一个区块
+BUCKETS = (("seeding", "做种中"), ("downloading", "下载中"), ("pending", "待加种"), ("problem", "异常"),
+           ("removing", "即将删除"))
+# 区块：标题与它包含的段。「待加种」并进「进行中」：它们是下一步就要开始下载的种子，和正在下载的是同一个阶段；
+# 平时只有零星几条，单独成块反而多一层，所以在「进行中」下面按原因各占一行（「待加种 n 个 · 下一轮加入」）
+SECTIONS = (("problem", "需要处理", ("problem",)), ("active", "进行中", ("downloading", "pending")),
+            ("seeding", "做种中", ("seeding",)), ("removing", "即将删除", ("removing",)))
+# 站点收回原因（契约 reason）→ 短说法
+RELEASE_SHORT = {"surplus": "副本已满", "capacity": "调低空间", "delisted": "下架", "stale": "长期不做种",
+                 "left_group": "离组"}
+# 加种失败的原因码 → 说法（站点下载 / 下载器加种）
+ADD_FAIL_TEXT = {"http_5xx": "站点返回 5xx", "timeout": "连接站点超时", "network": "连不上站点",
+                 "redirect": "站点返回了重定向", "bad_download_url": "下载链接不合规", "torrent_too_large": "种子文件过大",
+                 "bad_torrent": "种子文件无效", "hash_mismatch": "种子与派单不符", "not_visible": "下载器加了却查不到",
+                 "duplicate": "下载器里已有同一颗", "add_failed": "下载器加种失败", "unavailable": "下载器连不上"}
+# 只有这几样当行内主操作；「接管」放进「⋯」菜单（它改变归属，不该是一眼就点到的按钮）
+PRIMARY_ACTIONS = ("retry", "resume", "recheck")
+BULK_TEXT = {"retry": "全部重试", "resume": "全部恢复", "recheck": "全部重新校验"}
+
+
+def bucket(row: Dict[str, Any]) -> str:
+    """一行属于状态条的哪一段。"""
+    if is_problem(row):
+        return "problem"
+    if row.get("action") == "remove":
+        return "removing"
+    local = row.get("local")
+    if local == "pending":
+        return "pending"
+    if local == "added":
+        return "downloading"
+    progress = row.get("progress")
+    if row.get("status") == "seeding" or (isinstance(progress, (int, float)) and progress >= 1):
+        return "seeding"
+    return "downloading"
+
+
+def add_fail_text(code: str) -> str:
+    if code in ADD_FAIL_TEXT:
+        return ADD_FAIL_TEXT[code]
+    if code.startswith("http_") and code[5:].isdigit():
+        return f"站点返回 {code[5:]}"
+    return "其它原因"
+
+
+def cause_of(row: Dict[str, Any]) -> Tuple[str, str, str]:
+    """异常行的原因：(key, 说法, 原因码)。同一 key 的行合成一行显示。"""
+    local, status = row.get("local"), row.get("status")
+    if local == "backoff":
+        code = str(row.get("detail") or "")
+        return f"backoff:{code}", f"加种失败 · {add_fail_text(code)}", code
+    if local == "unknown":
+        return "unknown", "下载器列不出种子，本轮未知", "list_failed"
+    side = "" if local in ("owned", "added", "taken_over") else "（非插件管理）"
+    key = f"{status}:{'mine' if not side else 'external'}"
+    return key, ("下载器里已暂停" if status == "paused" else "下载器报错") + side, str(status or "")
+
+
+def badge(row: Dict[str, Any]) -> str:
+    local = row.get("local")
+    if local == "taken_over" or (local in ("owned", "remove_pending") and row.get("taken_over")):
+        return "已接管"
+    if local in ("owned", "added", "remove_pending"):
+        return "插件管理"
+    if local in ("external", "not_owned", "detached"):
+        return "非插件管理"
+    return ""
+
+
+def site_seen(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """站点（tracker）确认：老站点不给字段时为 None（面板不显示）；否则 confirmed + 时间。"""
+    if row.get("observed") is None:
+        return None
+    at = row.get("last_seeded_at")
+    return {"confirmed": bool(row.get("observed")) or at is not None, "at": at}
+
+
+def outcome_text(row: Dict[str, Any]) -> str:
+    """站点收回的派单接下来会怎样。"""
+    local = row.get("local")
+    if local == "remove_pending":
+        return "下一轮删除" + ("（本轮删除失败）" if row.get("detail") == "remove_failed" else "")
+    return {"removed": "本轮已删除", "not_owned": "不是插件管理，不删", "detached": "已去掉专用标签，不删",
+            "gone": "下载器里已没有"}.get(str(local), "")
+
+
+def row_view(row: Dict[str, Any], fmt_time: Callable[[float], str]) -> Dict[str, Any]:
+    """一行要显示的东西（没有 info_hash、没有链接）。主操作至多一个，其余进「⋯」。"""
+    acts = row_actions(row)
+    primary = next((a for a in acts if a in PRIMARY_ACTIONS), None)
+    progress = row.get("progress")
+    return {
+        "torrent_id": row.get("torrent_id"),
+        "name": str(row.get("name") or ""),
+        "size": int(row.get("size") or 0),
+        "downloader": str(row.get("downloader") or ""),
+        "badge": badge(row),
+        "note": local_text(row, fmt_time) if row.get("local") in ("added", "taken_over") else "",
+        "status_text": local_text(row, fmt_time),
+        "primary": {"action": primary, "text": ROW_ACTION_TEXT[primary]} if primary else None,
+        "more": [{"action": a, "text": ROW_ACTION_TEXT[a]} for a in acts if a != primary],
+        "size_text": human_size(row.get("size") or 0),
+        "progress": progress if isinstance(progress, (int, float)) else None,
+        "dl_speed": int(row.get("dl_speed") or 0),
+        "speed_text": f"{human_size(row.get('dl_speed'))}/s" if row.get("dl_speed") else "",
+        "eta": row.get("eta"),
+        "eta_text": f"还要约 {duration_text(row.get('eta'))}" if isinstance(row.get("eta"), int) else "",
+        "site": site_seen(row),
+        "release_text": RELEASE_SHORT.get(str(row.get("reason") or ""), "站点收回") if row.get("action") == "remove"
+        else "",
+        "outcome_text": outcome_text(row),
+    }
+
+
+def _key_name(view: Dict[str, Any]) -> Tuple[str, int]:
+    return view["name"].casefold(), int(view["torrent_id"] or 0)
+
+
+def group_assignments(rows: List[Dict[str, Any]], fmt_time: Callable[[float], str]) -> Dict[str, Any]:
+    """把派单快照分成状态条与区块（插件页与 Docker 面板都只按这里的结果排版）：
+
+    - ``bar``：五段（做种中 / 下载中 / 待加种 / 异常 / 即将删除）的条数与体积，没有的段也在（count 0），渲染方跳过；
+    - ``sections``：需要处理 → 进行中 → 做种中 → 即将删除，**空的区块不出现**。
+      需要处理按原因合并（同一本地情况 + 同一原因码一行，带可批量的修复操作与成员）；
+      进行中是下载中的行 + 按原因合并的待加种行；做种中、即将删除按名字排序。"""
+    views: Dict[str, List[Dict[str, Any]]] = {key: [] for key, _ in BUCKETS}
+    causes: Dict[str, Dict[str, Any]] = {}
+    pending: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = bucket(row)
+        view = row_view(row, fmt_time)
+        views[key].append(view)
+        if key == "problem":
+            ckey, label, code = cause_of(row)
+            group = causes.setdefault(ckey, {"key": ckey, "label": label, "code": code, "rows": []})
+            group["rows"].append(view)
+        elif key == "pending":
+            detail = str(row.get("detail") or "")
+            label = {"": "下一轮加入", "add_cap": "本轮已达加种上限，下一轮加入"}.get(detail) \
+                or PENDING_TEXT.get(detail, "下一轮加入")
+            group = pending.setdefault(detail, {"key": detail or "next", "label": label, "rows": []})
+            group["rows"].append(view)
+
+    def total(items: List[Dict[str, Any]]) -> int:
+        return sum(v["size"] for v in items)
+
+    def finish(group: Dict[str, Any]) -> Dict[str, Any]:
+        group["rows"].sort(key=_key_name)
+        group["count"], group["size"] = len(group["rows"]), total(group["rows"])
+        group["size_text"] = human_size(group["size"])
+        fix = {(v["primary"] or {}).get("action") for v in group["rows"]}
+        action = fix.pop() if len(fix) == 1 else None
+        group["fix"] = {"action": action, "text": BULK_TEXT[action]} if action in BULK_TEXT else None
+        return group
+
+    cause_list = sorted((finish(g) for g in causes.values()), key=lambda g: (-g["count"], g["label"]))
+    pending_list = sorted((finish(g) for g in pending.values()), key=lambda g: (-g["count"], g["label"]))
+    for key in ("downloading", "seeding", "removing"):
+        views[key].sort(key=_key_name)
+    bodies = {"problem": {"causes": cause_list},
+              "active": {"rows": views["downloading"], "pending": pending_list},
+              "seeding": {"rows": views["seeding"]},
+              "removing": {"rows": views["removing"]}}
+    sections = []
+    for key, title, parts in SECTIONS:
+        members = [v for part in parts for v in views[part]]
+        if not members:
+            continue
+        sections.append({"key": key, "title": title, "buckets": list(parts), "count": len(members),
+                         "size": total(members), "size_text": human_size(total(members)), **bodies[key]})
+    all_views = [v for items in views.values() for v in items]
+    return {
+        "count": len(all_views),
+        "size": total(all_views),
+        "size_text": human_size(total(all_views)),
+        "bar": [{"key": key, "label": label, "count": len(views[key]), "size": total(views[key]),
+                 "size_text": human_size(total(views[key])),
+                 "section": next(s for s, _, parts in SECTIONS if key in parts)} for key, label in BUCKETS],
+        "sections": sections,
+    }
 
 
 # ---------------- 面板上的手动操作 ----------------
@@ -799,6 +989,19 @@ class Actions:
         self.persist(self.state)
         self._info(f"手动重试：清除种子 {row['torrent_id']} 的加种退避")
         return self._result("retried", count=1)
+
+    def bulk(self, rows: Optional[List[Dict[str, Any]]], action: str, torrent_ids: Any) -> Dict[str, Any]:
+        """「需要处理」一行原因的批量修复：对每个 torrent_id 做同一个操作（retry / resume），各自照常复核。
+        recheck 走 resume（出错的种子 resume 就是重新校验）。"""
+        if action not in ("retry", "resume", "recheck") or not isinstance(torrent_ids, list) or not torrent_ids \
+                or len(torrent_ids) > MAX_SNAPSHOT_ROWS:
+            return self._result("not_found", ok=False)
+        run = self.retry if action == "retry" else self.resume
+        done = [run(rows, tid) for tid in torrent_ids]
+        ok = sum(1 for r in done if r.get("code") in ("retried", "resumed", "rechecking"))
+        message = f"已处理 {ok} 条" + (f"，{len(done) - ok} 条没有执行" if ok < len(done) else "")
+        return {"ok": ok > 0, "code": "bulk_done" if ok else (done[0].get("code") if done else "not_found"),
+                "message": message if ok else (done[0].get("message") if done else ""), "count": ok}
 
     def _owned_torrent(self, row: Dict[str, Any]) -> Tuple[Optional[Downloader], Optional[ClientTorrent], str]:
         h = row["info_hash"]

@@ -30,6 +30,8 @@ class ClientTorrent:
     state: str = "unknown"  # seeding / downloading / paused / checking / queued / error / unknown
     size: int = 0
     uploaded: int = 0
+    dl_speed: int = 0             # 当前下载速度 B/s（只读，面板显示）
+    eta: Optional[int] = None     # 预计剩余秒数；下载器不知道 / 无限时为 None
 
 
 @dataclass
@@ -81,6 +83,26 @@ def _kib(value: Any) -> Optional[int]:
         return max(0, int(value))
     except (TypeError, ValueError):
         return None
+
+
+def _rate(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _eta(value: Any, unknown_at: Optional[int] = None) -> Optional[int]:
+    """剩余秒数；负数、无限、读不到都返回 None。transmission-rpc 的 eta 是 timedelta。"""
+    if hasattr(value, "total_seconds"):
+        value = value.total_seconds()
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0 or (unknown_at is not None and seconds >= unknown_at):
+        return None
+    return seconds
 
 
 class Downloader:
@@ -160,6 +182,8 @@ class QbDownloader(Downloader):
                 state=_QB_STATES.get(str(_get(row, "state", default="")), "unknown"),
                 size=int(_get(row, "size", "total_size", default=0) or 0),
                 uploaded=int(_get(row, "uploaded", default=0) or 0),
+                dl_speed=_rate(_get(row, "dlspeed", default=0)),
+                eta=_eta(_get(row, "eta", default=None), unknown_at=8640000),   # qB 用 8640000 表示无限
             ))
         return out
 
@@ -262,6 +286,8 @@ class TrDownloader(Downloader):
                 state=self._state(row),
                 size=int(_get(row, "total_size", "totalSize", default=0) or 0),
                 uploaded=int(_get(row, "uploaded_ever", "uploadedEver", default=0) or 0),
+                dl_speed=_rate(_get(row, "rate_download", "rateDownload", default=0)),
+                eta=_eta(_get(row, "eta", default=None)),                     # TR 用 -1 / -2 表示不知道
             ))
         return out
 

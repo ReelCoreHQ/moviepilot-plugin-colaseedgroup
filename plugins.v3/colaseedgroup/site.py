@@ -12,7 +12,8 @@
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -45,6 +46,10 @@ class AssignmentItem:
     download_url: str = ""
     reason: str = ""
     name: str = ""   # 站点显示的种子名；老站点不给时为空，面板再按下载器里的名字兜底
+    # tracker 观测（站点新版才给）：observed 为 None = 站点没给这两个字段（老站点），面板什么都不显示；
+    # 给了时 last_seeded_at 是 tracker 最近一次看到你在做种的时间（epoch 秒，没看到过为 None）
+    observed: Optional[bool] = None
+    last_seeded_at: Optional[float] = None
 
 
 @dataclass
@@ -85,6 +90,30 @@ def _as_bytes(value: Any) -> int:
     raise SiteError("bad_shape")
 
 
+def _iso_time(value: Any) -> Optional[float]:
+    """ISO 8601 时间 → epoch 秒；不是合法时间返回 None。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _observation(raw: Dict[str, Any]) -> Tuple[Optional[bool], Optional[float]]:
+    """派单条目里 tracker 的观测（可选字段 ``last_seeded_at`` / ``observed_seeding``）。
+    两个都没有 = 站点没提供（返回 None, None）；只是展示用，格式不对也不作废整单，按「没看到」处理。"""
+    if "last_seeded_at" not in raw and "observed_seeding" not in raw:
+        return None, None
+    seen_at = _iso_time(raw.get("last_seeded_at"))
+    flag = raw.get("observed_seeding")
+    observed = flag if isinstance(flag, bool) else seen_at is not None
+    return observed, seen_at
+
+
 def parse_assignment(body: Any) -> Assignment:
     """严格校验站点返回（契约 SeedGroupAssignment）；任何一条不合规都整单作废（本轮不加不删）。"""
     if not isinstance(body, dict):
@@ -108,6 +137,7 @@ def parse_assignment(body: Any) -> Assignment:
         name = raw.get("name") or ""
         if not isinstance(url, str) or not isinstance(reason, str) or not isinstance(name, str):
             raise SiteError("bad_shape")
+        observed, seen_at = _observation(raw)
         items.append(AssignmentItem(
             info_hash=info_hash,
             torrent_id=_as_int(raw.get("torrent_id")),
@@ -116,6 +146,8 @@ def parse_assignment(body: Any) -> Assignment:
             download_url=url,
             reason=reason,
             name=name.strip()[:MAX_NAME],
+            observed=observed,
+            last_seeded_at=seen_at,
         ))
     minimum = body.get("min_plugin_version")
     if not isinstance(minimum, str):
