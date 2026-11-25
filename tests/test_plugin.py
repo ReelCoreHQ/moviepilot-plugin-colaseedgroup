@@ -190,12 +190,17 @@ class PluginTests(unittest.TestCase):
         blob = json.dumps(page, ensure_ascii=False)
         self.assertIn("全部派单 11 条 · 66.0 GiB", blob)
         panels = next(c for c in page if c["component"] == "VExpansionPanels")
-        titles = [x["content"][0]["text"] for x in panels["content"]]
-        self.assertEqual(titles, ["需要处理 · 2 个 · 16.0 GiB", "进行中 · 2 个 · 6.0 GiB", "做种中 · 2 个 · 4.0 GiB",
-                                  "即将删除 · 5 个 · 40.0 GiB"])
+        # 第一层：标题只有名字 + 条数小标（带无障碍名「N 个」），不写体积
+        titles = [(x["content"][0]["content"][0]["text"], x["content"][0]["content"][1]["text"],
+                   x["content"][0]["content"][1]["props"]["aria-label"]) for x in panels["content"]]
+        self.assertEqual(titles, [("需要处理", "2", "2 个"), ("进行中", "2", "2 个"), ("做种中", "2", "2 个"),
+                                  ("即将删除", "5", "5 个")])
+        self.assertNotIn("16.0 GiB\"", json.dumps([x["content"][0] for x in panels["content"]], ensure_ascii=False))
+        self.assertNotIn("原因码", blob)
+        self.assertNotIn("http_5xx", blob)
         self.assertEqual(panels["props"]["model-value"], ["problem", "active", "removing"])   # 做种中默认收起
         for want in ("加种失败 · 站点返回 5xx", "全部重试", "下载器列不出种子，本轮未知", "40%", "本轮已加",
-                     "待加种 1 个 · 4.0 GiB · 下一轮加入", "插件管理", "非插件管理", "副本已满", "下一轮删除",
+                     "待加种 · 下一轮加入", "1 个 · 4.0 GiB", "mdi-alert-outline", "插件管理", "非插件管理", "副本已满", "下一轮删除",
                      "不是插件管理，不删", "本轮已删除", "下载器里已没有", "接管", "立即同步"):
             self.assertIn(want, blob)
         self.assertNotIn("站点要求", blob)
@@ -236,7 +241,7 @@ class PluginTests(unittest.TestCase):
         blob = json.dumps(page, ensure_ascii=False)
         panels = next(c for c in page if c["component"] == "VExpansionPanels")
         self.assertEqual(panels["props"]["model-value"], [])
-        table = panels["content"][0]["content"][1]["content"][0]
+        table = panels["content"][0]["content"][1]["content"][0]["content"][0]
         names = [tr["content"][0]["content"][0]["text"] for tr in table["content"][1]["content"]]
         self.assertEqual(names, [f"Film.{i:03d}" for i in range(50)])
         self.assertIn("按名字排序只列前 50 个，还有 350 个", blob)

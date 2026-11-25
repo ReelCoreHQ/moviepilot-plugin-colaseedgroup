@@ -780,6 +780,9 @@ class GroupingTests(unittest.TestCase):
             ("加种失败 · 连接站点超时", 1, ["c"], "全部重试"),
         ])
         self.assertEqual(problem["causes"][1]["size"], 5)
+        self.assertEqual(problem["causes"][1]["meta_text"], "2 个 · 5 B")
+        one = group_assignments([g_row("x", "backoff", "add", status="", detail="http_5xx", size=2048)], str)
+        self.assertEqual(one["sections"][0]["causes"][0]["meta_text"], "2.0 KiB")   # 只有一个原因：条数只在标题上
         self.assertEqual(problem["causes"][1]["code"], "http_5xx")
         # 主操作至多一个；接管只进「⋯」
         f = problem["causes"][3]["rows"][0]

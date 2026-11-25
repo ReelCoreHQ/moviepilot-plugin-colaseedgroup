@@ -171,30 +171,42 @@ def _site_seen(v: Dict[str, Any], now: float) -> str:
     return "等待取样 ⏳" + (f"（上次确认 {ago}）" if ago else "")
 
 
-def _panel(value: str, title: str, content: List[dict]) -> dict:
+def _panel(value: str, title: str, content: List[dict], count: Optional[int] = None) -> dict:
+    """一个区块：标题只有名字 + 条数小标（第一层），条数 · 体积与操作都在面板里的行上（第二层）。"""
+    head: Dict[str, Any] = {"component": "VExpansionPanelTitle", "text": title}
+    if count is not None:
+        head = {"component": "VExpansionPanelTitle", "content": [
+            {"component": "span", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": title},
+            {"component": "VChip", "props": {"size": "small", "class": "ml-2", "variant": "tonal",
+                                             "aria-label": f"{count} 个"}, "text": str(count)}]}
     return {"component": "VExpansionPanel", "props": {"value": value}, "content": [
-        {"component": "VExpansionPanelTitle", "text": title},
-        {"component": "VExpansionPanelText", "content": content},
-    ]}
+        head, {"component": "VExpansionPanelText", "content": content}]}
+
+
+def _line(icon: str, color: str, label: str, meta: str, extra: List[dict]) -> dict:
+    """区块里的一行（第二层）：缩进、左边状态图标、比标题小一号、不加粗；条数 · 体积与操作在这一层。"""
+    return {"component": "div", "props": {"class": "d-flex flex-wrap align-center pl-4 mt-1 text-body-2"}, "content": [
+        {"component": "VIcon", "props": {"icon": icon, "color": color, "size": "small", "class": "mr-2"}},
+        {"component": "span", "props": {"class": "mr-3"}, "text": label},
+        {"component": "span", "props": {"class": "text-medium-emphasis mr-3"}, "text": meta},
+        *extra]}
 
 
 def _section_body(sec: Dict[str, Any], now: float) -> List[dict]:
     key = sec["key"]
     if key == "problem":
         out = []
-        for cause in sec["causes"]:
+        for n, cause in enumerate(sec["causes"]):
             ids = [v["torrent_id"] for v in cause["rows"]]
-            head = [{"component": "span", "props": {"class": "text-body-2 mr-3"},
-                     "text": f"{cause['label']} · {cause['count']} 个 · {cause['size_text']}"}]
-            if cause["fix"]:
-                path = _ACTION_PATH[cause["fix"]["action"]]
-                head.append(_btn(cause["fix"]["text"], path, {"torrent_ids": ids}, variant="flat"))
+            # 原因码不上页面（MoviePilot 的 JSON 页面做不了悬停提示）；日志里照常有
+            fix = [_btn(cause["fix"]["text"], _ACTION_PATH[cause["fix"]["action"]], {"torrent_ids": ids}, variant="flat")] \
+                if cause["fix"] else []
             members = _table(["种子名", "体积", "情况", "下载器", "操作"],
                              [[_name_cell(v), _td(v["size_text"]), _td(v["status_text"], _WRAP),
                                _td(v["downloader"] or "—"), _ops_cell(v)] for v in cause["rows"]])
-            out += [{"component": "div", "props": {"class": "d-flex flex-wrap align-center mt-1"}, "content": head},
-                    {"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "mb-2"},
-                     "content": [_panel(f"c-{cause['key']}", "展开", [members])]}]
+            out += [_line("mdi-alert-outline", "error", cause["label"], cause["meta_text"], fix),
+                    {"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "mb-2 pl-4"},
+                     "content": [_panel(f"c-{n}", "展开", [members])]}]
         return out
     if key == "active":
         rows = []
@@ -206,16 +218,17 @@ def _section_body(sec: Dict[str, Any], now: float) -> List[dict]:
                 {"component": "div", "props": {"class": "text-caption"},
                  "text": " · ".join(x for x in (f"{pct}%", v["speed_text"], v["eta_text"]) if x)}])
             rows.append([_name_cell(v), _td(v["size_text"]), progress, _td(v["downloader"] or "—"), _ops_cell(v)])
-        out = [_table(["种子名", "体积", "进度", "下载器", "操作"], rows)] if rows else []
+        out = [{"component": "div", "props": {"class": "pl-4"},
+                "content": [_table(["种子名", "体积", "进度", "下载器", "操作"], rows)]}] if rows else []
         for group in sec["pending"]:
-            out.append({"component": "div", "props": {"class": "text-body-2 mt-2"},
-                        "text": f"待加种 {group['count']} 个 · {group['size_text']} · {group['label']}"})
+            out.append(_line("mdi-clock-outline", "grey", f"待加种 · {group['label']}", group["meta_text"], []))
         return out
     if key == "seeding":
         shown = sec["rows"][:PAGE_SIZE]
         rows = [[_name_cell(v), _td(v["size_text"]), _td(v["downloader"] or "—"), _td(_site_seen(v, now)),
                  _ops_cell(v)] for v in shown]
-        out = [_table(["种子名", "体积", "下载器", "站点确认", "操作"], rows)]
+        out = [{"component": "div", "props": {"class": "pl-4"},
+                "content": [_table(["种子名", "体积", "下载器", "站点确认", "操作"], rows)]}]
         if len(sec["rows"]) > PAGE_SIZE:
             out.append({"component": "div", "props": {"class": "text-caption mt-2"},
                         "text": f"按名字排序只列前 {PAGE_SIZE} 个，还有 {len(sec['rows']) - PAGE_SIZE} 个"
@@ -223,7 +236,7 @@ def _section_body(sec: Dict[str, Any], now: float) -> List[dict]:
         return out
     rows = [[_name_cell(v), _td(v["size_text"]), _td(v["release_text"]), _td(v["outcome_text"], _WRAP)]
             for v in sec["rows"]]
-    return [_table(["种子名", "体积", "原因", "接下来"], rows)]
+    return [{"component": "div", "props": {"class": "pl-4"}, "content": [_table(["种子名", "体积", "原因", "接下来"], rows)]}]
 
 
 def _confirm_takeover(rows: List[Dict[str, Any]], armed: Dict[str, Any], delete_files: bool, now: float) -> List[dict]:
@@ -273,8 +286,7 @@ def assignment_table(last: Dict[str, Any], site_url: str, armed: Optional[Dict[s
                                                         "text": "站点暂时没有派单"}}, note]
     out += _status_bar(groups)
     out += _confirm_takeover(rows, armed or {}, delete_files, now)
-    panels = [_panel(sec["key"], f"{sec['title']} · {sec['count']} 个 · {sec['size_text']}", _section_body(sec, now))
-              for sec in groups["sections"]]
+    panels = [_panel(sec["key"], sec["title"], _section_body(sec, now), count=sec["count"]) for sec in groups["sections"]]
     opened = [sec["key"] for sec in groups["sections"] if sec["key"] != "seeding"]
     out.append({"component": "VExpansionPanels", "props": {"multiple": True, "model-value": opened, "class": "mt-3"},
                 "content": panels})

@@ -852,7 +852,8 @@ def group_assignments(rows: List[Dict[str, Any]], fmt_time: Callable[[float], st
     """把派单快照分成状态条与区块（插件页与 Docker 面板都只按这里的结果排版）：
 
     - ``bar``：五段（做种中 / 下载中 / 待加种 / 异常 / 即将删除）的条数与体积，没有的段也在（count 0），渲染方跳过；
-    - ``sections``：需要处理 → 进行中 → 做种中 → 即将删除，**空的区块不出现**。
+    - ``sections``：需要处理 → 进行中 → 做种中 → 即将删除，**空的区块不出现**。两层：区块标题只显示名字与条数
+      （``count``），条数 · 体积与操作只在区块里的行上（原因行的 ``meta_text``、各行的 ``size_text``）。
       需要处理按原因合并（同一本地情况 + 同一原因码一行，带可批量的修复操作与成员）；
       进行中是下载中的行 + 按原因合并的待加种行；做种中、即将删除按名字排序。"""
     views: Dict[str, List[Dict[str, Any]]] = {key: [] for key, _ in BUCKETS}
@@ -887,6 +888,12 @@ def group_assignments(rows: List[Dict[str, Any]], fmt_time: Callable[[float], st
 
     cause_list = sorted((finish(g) for g in causes.values()), key=lambda g: (-g["count"], g["label"]))
     pending_list = sorted((finish(g) for g in pending.values()), key=lambda g: (-g["count"], g["label"]))
+    # 第二层（区块里的行）才写条数与体积；区块标题只有一个条数小标。只有一个原因时它的条数就是标题上的那个，
+    # 这一行只写体积，不重复数字
+    for g in cause_list + pending_list:
+        g["meta_text"] = f"{g['count']} 个 · {g['size_text']}"
+    if len(cause_list) == 1:
+        cause_list[0]["meta_text"] = cause_list[0]["size_text"]
     for key in ("downloading", "seeding", "removing"):
         views[key].sort(key=_key_name)
     bodies = {"problem": {"causes": cause_list},
