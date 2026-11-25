@@ -20,24 +20,21 @@ from apscheduler.triggers.interval import IntervalTrigger
 from .clients import Downloader, norm_path, wrap
 from .engine import (
     ACTION_RESULT_TEXT,
-    FILTERS,
     HARD_MAX_ADDS,
     HARD_MAX_DELETES,
-    ROW_ACTION_TEXT,
+    MAX_AUTO_TAKEOVERS,
     Actions,
     Engine,
     Settings,
-    action_text,
-    default_filter,
-    local_text,
+    duration_text,
+    group_assignments,
+    human_size,
     row_actions,
-    row_filter,
-    summary_text,
     takeover_warning,
 )
 from .site import SiteClient
 
-PLUGIN_VERSION = "0.7.1"
+PLUGIN_VERSION = "0.7.2"
 DEFAULT_SITE = "https://www.colapt.com"
 KEY_PAGE = "https://www.colapt.com/account/tracker?tab=api"
 DEFAULT_TAG = "可乐保种组"
@@ -85,39 +82,18 @@ def _host_version() -> str:
         return ""
 
 
-_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
-
-
-def human_size(num: Any) -> str:
-    """字节数自动换算单位（B/KiB/MiB/GiB/TiB/PiB），页面上所有体积都走这里。"""
-    try:
-        value = float(num)
-    except (TypeError, ValueError):
-        return "-"
-    value = max(0.0, value)
-    unit = 0
-    while value >= 1024 and unit < len(_UNITS) - 1:
-        value /= 1024
-        unit += 1
-    if unit == 0:
-        return f"{int(value)} B"
-    return f"{value:.1f} {_UNITS[unit]}" if value < 100 else f"{value:.0f} {_UNITS[unit]}"
-
-
 def _clock(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M") if ts else "-"
 
 
-# 派单表里会换行的格（种子名、站点要求、本地情况）：手机宽度下折行，不把表撑出屏幕
 _WRAP = "white-space: normal; overflow-wrap: anywhere; word-break: break-word;"
 _NOWRAP = "white-space: nowrap;"
 PAGE_SIZE = 50
-_COLUMNS = (("种子名", "name", _WRAP + " min-width: 14em;"), ("体积", "size", _NOWRAP),
-            ("站点要求", "action", _WRAP + " min-width: 5em;"), ("本地情况", "local", _WRAP + " min-width: 8em;"),
-            ("下载器", "downloader", _NOWRAP), ("操作", "ops", _NOWRAP))
-_EMPTY_TEXT = {"problem": "没有异常的派单", "pending": "没有待加种的派单", "all": "站点暂时没有派单"}
 API = "plugin/ColaSeedGroup"
 ARM_SECONDS = 300   # 「接管」第一下之后，确认按钮保留多久
+# 状态条配色：中性灰阶，只有「异常」用错误色（与 Docker 面板一致）
+_BAR_COLOR = {"seeding": "grey-darken-3", "downloading": "grey", "pending": "grey-lighten-1", "problem": "error",
+              "removing": "grey-lighten-3"}
 
 
 def _btn(text: str, path: str, params: Dict[str, Any], color: str = "primary", variant: str = "tonal") -> dict:
@@ -129,45 +105,138 @@ def _btn(text: str, path: str, params: Dict[str, Any], color: str = "primary", v
 _ACTION_PATH = {"retry": "/retry", "resume": "/resume", "recheck": "/resume", "takeover": "/takeover"}
 
 
-def _cells(r: Dict[str, Any]) -> Dict[str, Any]:
-    """表格一行：显示用的文字 + 操作按钮（按钮只带 torrent_id）。没有 info_hash、没有链接。"""
-    tid = r.get("torrent_id")
-    return {"name": str(r.get("name") or ""), "size": human_size(r.get("size") or 0), "action": action_text(r),
-            "local": local_text(r, _clock), "downloader": str(r.get("downloader") or "—"),
-            "ops": [_btn(ROW_ACTION_TEXT[a], _ACTION_PATH[a], {"torrent_id": tid}) for a in row_actions(r)]}
+def _td(text: str = "", style: str = _NOWRAP, content: Optional[List[dict]] = None) -> dict:
+    cell: Dict[str, Any] = {"component": "td", "props": {"style": style}}
+    if content is not None:
+        cell["content"] = content
+    else:
+        cell["text"] = text
+    return cell
 
 
-def _table(items: List[Dict[str, Any]], empty: str) -> dict:
-    def cell(cells: Dict[str, Any], key: str, style: str) -> dict:
-        if key == "ops":
-            return {"component": "td", "props": {"style": style}, "content": cells["ops"]}
-        return {"component": "td", "props": {"style": style}, "text": cells[key]}
+def _name_cell(v: Dict[str, Any]) -> dict:
+    """种子名 + 归属小标（插件管理 / 非插件管理 / 已接管）。"""
+    content: List[dict] = [{"component": "span", "text": v["name"]}]
+    if v["badge"]:
+        content.append({"component": "VChip", "props": {"size": "x-small", "variant": "outlined", "class": "ml-2",
+                                                        "label": True}, "text": v["badge"]})
+    if v["note"]:
+        content.append({"component": "span", "props": {"class": "text-caption text-medium-emphasis ml-2"},
+                        "text": v["note"]})
+    return _td(style=_WRAP + " min-width: 14em;", content=content)
 
-    body = [{"component": "tr", "content": [cell(cells, key, style) for _, key, style in _COLUMNS]}
-            for cells in items] or [{"component": "tr", "content": [
-                {"component": "td", "props": {"colspan": len(_COLUMNS)}, "text": empty}]}]
+
+def _ops_cell(v: Dict[str, Any]) -> dict:
+    """一个主操作；其余（接管等）用不显眼的文字按钮。MoviePilot 的 JSON 页面没有可靠的弹出菜单，所以不做「⋯」。"""
+    tid = v["torrent_id"]
+    btns = []
+    if v["primary"]:
+        btns.append(_btn(v["primary"]["text"], _ACTION_PATH[v["primary"]["action"]], {"torrent_id": tid}))
+    btns += [_btn(m["text"], _ACTION_PATH[m["action"]], {"torrent_id": tid}, color="secondary", variant="text")
+             for m in v["more"]]
+    return _td(content=btns)
+
+
+def _table(headers: List[str], rows: List[List[dict]]) -> dict:
     return {"component": "VTable", "props": {"density": "compact"}, "content": [
         {"component": "thead", "content": [{"component": "tr", "content": [
-            {"component": "th", "props": {"style": _NOWRAP}, "text": title} for title, _, _ in _COLUMNS]}]},
-        {"component": "tbody", "content": body},
+            {"component": "th", "props": {"style": _NOWRAP}, "text": h} for h in headers]}]},
+        {"component": "tbody", "content": [{"component": "tr", "content": r} for r in rows]},
     ]}
 
 
-def _paged(items: List[Dict[str, Any]], empty: str) -> dict:
-    """一页 50 条。超过一页时每页是一个可展开的「第 a–b 条」，第一页默认展开（JSON 页面没有双向绑定，
-    VDataTable 的表体又会被渲染器的默认插槽盖掉，所以分页用手风琴面板做）。"""
-    if len(items) <= PAGE_SIZE:
-        return _table(items, empty)
-    pages = []
-    for i, start in enumerate(range(0, len(items), PAGE_SIZE), 1):
-        chunk = items[start:start + PAGE_SIZE]
-        pages.append({"component": "VExpansionPanel", "props": {"value": f"p{i}"}, "content": [
-            {"component": "VExpansionPanelTitle", "props": {"class": "text-body-2"},
-             "text": f"第 {start + 1}–{start + len(chunk)} 条（共 {len(items)} 条）"},
-            {"component": "VExpansionPanelText", "content": [_table(chunk, empty)]},
-        ]})
-    return {"component": "VExpansionPanels", "props": {"variant": "accordion", "model-value": "p1"},
-            "content": pages}
+def _status_bar(groups: Dict[str, Any]) -> List[dict]:
+    """按体积的横向堆叠条（一排 VSheet，宽度按体积占比）+ 图例。静态页面不能点了筛选。"""
+    parts = [b for b in groups["bar"] if b["count"]]
+    total = sum(b["size"] for b in parts) or 1
+    bar = {"component": "div", "props": {"class": "d-flex rounded overflow-hidden my-2", "style": "height: 14px;"},
+           "content": [{"component": "VSheet", "props": {
+               "color": _BAR_COLOR[b["key"]], "style": f"width: {max(b['size'] / total * 100, 1.5):.2f}%;",
+               "title": f"{b['label']} {b['count']} 个 · {b['size_text']}"}} for b in parts]}
+    legend = {"component": "div", "props": {"class": "d-flex flex-wrap text-caption"}, "content": [
+        {"component": "div", "props": {"class": "d-flex align-center mr-4"}, "content": [
+            {"component": "VSheet", "props": {"color": _BAR_COLOR[b["key"]], "class": "mr-1 rounded-sm",
+                                              "style": "width: 10px; height: 10px;"}},
+            {"component": "span", "text": f"{b['label']} {b['count']} 个 · {b['size_text']}"}]} for b in parts]}
+    return [bar, legend]
+
+
+def _site_seen(v: Dict[str, Any], now: float) -> str:
+    seen = v.get("site")
+    if not seen:
+        return ""
+    ago = f"{duration_text(now - seen['at'])}前" if seen.get("at") else ""
+    if seen["confirmed"]:
+        return "站点已确认 ✓" + (f" {ago}" if ago else "")
+    return "等待取样 ⏳" + (f"（上次确认 {ago}）" if ago else "")
+
+
+def _panel(value: str, title: str, content: List[dict], count: Optional[int] = None) -> dict:
+    """一个区块：标题只有名字 + 条数小标（第一层），条数 · 体积与操作都在面板里的行上（第二层）。"""
+    head: Dict[str, Any] = {"component": "VExpansionPanelTitle", "text": title}
+    if count is not None:
+        head = {"component": "VExpansionPanelTitle", "content": [
+            {"component": "span", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": title},
+            {"component": "VChip", "props": {"size": "small", "class": "ml-2", "variant": "tonal",
+                                             "aria-label": f"{count} 个"}, "text": str(count)}]}
+    return {"component": "VExpansionPanel", "props": {"value": value}, "content": [
+        head, {"component": "VExpansionPanelText", "content": content}]}
+
+
+def _line(icon: str, color: str, label: str, meta: str, extra: List[dict]) -> dict:
+    """区块里的一行（第二层）：缩进、左边状态图标、比标题小一号、不加粗；条数 · 体积与操作在这一层。"""
+    return {"component": "div", "props": {"class": "d-flex flex-wrap align-center pl-4 mt-1 text-body-2"}, "content": [
+        {"component": "VIcon", "props": {"icon": icon, "color": color, "size": "small", "class": "mr-2"}},
+        {"component": "span", "props": {"class": "mr-3"}, "text": label},
+        {"component": "span", "props": {"class": "text-medium-emphasis mr-3"}, "text": meta},
+        *extra]}
+
+
+def _section_body(sec: Dict[str, Any], now: float) -> List[dict]:
+    key = sec["key"]
+    if key == "problem":
+        out = []
+        for n, cause in enumerate(sec["causes"]):
+            ids = [v["torrent_id"] for v in cause["rows"]]
+            # 原因码不上页面（MoviePilot 的 JSON 页面做不了悬停提示）；日志里照常有
+            fix = [_btn(cause["fix"]["text"], _ACTION_PATH[cause["fix"]["action"]], {"torrent_ids": ids}, variant="flat")] \
+                if cause["fix"] else []
+            members = _table(["种子名", "体积", "情况", "下载器", "操作"],
+                             [[_name_cell(v), _td(v["size_text"]), _td(v["status_text"], _WRAP),
+                               _td(v["downloader"] or "—"), _ops_cell(v)] for v in cause["rows"]])
+            out += [_line("mdi-alert-outline", "error", cause["label"], cause["meta_text"], fix),
+                    {"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "mb-2 pl-4"},
+                     "content": [_panel(f"c-{n}", "展开", [members])]}]
+        return out
+    if key == "active":
+        rows = []
+        for v in sec["rows"]:
+            pct = int((v["progress"] or 0) * 100)
+            progress = _td(style="min-width: 10em;", content=[
+                {"component": "VProgressLinear", "props": {"model-value": pct, "height": 6, "rounded": True,
+                                                           "color": "grey-darken-2"}},
+                {"component": "div", "props": {"class": "text-caption"},
+                 "text": " · ".join(x for x in (f"{pct}%", v["speed_text"], v["eta_text"]) if x)}])
+            rows.append([_name_cell(v), _td(v["size_text"]), progress, _td(v["downloader"] or "—"), _ops_cell(v)])
+        out = [{"component": "div", "props": {"class": "pl-4"},
+                "content": [_table(["种子名", "体积", "进度", "下载器", "操作"], rows)]}] if rows else []
+        for group in sec["pending"]:
+            out.append(_line("mdi-clock-outline", "grey", f"待加种 · {group['label']}", group["meta_text"], []))
+        return out
+    if key == "seeding":
+        shown = sec["rows"][:PAGE_SIZE]
+        rows = [[_name_cell(v), _td(v["size_text"]), _td(v["downloader"] or "—"), _td(_site_seen(v, now)),
+                 _ops_cell(v)] for v in shown]
+        out = [{"component": "div", "props": {"class": "pl-4"},
+                "content": [_table(["种子名", "体积", "下载器", "站点确认", "操作"], rows)]}]
+        if len(sec["rows"]) > PAGE_SIZE:
+            out.append({"component": "div", "props": {"class": "text-caption mt-2"},
+                        "text": f"按名字排序只列前 {PAGE_SIZE} 个，还有 {len(sec['rows']) - PAGE_SIZE} 个"
+                                "（插件页不能搜索；完整列表在站点保种组页面）"})
+        return out
+    rows = [[_name_cell(v), _td(v["size_text"]), _td(v["release_text"]), _td(v["outcome_text"], _WRAP)]
+            for v in sec["rows"]]
+    return [{"component": "div", "props": {"class": "pl-4"}, "content": [_table(["种子名", "体积", "原因", "接下来"], rows)]}]
 
 
 def _confirm_takeover(rows: List[Dict[str, Any]], armed: Dict[str, Any], delete_files: bool, now: float) -> List[dict]:
@@ -190,10 +259,10 @@ def _confirm_takeover(rows: List[Dict[str, Any]], armed: Dict[str, Any], delete_
 
 def assignment_table(last: Dict[str, Any], site_url: str, armed: Optional[Dict[str, Any]] = None,
                      delete_files: bool = True, now: Optional[float] = None) -> List[dict]:
-    """全部派单：摘要一行 + 三个筛选（异常 / 待加种 / 全部，每页 50 条）+ 说明。
-    行、顺序、筛选与可做的操作都来自执行器（engine._snapshot / row_filter / row_actions），这里只负责排版。
-
-    MoviePilot 的 JSON 页面没有双向绑定，筛选用手风琴面板：初始展开项是默认筛选，之后由面板自己切换。"""
+    """全部派单：标题（条数 · 体积）+ 按体积的状态条 + 区块（需要处理 / 进行中 / 做种中 / 即将删除，空的不出现）。
+    分组、顺序、文案与可做的操作都来自执行器（engine.group_assignments），与 Docker 面板一致；这里只负责排版。
+    每个区块一个折叠面板：需要处理、进行中、即将删除默认展开，做种中默认收起。"""
+    now = time.time() if now is None else now
     rows = last.get("assignments")
     note = {"component": "div", "props": {"class": "text-caption mt-2"}, "content": [
         {"component": "span", "text": "这里只是下载器这一侧的情况；tracker 有没有把它算作做种，以站点"},
@@ -209,30 +278,18 @@ def assignment_table(last: Dict[str, Any], site_url: str, armed: Optional[Dict[s
                 {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact",
                                                   "text": empty}},
                 note]
-    groups: Dict[str, List[Dict[str, Any]]] = {"problem": [], "pending": [], "all": []}
-    for r in rows:
-        cells = _cells(r)
-        groups["all"].append(cells)
-        key = row_filter(r)
-        if key:
-            groups[key].append(cells)
-    panels = []
-    for key, label in FILTERS:
-        items = groups[key]
-        panels.append({"component": "VExpansionPanel", "props": {"value": key}, "content": [
-            {"component": "VExpansionPanelTitle", "text": f"{label}（{len(items)}）"},
-            {"component": "VExpansionPanelText", "content": [_paged(items, _EMPTY_TEXT[key])]},
-        ]})
-    head: List[dict] = [{"component": "span", "props": {"class": "text-subtitle-2 mr-3"},
-                         "text": summary_text(last.get("assignment_summary") or {})}]
-    if any("retry" in row_actions(r) for r in rows):
-        head.append(_btn("全部重试加种", "/retry", {}, variant="outlined"))
-    out = [
-        {"component": "div", "props": {"class": "d-flex flex-wrap align-center mt-4 mb-2"}, "content": head},
-        *_confirm_takeover(rows, armed or {}, delete_files, time.time() if now is None else now),
-        {"component": "VExpansionPanels", "props": {"variant": "accordion", "model-value": default_filter(rows)},
-         "content": panels},
-    ]
+    groups = group_assignments(rows, _clock)
+    out: List[dict] = [{"component": "div", "props": {"class": "text-subtitle-2 mt-4"},
+                        "text": f"全部派单 {groups['count']} 条 · {groups['size_text']}"}]
+    if not groups["count"]:
+        return out + [{"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact",
+                                                        "text": "站点暂时没有派单"}}, note]
+    out += _status_bar(groups)
+    out += _confirm_takeover(rows, armed or {}, delete_files, now)
+    panels = [_panel(sec["key"], sec["title"], _section_body(sec, now), count=sec["count"]) for sec in groups["sections"]]
+    opened = [sec["key"] for sec in groups["sections"] if sec["key"] != "seeding"]
+    out.append({"component": "VExpansionPanels", "props": {"multiple": True, "model-value": opened, "class": "mt-3"},
+                "content": panels})
     if last.get("assignments_truncated"):
         out.append({"component": "div", "props": {"class": "text-caption mt-2"},
                     "text": f"还有 {last['assignments_truncated']} 条未列出"})
@@ -277,6 +334,7 @@ class ColaSeedGroup(_PluginBase):
         self._max_adds = DEFAULT_MAX_ADDS
         self._max_deletes = 5
         self._delete_files = True
+        self._auto_takeover = False
         self._stop = threading.Event()
 
     # ---------------- 生命周期 ----------------
@@ -295,6 +353,7 @@ class ColaSeedGroup(_PluginBase):
         self._max_adds = _int(config.get("max_adds"), DEFAULT_MAX_ADDS, 0, HARD_MAX_ADDS)
         self._max_deletes = _int(config.get("max_deletes"), 5, 0, HARD_MAX_DELETES)
         self._delete_files = bool(config.get("delete_files", True))
+        self._auto_takeover = bool(config.get("auto_takeover", False))
         if not self.get_data("instance_id"):
             self.save_data("instance_id", uuid.uuid4().hex)
         if config.get("onlyonce"):
@@ -338,8 +397,8 @@ class ColaSeedGroup(_PluginBase):
 
         return [
             api("/sync", self.api_sync, "立即同步"),
-            api("/retry", self.api_retry, "重试加种（torrent_id 为空 = 全部）"),
-            api("/resume", self.api_resume, "恢复 / 重新校验插件管理的种子"),
+            api("/retry", self.api_retry, "重试加种（torrent_id 为空 = 全部；torrent_ids = 这几条）"),
+            api("/resume", self.api_resume, "恢复 / 重新校验插件管理的种子（torrent_ids = 这几条）"),
             api("/takeover", self.api_takeover, "接管下载器里已有的同一颗种子（需确认）"),
             api("/takeover/cancel", self.api_takeover_cancel, "取消接管确认"),
         ]
@@ -370,7 +429,7 @@ class ColaSeedGroup(_PluginBase):
             result = func(self._actions(state), rows)
         finally:
             _HOLDER.lock.release()
-        changed = result.get("code") in ("retried", "retried_all", "resumed", "rechecking", "taken_over")
+        changed = result.get("code") in ("retried", "retried_all", "resumed", "rechecking", "taken_over", "bulk_done")
         return self._done(result, sync=sync and changed)
 
     def api_sync(self, body: dict) -> Dict[str, Any]:
@@ -386,14 +445,20 @@ class ColaSeedGroup(_PluginBase):
         return _envelope(self._retry(body))
 
     def _retry(self, body: dict) -> Dict[str, Any]:
-        tid = (body or {}).get("torrent_id")
+        body = body or {}
+        if "torrent_ids" in body:
+            return self._act(lambda a, rows: a.bulk(rows, "retry", body.get("torrent_ids")), sync=True)
+        tid = body.get("torrent_id")
         return self._act(lambda a, rows: a.retry(rows, tid), sync=True)
 
     def api_resume(self, body: dict) -> Dict[str, Any]:
         return _envelope(self._resume(body))
 
     def _resume(self, body: dict) -> Dict[str, Any]:
-        tid = (body or {}).get("torrent_id")
+        body = body or {}
+        if "torrent_ids" in body:
+            return self._act(lambda a, rows: a.bulk(rows, "resume", body.get("torrent_ids")), sync=True)
+        tid = body.get("torrent_id")
         return self._act(lambda a, rows: a.resume(rows, tid), sync=True)
 
     def api_takeover(self, body: dict) -> Dict[str, Any]:
@@ -465,7 +530,8 @@ class ColaSeedGroup(_PluginBase):
                 site=site,
                 downloaders=self._selected(),
                 settings=Settings(save_path=self._save_path, tag=self._tag, max_adds=self._max_adds,
-                                  max_deletes=self._max_deletes, delete_files=self._delete_files),
+                                  max_deletes=self._max_deletes, delete_files=self._delete_files,
+                                  auto_takeover=self._auto_takeover),
                 state=state,
                 persist=lambda s: self.save_data("state", s),
                 plugin_version=PLUGIN_VERSION,
@@ -516,6 +582,12 @@ class ColaSeedGroup(_PluginBase):
                                   "只删本插件加的种子；内容被别的种子共用时只删种子")),
                 ]},
                 {"component": "VRow", "content": [
+                    col(12, switch("auto_takeover", "自动接管",
+                                   "默认关。开启后，下载器里已经在做种的同一颗种子会被自动接管；"
+                                   "站点收回这条派单时，它会被删除（共用内容时只删种子）。"
+                                   f"只接已下完且在做种的，每轮最多 {MAX_AUTO_TAKEOVERS} 颗，不挪文件")),
+                ]},
+                {"component": "VRow", "content": [
                     col(12, text("api_key", "可乐PT API Key",
                                  f"在 {KEY_PAGE} 创建，勾选「保种组（seedgroup）」范围", type="password")),
                 ]},
@@ -543,7 +615,7 @@ class ColaSeedGroup(_PluginBase):
                     col(12, {"component": "VAlert", "props": {
                         "type": "info", "variant": "tonal",
                         "text": ("插件只执行站点派单：缺的加、站点明确收回的删。"
-                                 "下载器里已有的同一颗种子不会被自动接管（可在插件页手动接管）；"
+                                 "下载器里已有的同一颗种子默认不接管（可在插件页手动接管，或打开「自动接管」）；"
                                  "你自己的种子、别站的种子永远不会被删除，也不会改动任何限速。"
                                  "奖励由站点按 tracker 实际做种情况计算。"),
                     }}),
@@ -553,7 +625,7 @@ class ColaSeedGroup(_PluginBase):
         defaults = {
             "enabled": False, "onlyonce": False, "api_key": "", "site_url": DEFAULT_SITE, "downloaders": [],
             "save_path": DEFAULT_SAVE_PATH, "tag": DEFAULT_TAG, "interval": DEFAULT_INTERVAL,
-            "max_adds": DEFAULT_MAX_ADDS, "max_deletes": 5, "delete_files": True,
+            "max_adds": DEFAULT_MAX_ADDS, "max_deletes": 5, "delete_files": True, "auto_takeover": False,
         }
         return form, defaults
 

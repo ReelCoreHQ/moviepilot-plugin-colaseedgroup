@@ -1,6 +1,7 @@
 """插件外壳：配置前缀、上限钳制、服务注册、跑一轮日志里没有秘密、停用即停。"""
 
 import json
+import time
 import types
 import unittest
 
@@ -180,35 +181,40 @@ class PluginTests(unittest.TestCase):
             rows.append({"info_hash": f"{i:040x}", "torrent_id": i, "name": f"Film.{i:02d}." + "Long" * 20,
                          "size": i * 1024 ** 3, "action": "remove" if local in ("removed", "remove_pending", "not_owned",
                                                                             "detached", "gone") else "keep",
-                         "reason": "surplus", "local": local, "detail": "", "status": "seeding", "progress": 1.0,
-                         "downloader": "qb", "until": 1_800_000_000})
+                         "reason": "surplus", "local": local, "detail": "http_5xx" if local == "backoff" else "",
+                         "status": "downloading" if local == "added" else "seeding",
+                         "progress": 0.4 if local == "added" else 1.0, "downloader": "qb", "until": 1_800_000_000})
         rows.sort(key=sort_key)
-        p.save_data("last_run", {"status": "ok", "finished_at": 1, "assignments": rows,
-                                 "assignment_summary": {"total": 11, "managed": 2, "external": 1, "pending": 1,
-                                                        "backoff": 1, "removing": 5}})
+        p.save_data("last_run", {"status": "ok", "finished_at": 1, "assignments": rows})
         page = p.get_page()
         blob = json.dumps(page, ensure_ascii=False)
-        self.assertIn("派单 11 · 插件管理 2 · 非插件管理 1 · 待加种 1 · 退避 1 · 收回 5", blob)
-        tables = self.tables(page)
-        self.assertEqual(list(tables), ["异常", "待加种", "全部"])
-        self.assertEqual([tr[0] for page_ in tables["全部"] for tr in page_[1]], [r["name"] for r in rows])
-        self.assertEqual(len(tables["异常"][0][1]), 2)   # 退避 + 列不出种子；站点收回的不算异常
-        self.assertEqual(len(tables["待加种"][0][1]), 1)
-        self.assertEqual(tables["全部"][0][0], ["种子名", "体积", "站点要求", "本地情况", "下载器", "操作"])
-        for want in ("插件管理·做种中", "本轮已加", "已在下载器（非插件管理）·做种中", "待加种", "加种失败退避到 ",
-                     "本轮已删除", "不是插件加的，不删", "站点已收回，下载器里已没有", "站点已收回，下一轮删除",
-                     "副本超额，收回", "1.0 GiB", "重试加种", "接管", "全部重试加种", "立即同步"):
+        self.assertIn("全部派单 11 条 · 66.0 GiB", blob)
+        panels = next(c for c in page if c["component"] == "VExpansionPanels")
+        # 第一层：标题只有名字 + 条数小标（带无障碍名「N 个」），不写体积
+        titles = [(x["content"][0]["content"][0]["text"], x["content"][0]["content"][1]["text"],
+                   x["content"][0]["content"][1]["props"]["aria-label"]) for x in panels["content"]]
+        self.assertEqual(titles, [("需要处理", "2", "2 个"), ("进行中", "2", "2 个"), ("做种中", "2", "2 个"),
+                                  ("即将删除", "5", "5 个")])
+        self.assertNotIn("16.0 GiB\"", json.dumps([x["content"][0] for x in panels["content"]], ensure_ascii=False))
+        self.assertNotIn("原因码", blob)
+        self.assertNotIn("http_5xx", blob)
+        self.assertEqual(panels["props"]["model-value"], ["problem", "active", "removing"])   # 做种中默认收起
+        for want in ("加种失败 · 站点返回 5xx", "全部重试", "下载器列不出种子，本轮未知", "40%", "本轮已加",
+                     "待加种 · 下一轮加入", "1 个 · 4.0 GiB", "mdi-alert-outline", "插件管理", "非插件管理", "副本已满", "下一轮删除",
+                     "不是插件管理，不删", "本轮已删除", "下载器里已没有", "接管", "立即同步"):
             self.assertIn(want, blob)
+        self.assertNotIn("站点要求", blob)
         for r in rows:
             self.assertNotIn(r["info_hash"], blob)
+        # 状态条：按体积的五段（这里全都有），异常用错误色
+        bar = next(c for c in page if c.get("props", {}).get("style") == "height: 14px;")
+        self.assertEqual([x["props"]["color"] for x in bar["content"]],
+                         ["grey-darken-3", "grey", "grey-lighten-1", "error", "grey-lighten-3"])
         # 唯一的链接是站点保种组页面
         import re
         self.assertEqual(re.findall(r"https?://[^\"]+", blob), ["https://c.example.com/account/seed-group"])
-        self.assertIn("overflow-wrap: anywhere", blob)
-        panels = next(c for c in page if c["component"] == "VExpansionPanels")
-        self.assertEqual(panels["props"]["model-value"], "problem")
-        # 按钮只带 torrent_id，调本插件接口
         clicks = [b["events"]["click"] for b in self.buttons(page)]
+        self.assertIn({"api": "plugin/ColaSeedGroup/retry", "method": "post", "params": {"torrent_ids": [5]}}, clicks)
         self.assertIn({"api": "plugin/ColaSeedGroup/retry", "method": "post", "params": {"torrent_id": 5}}, clicks)
         self.assertIn({"api": "plugin/ColaSeedGroup/takeover", "method": "post", "params": {"torrent_id": 3}}, clicks)
 
@@ -224,44 +230,32 @@ class PluginTests(unittest.TestCase):
             out += PluginTests.buttons(node.get("content") or [])
         return out
 
-    @staticmethod
-    def tables(page):
-        """{筛选名: [(表头, [[格...]...]) 每页一项]}"""
-        def table(t):
-            head = [th["text"] for th in t["content"][0]["content"][0]["content"]]
-            rows = [[td.get("text", "") for td in tr["content"]] for tr in t["content"][1]["content"]
-                    if "colspan" not in tr["content"][0].get("props", {})]
-            return head, rows
-        panels = next(c for c in page if c["component"] == "VExpansionPanels")
-        out = {}
-        for panel in panels["content"]:
-            title = panel["content"][0]["text"].split("（")[0]
-            inner = panel["content"][1]["content"][0]
-            if inner["component"] == "VTable":
-                out[title] = [table(inner)]
-            else:
-                out[title] = [table(pg["content"][1]["content"][0]) for pg in inner["content"]]
-        return out
-
-    def test_page_400_rows_paged_and_default_filter(self):
+    def test_seeding_panel_lists_first_50_by_name(self):
         p = make_plugin()
-        rows = [{"info_hash": f"{i:040x}", "torrent_id": i, "name": f"Film.{i:03d}", "size": 1024 ** 3,
-                 "action": "keep", "local": "owned", "status": "seeding", "progress": 1.0, "downloader": "qb"}
+        rows = [{"info_hash": f"{i:040x}", "torrent_id": i, "name": f"Film.{399 - i:03d}", "size": 1024 ** 3,
+                 "action": "keep", "local": "owned", "status": "seeding", "progress": 1.0, "downloader": "qb",
+                 "observed": True, "last_seeded_at": time.time() - 600}
                 for i in range(400)]
-        p.save_data("last_run", {"status": "ok", "finished_at": 1, "assignments": rows,
-                                 "assignment_summary": {"total": 400, "managed": 400}})
+        p.save_data("last_run", {"status": "ok", "finished_at": 1, "assignments": rows})
         page = p.get_page()
-        tables = self.tables(page)
-        self.assertEqual([len(rows_) for _, rows_ in tables["全部"]], [50] * 8)   # 全部在，每页 50 条
-        self.assertEqual([r[0] for _, rows_ in tables["全部"] for r in rows_], [r["name"] for r in rows])
-        self.assertEqual(tables["异常"][0][1], [])
         blob = json.dumps(page, ensure_ascii=False)
-        self.assertIn("第 351–400 条（共 400 条）", blob)
-        self.assertIn("没有异常的派单", blob)
         panels = next(c for c in page if c["component"] == "VExpansionPanels")
-        self.assertEqual(panels["props"]["model-value"], "all")       # 没有异常：默认看全部
-        self.assertIn("全部（400）", json.dumps(page, ensure_ascii=False))
+        self.assertEqual(panels["props"]["model-value"], [])
+        table = panels["content"][0]["content"][1]["content"][0]["content"][0]
+        names = [tr["content"][0]["content"][0]["text"] for tr in table["content"][1]["content"]]
+        self.assertEqual(names, [f"Film.{i:03d}" for i in range(50)])
+        self.assertIn("按名字排序只列前 50 个，还有 350 个", blob)
+        self.assertIn("站点已确认 ✓ 10 分钟前", blob)
         self.assertNotIn(rows[0]["info_hash"], json.dumps(page))
+
+    def test_bulk_fix_runs_each_row(self):
+        p = make_plugin()
+        self.seed_rows(p)
+        r = p._retry({"torrent_ids": [3, 2]})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["message"].split("；")[0], "已处理 1 条，1 条没有执行")
+        self.assertNotIn("3" * 40, p.get_data("state")["backoff"])
+        self.assertFalse(p._resume({"torrent_ids": "1"})["ok"])
 
     def test_full_cycle_page_shows_name_not_hash(self):
         data, h = make_torrent("Cycle.Film")
@@ -276,6 +270,7 @@ class PluginTests(unittest.TestCase):
         page = json.dumps(p.get_page(), ensure_ascii=False)
         self.assertIn("Cycle.Film", page)          # 站点没给 name：用下载器里的名字
         self.assertIn("本轮已加", page)
+        self.assertIn("进行中", page)
         self.assertNotIn(h, page)
         self.assertNotIn("SECRETTOKEN", page)
 
@@ -325,6 +320,30 @@ class PluginTests(unittest.TestCase):
         self.assertEqual((p._interval, p._max_adds), (30, 5))
         self.assertTrue(defaults["delete_files"])
         self.assertIn("api_key", json.dumps(form))
+        self.assertFalse(defaults["auto_takeover"])          # 自动接管默认关
+        self.assertIn('"model": "auto_takeover"', json.dumps(form))
+        self.assertFalse(make_plugin()._auto_takeover)
+        self.assertTrue(make_plugin(auto_takeover=True)._auto_takeover)
+
+    def test_auto_takeover_full_cycle(self):
+        _, h = make_torrent("Theirs.Film")
+        self.mp_qb.rows = [{"hash": h, "name": "Theirs.Film", "save_path": "/media", "content_path": "/media/Theirs.Film",
+                            "tags": "", "progress": 1, "state": "stalledUP"}]
+        body = {"revision": 1, "min_plugin_version": "0.7.0", "capacity_gib": 2048, "assigned_bytes": "10",
+                "server_time": "2026-11-24T00:00:00Z",
+                "items": [{"info_hash": h, "torrent_id": 3, "size_bytes": "10", "action": "keep",
+                           "download_url": "https://c.example.com/api/v1/dl/signed-SECRETTOKEN", "reason": None}]}
+        self._session({"/assignment": Rsp(200, body), "/state": Rsp(200, {})})
+        p = make_plugin()                                    # 默认关：不动
+        self.assertEqual(p.run_cycle()["taken_over"], [])
+        self.assertEqual(self.mp_qb.rows[0]["tags"], "")
+        p = make_plugin(auto_takeover=True)
+        self.assertEqual(p.run_cycle()["taken_over"], [h])
+        self.assertIn("可乐保种组", self.mp_qb.rows[0]["tags"])
+        self.assertEqual(self.mp_qb.rows[0]["save_path"], "/media")
+        self.assertTrue(p.get_data("state")["owned"][h]["taken_over"])
+        self.assertIn("自动接管 Theirs.Film", LOG.text())
+        self.assertIn("本轮自动接管", json.dumps(p.get_page(), ensure_ascii=False))
 
 
     # ---------------- 页面上的手动操作 ----------------

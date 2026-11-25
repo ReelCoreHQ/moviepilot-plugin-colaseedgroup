@@ -8,17 +8,16 @@ from support import LOG, import_plugin, make_torrent
 pkg = import_plugin()
 from colaseedgroup.clients import AddResult, ClientError, ClientTorrent, Downloader  # noqa: E402
 from colaseedgroup.engine import (  # noqa: E402
+    MAX_AUTO_TAKEOVERS,
     MAX_SNAPSHOT_ROWS,
     Actions,
     Engine,
     Settings,
-    default_filter,
+    group_assignments,
     is_problem,
     local_text,
     row_actions,
-    row_filter,
     sort_key,
-    summary_text,
 )
 from colaseedgroup.site import Assignment, AssignmentItem, SiteError  # noqa: E402
 
@@ -112,7 +111,8 @@ def owned_torrent(h, name="Movie", save=SAVE, tags=(TAG,)):
 
 def engine(site, dls, state=None, **kw):
     settings = Settings(save_path=SAVE, tag=TAG, max_adds=kw.pop("max_adds", 5),
-                        max_deletes=kw.pop("max_deletes", 5), delete_files=kw.pop("delete_files", True))
+                        max_deletes=kw.pop("max_deletes", 5), delete_files=kw.pop("delete_files", True),
+                        auto_takeover=kw.pop("auto_takeover", False))
     saved = []
     e = Engine(site, dls, settings, state if state is not None else {}, lambda s: saved.append(True),
                plugin_version=kw.pop("version", "0.7.0"), stop=kw.pop("stop", None), log=LOG)
@@ -181,6 +181,113 @@ class OwnershipTests(unittest.TestCase):
         engine(FakeSite(Assignment(1, "", 2048, [item(H3, "remove"), item(H1, "keep")])), [dl], state).run()
         self.assertEqual(dl.removed, [])
         self.assertIn(H3, dl.torrents)
+
+
+def hxx(n):
+    return f"{n:040x}"
+
+
+class AutoTakeoverTests(unittest.TestCase):
+    """自动接管（默认关）：只接 keep / add 派单里已下完且在做种的同 hash 种子，做的事与手动接管相同。"""
+
+    def external(self, h, name="Pre", state="seeding", progress=1.0, tags=()):
+        return ClientTorrent(h, name, "/downloads/other", f"/downloads/other/{name}", set(tags), progress, state)
+
+    def test_off_by_default_and_on_takes_over_like_manual(self):
+        dl = FakeDownloader(torrents=[self.external(H1, tags=("IYUU",))])
+        site = FakeSite(Assignment(1, "", 2048, [item(H1, "keep", tid=7, name="Pre.Film")]))
+        state = {}
+        r = engine(site, [dl], state).run()
+        self.assertEqual((r.taken_over, r.skipped[H1], dl.calls), ([], "external", []))
+        self.assertNotIn(H1, state["owned"])
+        r = engine(site, [dl], state, auto_takeover=True).run()
+        self.assertEqual(r.taken_over, [H1])
+        self.assertNotIn(H1, r.skipped)
+        self.assertEqual(dl.calls, [("add_tag", H1, TAG)])
+        self.assertEqual(dl.torrents[H1].tags, {"IYUU", TAG})
+        self.assertEqual(dl.torrents[H1].save_path, "/downloads/other")      # 文件没动
+        rec = state["owned"][H1]
+        self.assertEqual((rec["downloader"], rec["torrent_id"], rec["taken_over"]), ("qb", 7, True))
+        self.assertEqual(dl.added, [])
+        row = next(x for x in r.assignments if x["info_hash"] == H1)
+        self.assertEqual((row["local"], local_text(row, str)), ("taken_over", "本轮自动接管"))
+        # 已接管之后再同步：就是自己的，不再算接管
+        r = engine(site, [dl], state, auto_takeover=True).run()
+        self.assertEqual(r.taken_over, [])
+        self.assertEqual(site.reports[-1]["items"][0]["external"], False)
+
+    def test_log_names_torrent_without_hash_or_path(self):
+        dl = FakeDownloader(torrents=[self.external(H1, name="Client.Name")])
+        before = len(LOG.text())
+        engine(FakeSite(Assignment(1, "", 2048, [item(H1, "add", name="Site.Name")])), [dl], {},
+               auto_takeover=True).run()
+        text = LOG.text()[before:]
+        self.assertIn("自动接管 Site.Name", text)
+        line = next(x for x in text.splitlines() if "自动接管 Site.Name" in x)
+        self.assertNotIn(H1[:8], line)
+        self.assertNotIn("/downloads", line)
+
+    def test_skips_paused_error_checking_and_incomplete(self):
+        cases = {H1: self.external(H1, state="paused"), H2: self.external(H2, state="error"),
+                 H3: self.external(H3, state="checking"), hxx(4): self.external(hxx(4), state="downloading", progress=.5),
+                 hxx(5): self.external(hxx(5), state="seeding", progress=.99), hxx(6): self.external(hxx(6), state="queued")}
+        dl = FakeDownloader(torrents=list(cases.values()))
+        site = FakeSite(Assignment(1, "", 2048, [item(h, "keep", tid=i) for i, h in enumerate(cases, 1)]))
+        state = {}
+        r = engine(site, [dl], state, auto_takeover=True).run()
+        self.assertEqual(r.taken_over, [])
+        self.assertEqual(dl.calls, [])
+        self.assertEqual(state["owned"], {})
+        self.assertTrue(all(r.skipped[h] == "external" for h in cases))
+
+    def test_never_on_remove_items(self):
+        dl = FakeDownloader(torrents=[self.external(H1)])
+        state = {}
+        r = engine(FakeSite(Assignment(1, "", 2048, [item(H1, "remove")])), [dl], state, auto_takeover=True).run()
+        self.assertEqual((r.taken_over, dl.calls, dl.removed), ([], [], []))
+        self.assertEqual(r.skipped[H1], "not_owned")
+        self.assertNotIn(H1, state["owned"])
+
+    def test_cap_per_run_does_not_use_add_quota(self):
+        n = MAX_AUTO_TAKEOVERS + 3
+        hashes = [hxx(100 + i) for i in range(n)]
+        dl = FakeDownloader(torrents=[self.external(h, name=f"P{i}") for i, h in enumerate(hashes)])
+        data, new = make_torrent("Brand.New")
+        site = FakeSite(Assignment(1, "", 2048, [item(h, "keep", tid=i) for i, h in enumerate(hashes, 1)]
+                                   + [item(new, "add", tid=99)]), torrents={"/d/99": data})
+        state = {}
+        r = engine(site, [dl], state, auto_takeover=True, max_adds=1).run()
+        self.assertEqual(len(r.taken_over), MAX_AUTO_TAKEOVERS)
+        self.assertEqual(sum(1 for h in hashes if r.skipped.get(h) == "takeover_cap"), 3)
+        self.assertEqual(r.added, [new])                         # 加种额度没被接管占掉
+        r = engine(site, [dl], state, auto_takeover=True, max_adds=1).run()
+        self.assertEqual(len(r.taken_over), 3)                   # 剩下的下一轮接着接
+
+    def test_tag_failure_leaves_it_external(self):
+        dl = FakeDownloader(torrents=[self.external(H1)])
+        dl.add_tag = lambda *a: False
+        state = {}
+        r = engine(FakeSite(Assignment(1, "", 2048, [item(H1, "keep")])), [dl], state, auto_takeover=True).run()
+        self.assertEqual((r.taken_over, r.skipped[H1]), ([], "takeover_failed"))
+        self.assertNotIn(H1, state["owned"])
+
+    def test_taken_over_then_released_deleted_with_shared_content_rule(self):
+        pre = self.external(H1, name="Movie")
+        cross = ClientTorrent(H2, "Movie", "/downloads/other", "/downloads/other/Movie", {"IYUU"}, 1.0, "seeding")
+        dl = FakeDownloader(torrents=[pre, cross])
+        state = {}
+        engine(FakeSite(Assignment(1, "", 2048, [item(H1, "keep")])), [dl], state, auto_takeover=True).run()
+        self.assertTrue(state["owned"][H1]["taken_over"])
+        r = engine(FakeSite(Assignment(2, "", 2048, [item(H1, "remove")])), [dl], state, auto_takeover=True).run()
+        self.assertEqual(r.removed, [H1])
+        self.assertEqual(dl.removed, [(H1, False)])              # 共用内容：只删种子
+        self.assertNotIn(H2, [h for h, _ in dl.removed])
+        # 不共用时连文件删
+        dl2 = FakeDownloader(torrents=[self.external(H3, name="Solo")])
+        state2 = {}
+        engine(FakeSite(Assignment(1, "", 2048, [item(H3, "add")])), [dl2], state2, auto_takeover=True).run()
+        engine(FakeSite(Assignment(2, "", 2048, [item(H3, "remove")])), [dl2], state2).run()
+        self.assertEqual(dl2.removed, [(H3, True)])
 
 
 class SharedContentTests(unittest.TestCase):
@@ -435,7 +542,6 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(rows[h_cap]["downloader"], "")
         self.assertEqual(r.assignment_summary, {"total": 9, "managed": 3, "external": 1, "pending": 1, "backoff": 1,
                                                 "removing": 3})
-        self.assertEqual(summary_text(r.assignment_summary), "派单 9 · 插件管理 3 · 非插件管理 1 · 待加种 1 · 退避 1 · 收回 3")
         # 可 JSON 序列化，不含下载链接
         import json
         blob = json.dumps(r.to_dict(), ensure_ascii=False)
@@ -500,10 +606,6 @@ class SnapshotTests(unittest.TestCase):
         rows.append({"action": "keep", "local": "external", "status": "paused", "name": "f"})
         rows.append({"action": "remove", "local": "remove_pending", "status": "paused", "name": "g"})
         self.assertEqual([r["name"] for r in sorted(rows, key=sort_key)], ["c", "e", "f", "b", "d", "g", "a", "A0"])
-        self.assertEqual([row_filter(r) for r in sorted(rows, key=sort_key)],
-                         ["problem", "problem", "problem", "pending", "", "", "", ""])
-        self.assertEqual(default_filter(rows), "problem")
-        self.assertEqual(default_filter([r for r in rows if row_filter(r) != "problem"]), "all")
         data, h = make_torrent("Z")
         items = [item(H1, "keep", 1, name="keep"), item(H2, "remove", 2, name="rm"), item(H3, "add", 3, url="", name="p")]
         r = engine(FakeSite(Assignment(1, "", 2048, items)), [FakeDownloader(torrents=[owned_torrent(H1)])],
@@ -645,6 +747,121 @@ class ActionTests(unittest.TestCase):
         ext.tags = set()                                   # 成员又把专用标签去掉了
         r = engine(FakeSite(Assignment(1, "", 2048, [item(H1, "remove", 1)])), [dl], state).run()
         self.assertEqual((dl.removed, r.skipped[H1]), ([], "detached"))
+
+
+def g_row(name, local, action="keep", status="seeding", size=1, detail="", progress=1.0, reason="", tid=None,
+          **extra):
+    row = {"info_hash": "f" * 40, "torrent_id": tid if tid is not None else abs(hash(name)) % 100000, "name": name,
+           "size": size, "action": action, "reason": reason, "local": local, "detail": detail, "status": status,
+           "progress": progress, "downloader": "qb", "until": 0}
+    row.update(extra)
+    return row
+
+
+class GroupingTests(unittest.TestCase):
+    """派单分组（插件页与 Docker 面板共用）：原因合并、顺序、空区块不出现、收回原因、tracker 观测可选。"""
+
+    def test_causes_merged_by_local_and_reason(self):
+        rows = [g_row("b", "backoff", "add", status="", detail="http_5xx", size=3, tid=1),
+                g_row("a", "backoff", "add", status="", detail="http_5xx", size=2, tid=2),
+                g_row("c", "backoff", "add", status="", detail="timeout", size=1, tid=3),
+                g_row("d", "owned", status="paused", tid=4), g_row("e", "owned", status="paused", tid=5),
+                g_row("f", "external", status="error", tid=6), g_row("g", "unknown", status="", tid=7)]
+        g = group_assignments(rows, str)
+        problem = g["sections"][0]
+        self.assertEqual(problem["key"], "problem")
+        causes = [(c["label"], c["count"], [v["name"] for v in c["rows"]], (c["fix"] or {}).get("text"))
+                  for c in problem["causes"]]
+        self.assertEqual(causes, [
+            ("下载器里已暂停", 2, ["d", "e"], "全部恢复"),
+            ("加种失败 · 站点返回 5xx", 2, ["a", "b"], "全部重试"),
+            ("下载器列不出种子，本轮未知", 1, ["g"], None),
+            ("下载器报错（非插件管理）", 1, ["f"], None),
+            ("加种失败 · 连接站点超时", 1, ["c"], "全部重试"),
+        ])
+        self.assertEqual(problem["causes"][1]["size"], 5)
+        self.assertEqual(problem["causes"][1]["meta_text"], "2 个 · 5 B")
+        one = group_assignments([g_row("x", "backoff", "add", status="", detail="http_5xx", size=2048)], str)
+        self.assertEqual(one["sections"][0]["causes"][0]["meta_text"], "2.0 KiB")   # 只有一个原因：条数只在标题上
+        self.assertEqual(problem["causes"][1]["code"], "http_5xx")
+        # 主操作至多一个；接管只进「⋯」
+        f = problem["causes"][3]["rows"][0]
+        self.assertEqual((f["primary"], [m["action"] for m in f["more"]]), (None, ["takeover"]))
+        self.assertNotIn("info_hash", json_dumps(g))
+
+    def test_order_buckets_and_empty_sections_hidden(self):
+        rows = [g_row("seed", "owned"), g_row("dl", "owned", status="downloading", progress=.3, dl_speed=2048, eta=125),
+                g_row("new", "added", status="downloading", progress=0),
+                g_row("wait", "pending", "add", status="", detail="add_cap", size=4),
+                g_row("wait2", "pending", "add", status="", detail="", size=1),
+                g_row("rm", "remove_pending", "remove", reason="capacity", size=7)]
+        g = group_assignments(rows, str)
+        self.assertEqual([s["key"] for s in g["sections"]], ["active", "seeding", "removing"])   # 没有异常：不出现
+        self.assertEqual([(b["key"], b["count"], b["size"]) for b in g["bar"]],
+                         [("seeding", 1, 1), ("downloading", 2, 2), ("pending", 2, 5), ("problem", 0, 0),
+                          ("removing", 1, 7)])
+        self.assertEqual((g["count"], g["size"]), (6, 15))
+        active = g["sections"][0]
+        self.assertEqual([v["name"] for v in active["rows"]], ["dl", "new"])
+        dl = active["rows"][0]
+        self.assertEqual((dl["speed_text"], dl["eta_text"], dl["badge"]), ("2.0 KiB/s", "还要约 2 分钟", "插件管理"))
+        self.assertEqual(active["rows"][1]["note"], "本轮已加")
+        self.assertEqual([(p["label"], p["count"]) for p in active["pending"]],
+                         [("下一轮加入", 1), ("本轮已达加种上限，下一轮加入", 1)])
+        self.assertEqual(group_assignments([], str)["sections"], [])
+
+    def test_release_reason_and_outcome(self):
+        rows = [g_row(n, local, "remove", reason=reason) for n, local, reason in (
+            ("a", "remove_pending", "surplus"), ("b", "not_owned", "capacity"), ("c", "removed", "delisted"),
+            ("d", "gone", "stale"), ("e", "detached", "left_group"), ("f", "remove_pending", "mystery"))]
+        rows.append(g_row("g", "remove_pending", "remove", reason="surplus", detail="remove_failed"))
+        g = group_assignments(rows, str)
+        got = [(v["name"], v["release_text"], v["outcome_text"], v["badge"]) for v in g["sections"][0]["rows"]]
+        self.assertEqual(got, [
+            ("a", "副本已满", "下一轮删除", "插件管理"), ("b", "调低空间", "不是插件管理，不删", "非插件管理"),
+            ("c", "下架", "本轮已删除", ""), ("d", "长期不做种", "下载器里已没有", ""),
+            ("e", "离组", "已去掉专用标签，不删", "非插件管理"), ("f", "站点收回", "下一轮删除", "插件管理"),
+            ("g", "副本已满", "下一轮删除（本轮删除失败）", "插件管理")])
+
+    def test_site_observation_optional(self):
+        rows = [g_row("old", "owned"), g_row("seen", "owned", observed=True, last_seeded_at=1000.0),
+                g_row("wait", "owned", observed=False, last_seeded_at=None),
+                g_row("stale", "owned", observed=False, last_seeded_at=500.0),
+                g_row("took", "taken_over"), g_row("mine-took", "owned", taken_over=True)]
+        views = {v["name"]: v for v in group_assignments(rows, str)["sections"][0]["rows"]}
+        self.assertIsNone(views["old"]["site"])                       # 老站点：不显示
+        self.assertEqual(views["seen"]["site"], {"confirmed": True, "at": 1000.0})
+        self.assertEqual(views["wait"]["site"], {"confirmed": False, "at": None})
+        self.assertEqual(views["stale"]["site"], {"confirmed": False, "at": 500.0})   # 很久以前采到过，现在没确认
+        self.assertEqual((views["took"]["badge"], views["took"]["note"]), ("已接管", "本轮自动接管"))
+        self.assertEqual(views["mine-took"]["badge"], "已接管")
+
+    def test_observation_parsed_from_site_and_carried_into_snapshot(self):
+        from colaseedgroup.site import parse_assignment
+        base = {"revision": 1, "min_plugin_version": "0.7.0", "capacity_gib": 1, "assigned_bytes": "1", "items": []}
+        item_ = {"info_hash": H1, "torrent_id": 1, "size_bytes": "1", "action": "keep"}
+        old = parse_assignment({**base, "items": [dict(item_)]}).items[0]
+        self.assertEqual((old.observed, old.last_seeded_at), (None, None))
+        seen = parse_assignment({**base, "items": [dict(item_, last_seeded_at="2026-11-25T00:00:00Z")]}).items[0]
+        self.assertEqual((seen.observed, seen.last_seeded_at), (True, 1795564800.0))
+        never = parse_assignment({**base, "items": [dict(item_, last_seeded_at=None)]}).items[0]
+        self.assertEqual((never.observed, never.last_seeded_at), (False, None))
+        stale = parse_assignment({**base, "items": [dict(item_, last_seeded_at="2026-11-20T00:00:00Z",
+                                                          observed_seeding=False)]}).items[0]
+        self.assertEqual((stale.observed, stale.last_seeded_at), (False, 1795132800.0))
+        flagged = parse_assignment({**base, "items": [dict(item_, observed_seeding=True)]}).items[0]
+        self.assertEqual((flagged.observed, flagged.last_seeded_at), (True, None))
+        junk = parse_assignment({**base, "items": [dict(item_, last_seeded_at="yesterday")]}).items[0]
+        self.assertEqual((junk.observed, junk.last_seeded_at), (False, None))   # 格式不对不作废整单
+        site = FakeSite(Assignment(1, "", 2048, [AssignmentItem(H1, 1, 1, "keep", name="x", observed=True,
+                                                                last_seeded_at=5.0)]))
+        r = engine(site, [FakeDownloader(torrents=[owned_torrent(H1)])], {"owned": {H1: {"downloader": "qb"}}}).run()
+        self.assertEqual((r.assignments[0]["observed"], r.assignments[0]["last_seeded_at"]), (True, 5.0))
+
+
+def json_dumps(value):
+    import json
+    return json.dumps(value, ensure_ascii=False)
 
 
 if __name__ == "__main__":
