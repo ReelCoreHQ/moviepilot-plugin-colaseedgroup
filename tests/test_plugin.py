@@ -171,6 +171,34 @@ class PluginTests(unittest.TestCase):
             self.assertIn(text, page)
         self.assertNotIn("0.00 TiB", page)
 
+    def test_page_points_to_capacity_when_not_declared(self):
+        # 站点对没申报空间的成员照常给空派单（状态「正常」），上报状态被 409 拒绝：页面要指去申报，而不是显示「正常」
+        p = make_plugin()
+        p.save_data("last_run", {"status": "ok", "capacity_gib": 0, "items": 0, "finished_at": 1, "assignments": [],
+                                 "state_error": "http_409:state_conflict"})
+        page = json.dumps(p.get_page(), ensure_ascii=False)
+        self.assertIn("还没在站点申报可提供的空间", page)
+        self.assertIn("/account/seed-group", page)
+        self.assertIn("还没申报空间，所以没有派单", page)
+        self.assertIn("未申报", page)
+        self.assertNotIn("正常", page)
+        self.assertNotIn('"type": "success"', page)
+
+    def test_page_no_capacity_hint_once_declared(self):
+        p = make_plugin()
+        p.save_data("last_run", {"status": "ok", "capacity_gib": 500, "items": 0, "finished_at": 1, "assignments": []})
+        page = json.dumps(p.get_page(), ensure_ascii=False)
+        self.assertNotIn("还没在站点申报可提供的空间", page)
+        self.assertIn("站点暂时没有派单", page)
+
+    def test_needs_capacity(self):
+        from colaseedgroup.engine import needs_capacity
+        self.assertFalse(needs_capacity({}))
+        self.assertTrue(needs_capacity({"status": "ok", "capacity_gib": 0}))
+        self.assertTrue(needs_capacity({"status": "ok", "capacity_gib": 10, "state_error": "http_409:state_conflict"}))
+        self.assertFalse(needs_capacity({"status": "ok", "capacity_gib": 10}))
+        self.assertFalse(needs_capacity({"status": "site_error", "reason": "http_401"}))
+
     def test_page_lists_every_assignment_without_hash_or_urls(self):
         from colaseedgroup.engine import sort_key
         p = make_plugin()
@@ -185,7 +213,7 @@ class PluginTests(unittest.TestCase):
                          "status": "downloading" if local == "added" else "seeding",
                          "progress": 0.4 if local == "added" else 1.0, "downloader": "qb", "until": 1_800_000_000})
         rows.sort(key=sort_key)
-        p.save_data("last_run", {"status": "ok", "finished_at": 1, "assignments": rows})
+        p.save_data("last_run", {"status": "ok", "capacity_gib": 2048, "finished_at": 1, "assignments": rows})
         page = p.get_page()
         blob = json.dumps(page, ensure_ascii=False)
         self.assertIn("全部派单 11 条 · 66.0 GiB", blob)
