@@ -823,11 +823,13 @@ class GroupingTests(unittest.TestCase):
     def test_site_observation_optional(self):
         rows = [g_row("old", "owned"), g_row("seen", "owned", observed=True, last_seeded_at=1000.0),
                 g_row("wait", "owned", observed=False, last_seeded_at=None),
+                g_row("stale", "owned", observed=False, last_seeded_at=500.0),
                 g_row("took", "taken_over"), g_row("mine-took", "owned", taken_over=True)]
         views = {v["name"]: v for v in group_assignments(rows, str)["sections"][0]["rows"]}
         self.assertIsNone(views["old"]["site"])                       # 老站点：不显示
         self.assertEqual(views["seen"]["site"], {"confirmed": True, "at": 1000.0})
         self.assertEqual(views["wait"]["site"], {"confirmed": False, "at": None})
+        self.assertEqual(views["stale"]["site"], {"confirmed": False, "at": 500.0})   # 很久以前采到过，现在没确认
         self.assertEqual((views["took"]["badge"], views["took"]["note"]), ("已接管", "本轮自动接管"))
         self.assertEqual(views["mine-took"]["badge"], "已接管")
 
@@ -841,6 +843,9 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual((seen.observed, seen.last_seeded_at), (True, 1795564800.0))
         never = parse_assignment({**base, "items": [dict(item_, last_seeded_at=None)]}).items[0]
         self.assertEqual((never.observed, never.last_seeded_at), (False, None))
+        stale = parse_assignment({**base, "items": [dict(item_, last_seeded_at="2026-11-20T00:00:00Z",
+                                                          observed_seeding=False)]}).items[0]
+        self.assertEqual((stale.observed, stale.last_seeded_at), (False, 1795132800.0))
         flagged = parse_assignment({**base, "items": [dict(item_, observed_seeding=True)]}).items[0]
         self.assertEqual((flagged.observed, flagged.last_seeded_at), (True, None))
         junk = parse_assignment({**base, "items": [dict(item_, last_seeded_at="yesterday")]}).items[0]

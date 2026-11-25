@@ -165,9 +165,10 @@ def _site_seen(v: Dict[str, Any], now: float) -> str:
     seen = v.get("site")
     if not seen:
         return ""
+    ago = f"{duration_text(now - seen['at'])}前" if seen.get("at") else ""
     if seen["confirmed"]:
-        return "站点已确认 ✓" + (f" {duration_text(now - seen['at'])}前" if seen.get("at") else "")
-    return "等待取样 ⏳"
+        return "站点已确认 ✓" + (f" {ago}" if ago else "")
+    return "等待取样 ⏳" + (f"（上次确认 {ago}）" if ago else "")
 
 
 def _panel(value: str, title: str, content: List[dict]) -> dict:

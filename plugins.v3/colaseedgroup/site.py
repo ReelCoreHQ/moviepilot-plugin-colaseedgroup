@@ -104,8 +104,9 @@ def _iso_time(value: Any) -> Optional[float]:
 
 
 def _observation(raw: Dict[str, Any]) -> Tuple[Optional[bool], Optional[float]]:
-    """派单条目里 tracker 的观测（可选字段 ``last_seeded_at`` / ``observed_seeding``）。
-    两个都没有 = 站点没提供（返回 None, None）；只是展示用，格式不对也不作废整单，按「没看到」处理。"""
+    """派单条目里 tracker 的观测（契约 SeedGroupAssignmentItem 的 ``last_seeded_at`` / ``observed_seeding``，站点 20.1.0 起）。
+    ``observed_seeding`` 是「站点确认此刻在做种」；``last_seeded_at`` 是最近一次采到的时间（null = 从没采到）。
+    两个都没有 = 老站点（返回 None, None）；只是展示用，格式不对也不作废整单，按「没看到」处理。"""
     if "last_seeded_at" not in raw and "observed_seeding" not in raw:
         return None, None
     seen_at = _iso_time(raw.get("last_seeded_at"))

@@ -799,11 +799,12 @@ def badge(row: Dict[str, Any]) -> str:
 
 
 def site_seen(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """站点（tracker）确认：老站点不给字段时为 None（面板不显示）；否则 confirmed + 时间。"""
+    """站点（tracker）确认，按契约 SeedGroupAssignmentItem：``observed_seeding`` 为真 = 最近一两个 10 分钟采样看到你在做种
+    （「站点已确认 ✓」）；为假 = 还没采到（「等待取样 ⏳」），这时 ``last_seeded_at`` 若有就是更早的一次。
+    老站点不给字段时为 None（面板不显示）。"""
     if row.get("observed") is None:
         return None
-    at = row.get("last_seeded_at")
-    return {"confirmed": bool(row.get("observed")) or at is not None, "at": at}
+    return {"confirmed": bool(row.get("observed")), "at": row.get("last_seeded_at")}
 
 
 def outcome_text(row: Dict[str, Any]) -> str:
